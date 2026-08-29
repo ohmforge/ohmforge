@@ -1,0 +1,14 @@
+[package]
+name = "ee-ai"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "AI copilot: Claude client, tool definitions over the circuit API, RAG over parts, verification loop, offline heuristics."
+
+[lints]
+workspace = true
+
+[dependencies]
+ee-core = { workspace = true }
+# reqwest/serde added at M1 when the Claude client lands.

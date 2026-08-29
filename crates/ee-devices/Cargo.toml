@@ -1,0 +1,13 @@
+[package]
+name = "ee-devices"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Device models (R/L/C, diode, BJT, MOSFET, op-amp, ICs), board definitions, and the parts library."
+
+[lints]
+workspace = true
+
+[dependencies]
+ee-core = { workspace = true }

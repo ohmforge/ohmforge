@@ -1,0 +1,12 @@
+[package]
+name = "ee-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Core data model for ee-assist: circuit graph, units, values, time. No I/O, no UI; deterministic and WASM-clean."
+
+[lints]
+workspace = true
+
+[dependencies]

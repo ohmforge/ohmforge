@@ -1,0 +1,26 @@
+[package]
+name = "ee"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ee-assist: the AI-assisted EE workbench binary — orchestrates the shell, TUI, engines, and copilot."
+
+[[bin]]
+name = "ee"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+ee-core = { workspace = true }
+ee-sim = { workspace = true }
+ee-digital = { workspace = true }
+ee-mcu = { workspace = true }
+ee-devices = { workspace = true }
+ee-instruments = { workspace = true }
+ee-fmt = { workspace = true }
+ee-tui = { workspace = true }
+ee-shell = { workspace = true }
+ee-ai = { workspace = true }

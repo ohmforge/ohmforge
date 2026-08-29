@@ -1,0 +1,13 @@
+[package]
+name = "ee-sim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Analog / mixed-signal engine: MNA, Newton-Raphson, transient/DC/AC/noise analyses."
+
+[lints]
+workspace = true
+
+[dependencies]
+ee-core = { workspace = true }

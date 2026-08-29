@@ -1,0 +1,13 @@
+[package]
+name = "ee-digital"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Event-driven digital logic simulation (gates, flip-flops, buses) with X/Z states and delays."
+
+[lints]
+workspace = true
+
+[dependencies]
+ee-core = { workspace = true }

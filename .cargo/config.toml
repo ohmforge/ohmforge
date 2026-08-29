@@ -1,0 +1,15 @@
+# Workspace-local cargo config. Kept conservative so it works everywhere and in
+# CI without extra setup.
+
+[alias]
+# Handy shortcuts (see `just` for the fuller task set).
+lint = "clippy --workspace --all-targets --all-features -- -D warnings"
+t = "test --workspace"
+wasm = "check -p ee-core -p ee-sim --target wasm32-unknown-unknown"
+
+[build]
+# Uncomment for faster incremental linking once contributors have the linker
+# installed (documented in DEVELOPMENT.md); left off by default for portability.
+# [target.x86_64-unknown-linux-gnu]
+# linker = "clang"
+# rustflags = ["-C", "link-arg=-fuse-ld=lld"]

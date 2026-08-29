@@ -1,0 +1,68 @@
+# ee-assist — Cargo workspace
+# See docs/ARCHITECTURE.md for what each crate does.
+[workspace]
+resolver = "2"
+members = [
+    "crates/ee-core",
+    "crates/ee-sim",
+    "crates/ee-digital",
+    "crates/ee-mcu",
+    "crates/ee-devices",
+    "crates/ee-instruments",
+    "crates/ee-fmt",
+    "crates/ee-tui",
+    "crates/ee-shell",
+    "crates/ee-ai",
+    "crates/ee",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.79"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/your/ee-assist"
+authors = ["ee-assist contributors"]
+
+# Shared dependency versions live here; crates opt in with `dep = { workspace = true }`.
+# Kept commented until first use so the scaffold builds with zero network deps.
+[workspace.dependencies]
+ee-core        = { path = "crates/ee-core" }
+ee-sim         = { path = "crates/ee-sim" }
+ee-digital     = { path = "crates/ee-digital" }
+ee-mcu         = { path = "crates/ee-mcu" }
+ee-devices     = { path = "crates/ee-devices" }
+ee-instruments = { path = "crates/ee-instruments" }
+ee-fmt         = { path = "crates/ee-fmt" }
+ee-tui         = { path = "crates/ee-tui" }
+ee-shell       = { path = "crates/ee-shell" }
+ee-ai          = { path = "crates/ee-ai" }
+# Third-party (uncomment as milestones need them):
+# ratatui   = "0.28"
+# crossterm = "0.28"
+# faer      = "0.19"      # linear algebra / sparse solve
+# thiserror = "1"
+# anyhow    = "1"
+# serde     = { version = "1", features = ["derive"] }
+# rhai      = "1"         # embedded scripting for eesh
+
+# Lint policy shared by every crate (each opts in with `[lints] workspace = true`).
+# CI runs clippy with `-D warnings`, so these levels are effectively enforced.
+[workspace.lints.rust]
+unsafe_code = "warn"       # allowed only with a documented #[allow] + justification
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+# Unwind (not abort): the TUI panic hook restores the terminal, and the AI
+# verify-loop runs candidate patches on a scratch circuit and must catch a
+# solver panic instead of killing the process. See docs/ARCHITECTURE.md
+# §Cross-cutting design decisions.
+panic = "unwind"
+
+[profile.dev]
+opt-level = 1       # keep the simulator usable in debug builds

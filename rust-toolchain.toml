@@ -1,0 +1,8 @@
+# Dev convenience: rustup uses stable with the components CI needs. This does
+# NOT define the MSRV — the supported minimum is `rust-version` in Cargo.toml
+# (1.79) and is checked by its own CI job.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+# Targets contributors can add locally; CI installs them per-job.
+# targets = ["wasm32-unknown-unknown", "aarch64-unknown-linux-gnu"]

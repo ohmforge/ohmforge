@@ -1,0 +1,14 @@
+[package]
+name = "ee-mcu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Microcontroller cores + peripherals and the co-simulation bridge to the circuit engines."
+
+[lints]
+workspace = true
+
+[dependencies]
+ee-core = { workspace = true }
+ee-digital = { workspace = true }

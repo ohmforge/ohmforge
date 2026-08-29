@@ -1,0 +1,13 @@
+/target
+**/*.rs.bk
+.DS_Store
+# Cargo.lock IS committed: this workspace ships a binary (`ee`), so a locked,
+# reproducible dependency set is what we want in-repo.
+
+# Waveform/data exports produced by runs (keep sample fixtures under tests/).
+/*.vcd
+/*.csv
+
+# local AI config / secrets — never commit API keys
+.env
+
