@@ -8,5 +8,6 @@
 //! Rendering is decoupled from simulation via snapshots, so a slow redraw never
 //! stalls the solver. See docs/ARCHITECTURE.md § "The TUI." (Roadmap M0+.)
 
-/// TODO(M0): braille sub-cell waveform plotting for high vertical resolution.
-pub fn draw_stub() {}
+pub mod plot;
+
+pub use plot::Plot;
