@@ -26,6 +26,8 @@ pub enum PartKind {
     Capacitor,
     Inductor,
     VoltageSource,
+    /// Independent current source (value in amperes).
+    CurrentSource,
     /// Anything not yet modeled natively, identified by name.
     Other(String),
 }
