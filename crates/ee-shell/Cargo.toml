@@ -11,4 +11,6 @@ workspace = true
 
 [dependencies]
 ee-core = { workspace = true }
+ee-sim = { workspace = true }
+ee-tui = { workspace = true }
 # rhai = { workspace = true }   # embedded scripting, added at M1
