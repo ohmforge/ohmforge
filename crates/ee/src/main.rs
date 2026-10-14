@@ -3,65 +3,46 @@
 //! At M0 this becomes the full app: it owns session/project state and runs the
 //! TUI event loop wiring the shell, engines, instruments, and AI copilot
 //! together. For now it's an end-to-end smoke test of the M0 compute path —
-//! parse component values, build a circuit, simulate a transient, and draw the
+//! parse a netlist, build the circuit, simulate a transient, and draw the
 //! result in the terminal — proving every crate links and the pieces fit.
 //! See docs/ROADMAP.md.
 
-use ee_core::graph::{Circuit, NetId, PartKind};
-use ee_core::units::Unit;
-use ee_core::value::Value;
+use ee_fmt::netlist;
 use ee_sim::{Analysis, Engine};
 use ee_tui::Plot;
 
+/// The circuit, as you would type it. An RC low-pass: a 5 V step through 1 kΩ
+/// into 1 µF, so τ = R·C = 1 ms.
+const NETLIST: &str = "\
+.title rc-lowpass
+V1 in  gnd 5
+R1 in  out 1k
+C1 out gnd 1u
+";
+
 fn main() {
     println!("ee-assist — AI-assisted EE workbench (scaffold)\n");
-
-    // ── Build an RC low-pass by hand: a 5 V step through 1 kΩ into 1 µF. ──
-    //
-    //   V1(5V) ──[ R1 1k ]──┬── out
-    //                       ─┴─ C1 1µ
-    //                        │
-    //                       gnd
-    let mut circuit = Circuit::new("rc-lowpass");
-    let vin = circuit.new_net();
-    let out = circuit.new_net();
-    circuit.add_part(
-        "V1",
-        PartKind::VoltageSource,
-        val("5", Unit::Volt),
-        vec![vin, NetId::GROUND],
-    );
-    circuit.add_part(
-        "R1",
-        PartKind::Resistor,
-        val("1k", Unit::Ohm),
-        vec![vin, out],
-    );
-    circuit.add_part(
-        "C1",
-        PartKind::Capacitor,
-        val("1u", Unit::Farad),
-        vec![out, NetId::GROUND],
-    );
-
-    println!("circuit \"{}\":", circuit.name);
-    for part in circuit.parts() {
-        let value = part
-            .value
-            .as_ref()
-            .map(|v| format!("{:>9.3e} {}", v.magnitude, v.unit.symbol()))
-            .unwrap_or_default();
-        println!("  {:<3} {}", part.reference, value);
+    println!("netlist:");
+    for line in NETLIST.lines() {
+        println!("  {line}");
     }
-    println!("  τ = R·C = 1 ms\n");
+    println!();
+
+    // ── Parse: text → circuit. ──
+    let circuit = match netlist::parse(NETLIST) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("netlist error, {e}");
+            std::process::exit(1);
+        }
+    };
 
     // ── Simulate: transient over 5 τ, 20 µs steps. ──
-    let engine = Engine::new();
     let analysis = Analysis::Transient {
         duration: 5e-3,
         step: Some(20e-6),
     };
-    let signals = match engine.run(&circuit, &analysis) {
+    let signals = match Engine::new().run(&circuit, &analysis) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("simulation failed: {e}");
@@ -69,7 +50,8 @@ fn main() {
         }
     };
 
-    // ── Draw v(out) in the braille scope. ──
+    // ── Draw v(out) in the braille scope. `out` is R1's second terminal. ──
+    let out = circuit.part_by_ref("R1").expect("R1 exists").terminals[1];
     let out_name = format!("v(n{})", circuit.resolve(out).0);
     let Some(sig) = signals.iter().find(|s| s.name == out_name) else {
         eprintln!("no signal for the output node");
@@ -105,15 +87,4 @@ fn main() {
     println!(
         "\ntype a circuit → simulate → see it. next: the interactive shell (docs/ROADMAP.md)."
     );
-}
-
-/// Parse an engineering-notation value, e.g. `"1k"` → 1000 Ω.
-fn val(text: &str, unit: Unit) -> Option<Value> {
-    match Value::parse(text, unit) {
-        Ok(v) => Some(v),
-        Err(e) => {
-            eprintln!("bad value {text:?}: {e:?}");
-            None
-        }
-    }
 }
