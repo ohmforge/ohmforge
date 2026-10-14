@@ -330,7 +330,7 @@ impl Shell {
 }
 
 /// Map a reference's leading letter to a part kind and its value's unit —
-/// `R`→Ω, `C`→F, `L`→H, `V`→V. (Mirrors `ee-fmt`'s private netlist classifier.)
+/// `R`→Ω, `C`→F, `L`→H, `V`→V, `I`→A. (Mirrors `ee-fmt`'s private netlist classifier.)
 fn classify(reference: &str) -> Result<(PartKind, Unit), ShellError> {
     let c = reference.chars().next().ok_or(ShellError::EmptyReference)?;
     Ok(match c.to_ascii_uppercase() {
@@ -338,6 +338,7 @@ fn classify(reference: &str) -> Result<(PartKind, Unit), ShellError> {
         'C' => (PartKind::Capacitor, Unit::Farad),
         'L' => (PartKind::Inductor, Unit::Henry),
         'V' => (PartKind::VoltageSource, Unit::Volt),
+        'I' => (PartKind::CurrentSource, Unit::Ampere),
         other => return Err(ShellError::UnknownPartKind(other)),
     })
 }
@@ -354,6 +355,7 @@ fn kind_label(kind: &PartKind) -> &str {
         PartKind::Capacitor => "capacitor",
         PartKind::Inductor => "inductor",
         PartKind::VoltageSource => "source",
+        PartKind::CurrentSource => "current source",
         PartKind::Other(name) => name,
     }
 }

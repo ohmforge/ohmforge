@@ -296,6 +296,7 @@ fn take_kind(rest: &str) -> Result<(PartKind, &str), ErrorKind> {
         "C" => PartKind::Capacitor,
         "L" => PartKind::Inductor,
         "V" => PartKind::VoltageSource,
+        "I" => PartKind::CurrentSource,
         _ => return Err(ErrorKind::UnknownKind(tok.to_string())),
     };
     Ok((kind, remainder))
@@ -341,13 +342,14 @@ fn is_ground(name: &str) -> bool {
     matches!(name.to_ascii_lowercase().as_str(), "gnd" | "ground" | "0")
 }
 
-/// The kind field for a part: `R`/`C`/`L`/`V`, or `other(<name>)`.
+/// The kind field for a part: `R`/`C`/`L`/`V`/`I`, or `other(<name>)`.
 fn write_kind(kind: &PartKind) -> String {
     match kind {
         PartKind::Resistor => "R".to_string(),
         PartKind::Capacitor => "C".to_string(),
         PartKind::Inductor => "L".to_string(),
         PartKind::VoltageSource => "V".to_string(),
+        PartKind::CurrentSource => "I".to_string(),
         PartKind::Other(name) => format!("other({name})"),
     }
 }
@@ -578,6 +580,7 @@ R3 R 1k a ground
             PartKind::Capacitor => "C".into(),
             PartKind::Inductor => "L".into(),
             PartKind::VoltageSource => "V".into(),
+            PartKind::CurrentSource => "I".into(),
             PartKind::Other(n) => format!("other:{n}"),
         }
     }

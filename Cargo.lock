@@ -72,6 +72,8 @@ name = "ee-shell"
 version = "0.0.0"
 dependencies = [
  "ee-core",
+ "ee-sim",
+ "ee-tui",
 ]
 
 [[package]]
