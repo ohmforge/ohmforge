@@ -8,13 +8,13 @@ Phased so that **something real works at the end of every milestone**. Each phas
 
 **Goal:** type a circuit in `eesh`, simulate it, see a waveform. The end-to-end pipeline works, even if narrow.
 
-- [ ] Cargo workspace + crate stubs (done — see repo root).
-- [ ] `ee-core`: circuit graph, typed units/values, engineering-notation parser (`4k7`, `1u`).
-- [ ] `ee-sim`: MNA for **linear** circuits (R, C, L, DC/pulse/sine sources) + **DC op-point** + **transient** (Backward Euler).
-- [ ] `ee-shell`: minimal REPL — `add`, `wire`, `probe`, `run`, `show`, `help`, history, completion.
-- [ ] `ee-tui`: schematic list view + **braille waveform** plot; shell pane.
-- [ ] `ee-fmt`: native project save/load (human-readable).
-- [ ] `criterion` benches on stamp/solve; CI (build/test/clippy/fmt) on Linux/macOS/Windows.
+- [x] Cargo workspace + crate stubs.
+- [x] `ee-core`: circuit graph (union-find nets), typed units/values, engineering-notation parser (`4k7`, `1u`), `Signal` result type.
+- [x] `ee-sim`: MNA for **linear** circuits (R, C, L, DC voltage + current sources) + **DC op-point** + **transient** (Backward Euler), validated against analytic RC/RL/RLC. _(time-varying pulse/sine sources: follow-up.)_
+- [x] `ee-shell`: minimal REPL — `add`, `wire`, `probe`, `run`, `show`, `help`; interactive (TTY) or scripted (pipe). _(line history + completion: follow-up.)_
+- [ ] `ee-tui`: **braille waveform** plot done ✅; schematic list view + dockable shell pane still to do.
+- [x] `ee-fmt`: native project save/load (human-readable, lossless round-trip) + friendly netlist import.
+- [ ] `criterion` benches on stamp/solve (CI build/test/clippy/fmt/wasm/MSRV/docs on Linux/macOS/Windows is done ✅).
 
 **Demo:** an RC low-pass built by command, transient run, waveform on screen. ✅ pipeline proven.
 
