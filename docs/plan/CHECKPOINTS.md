@@ -99,7 +99,7 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 - [x] **CP-PLAT.1** CI green: fmt + `clippy -D warnings` + test on linux/macOS/windows (+ MSRV 1.79, docs). — *gate:* `.github/workflows/ci.yml` runs the matrix; gates pass locally.
 - [ ] **CP-PLAT.2** `aarch64` build (Raspberry Pi / Apple Silicon). — *gate:* cross build succeeds in CI.
 - [x] **CP-PLAT.3** `wasm32-unknown-unknown` build of the compute core. — *gate:* `ee-core`+`ee-sim` compile to wasm (CI `wasm` job + verified locally).
-- [~] **CP-PLAT.4** Criterion benches wired for `stamp/solve` + event queue. — *gate:* `cargo bench` runs; thresholds recorded. _(in progress — agent on `track/sim-core`; event-queue bench waits on `CP-BRD-M1.1`.)_
+- [x] **CP-PLAT.4** Criterion benches wired for `stamp/solve` (+ parser). — *gate:* `cargo bench` runs; recorded op-point/transient/N-ladder-scaling + parse numbers. _(Event-queue bench deferred until the digital kernel exists — `CP-BRD-M1.1`.)_
 - [ ] **CP-PLAT.5** Determinism harness: golden sims reproduce bit-for-bit. — *gate:* golden-file suite passes twice identically.
 
 ---
@@ -112,8 +112,8 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 | boards | 0 | 0 | 10 |
 | ui-shell | 3 | 1 | 13 |
 | ai-fmt | 1 | 0 | 9 |
-| platform | 2 | 1 | 5 |
-| **Total** | **11** | **2** | **52** |
+| platform | 3 | 0 | 5 |
+| **Total** | **12** | **1** | **52** |
 
 *Update this table when flipping a checkpoint.*
 
