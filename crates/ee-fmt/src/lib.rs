@@ -6,5 +6,7 @@
 //! CSV/VCD. See docs/FEATURES.md §9. (Roadmap M0 native; M1 SPICE; M2 KiCad/VCD.)
 
 pub mod netlist;
+pub mod project;
 
 pub use netlist::{parse as parse_netlist, NetlistError};
+pub use project::{load as load_project, save as save_project, ProjectError};
