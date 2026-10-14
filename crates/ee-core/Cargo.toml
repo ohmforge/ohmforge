@@ -10,3 +10,13 @@ description = "Core data model for ee-assist: circuit graph, units, values, time
 workspace = true
 
 [dependencies]
+
+[dev-dependencies]
+# Benches only; dev-deps never ship in the library crate, so this keeps ee-core
+# itself dependency-free and wasm/MSRV-clean. Default features off; we only need
+# `cargo_bench_support` to run a `harness = false` bench under `cargo bench`.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "parse"
+harness = false
