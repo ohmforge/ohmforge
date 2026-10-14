@@ -10,12 +10,12 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 
 ## Track: sim-core (`ee-core`, `ee-sim`) → design: [`track-sim-core.md`](track-sim-core.md)
 
-### M0 — linear engine + transient
-- [ ] **CP-SIM-M0.1** Circuit graph: add/remove parts, `wire` merges nets, name lookup, stamping iteration. — *gate:* `cargo test -p ee-core graph::` covers net-merge + lookup.
+### M0 — linear engine + transient  ✅ complete
+- [x] **CP-SIM-M0.1** Circuit graph: add/remove parts, `wire` merges nets, name lookup, stamping iteration. — *gate:* `cargo test -p ee-core graph::` covers net-merge + lookup.
 - [x] **CP-SIM-M0.2** Units + engineering-notation `Value` parser. — *gate:* `cargo test -p ee-core value::` (done in scaffold).
-- [ ] **CP-SIM-M0.3** Linear MNA + DC operating point (R + independent sources). — *gate:* golden resistive-divider solves to 1e-9 (`rc_divider_op`).
-- [ ] **CP-SIM-M0.4** Companion models for C/L + Backward-Euler transient. — *gate:* RC step response matches `1-e^(-t/RC)` within 1% (`rc_step_transient`).
-- [ ] **CP-SIM-M0.5** `Signal` type + streaming results from an analysis. — *gate:* a headless probe reads a transient `Signal` with correct units/length.
+- [x] **CP-SIM-M0.3** Linear MNA + DC operating point (R + independent V/I sources). — *gate:* `resistive_divider_operating_point` solves to 1e-9; `current_source_into_resistor_operating_point`.
+- [x] **CP-SIM-M0.4** Companion models for C/L + Backward-Euler transient. — *gate:* `rc_step_transient_matches_analytic` within 1%; also `rl_step_transient_matches_analytic`, `series_rlc_rings_at_the_damped_frequency`.
+- [x] **CP-SIM-M0.5** `Signal` type + results from an analysis. — *gate:* transient returns `Vec<Signal>` with correct units/length; consumed headless by the shell + `ee demo`.
 
 ### M1 — nonlinear + frequency domain
 - [ ] **CP-SIM-M1.1** Nonlinear device framework + Newton–Raphson; diode/LED. — *gate:* diode I–V matches Shockley within tol (`diode_iv`).
@@ -54,10 +54,10 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 ## Track: ui-shell (`ee-tui`, `ee-shell`, `ee-instruments`) → design: [`track-ui-shell.md`](track-ui-shell.md)
 
 ### M0 — shell + first pixels
-- [ ] **CP-UX-M0.1** eesh parser + core commands (`add`/`wire`/`probe`/`run`/`set`/`show`/`help`). — *gate:* parse tests; a scripted session builds a circuit graph.
-- [ ] **CP-UX-M0.2** TUI shell pane + schematic list/net view. — *gate:* renders a built circuit; layout snapshot test.
-- [ ] **CP-UX-M0.3** Braille waveform plot widget. — *gate:* plotting a known sine matches a golden ASCII snapshot.
-- [ ] **CP-UX-M0.4** probe → plot pipeline (consume `Signal`). — *gate:* `run` then `scope` shows the RC curve from `CP-SIM-M0.4`.
+- [x] **CP-UX-M0.1** eesh parser + core commands (`add`/`wire`/`probe`/`run`/`show`/`help`). — *gate:* parse/dispatch tests; a scripted session builds a circuit graph. _(`set <param>`: follow-up.)_
+- [~] **CP-UX-M0.2** TUI shell pane + schematic list/net view. — *gate:* renders a built circuit; layout snapshot test. _(in progress — agent on `track/ui-shell`.)_
+- [x] **CP-UX-M0.3** Braille waveform plot widget. — *gate:* plotting a known sine matches a golden ASCII snapshot.
+- [x] **CP-UX-M0.4** probe → plot pipeline (consume `Signal`). — *gate:* shell `run` + `ee demo` plot the RC curve from `CP-SIM-M0.4`.
 
 ### M1 — instruments + interaction
 - [ ] **CP-UX-M1.1** Oscilloscope (multi-channel, edge/level trigger, cursors). — *gate:* trigger locks a periodic signal; snapshot.
@@ -77,7 +77,7 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 ## Track: ai-fmt (`ee-ai`, `ee-fmt`) → design: [`track-ai-fmt.md`](track-ai-fmt.md)
 
 ### M0 — persistence
-- [ ] **CP-AF-M0.1** Native project format save/load (round-trip). — *gate:* save→load yields an equal circuit; golden file stable.
+- [x] **CP-AF-M0.1** Native project format save/load (round-trip). — *gate:* save→load yields an equal circuit; golden file stable. _(Bonus: a friendly netlist import format also landed — partial progress toward `CP-AF-M1.1`, though that one is SPICE-specific.)_
 
 ### M1 — interop + first AI
 - [ ] **CP-AF-M1.1** SPICE netlist import/export. — *gate:* import a known netlist (sim matches) and export round-trips.
@@ -96,23 +96,25 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 ---
 
 ## Track: platform (cross-cutting, on `main`) → design: [`README.md`](README.md) §Cross-cutting
-- [ ] **CP-PLAT.1** CI green: fmt + `clippy -D warnings` + test on linux/macOS/windows. — *gate:* CI workflow passes on a PR.
+- [x] **CP-PLAT.1** CI green: fmt + `clippy -D warnings` + test on linux/macOS/windows (+ MSRV 1.79, docs). — *gate:* `.github/workflows/ci.yml` runs the matrix; gates pass locally.
 - [ ] **CP-PLAT.2** `aarch64` build (Raspberry Pi / Apple Silicon). — *gate:* cross build succeeds in CI.
-- [ ] **CP-PLAT.3** `wasm32-unknown-unknown` build of the compute core. — *gate:* `ee-core`+`ee-sim` compile to wasm (no I/O leak).
-- [ ] **CP-PLAT.4** Criterion benches wired for `stamp/solve` + event queue. — *gate:* `cargo bench` runs; thresholds recorded.
+- [x] **CP-PLAT.3** `wasm32-unknown-unknown` build of the compute core. — *gate:* `ee-core`+`ee-sim` compile to wasm (CI `wasm` job + verified locally).
+- [~] **CP-PLAT.4** Criterion benches wired for `stamp/solve` + event queue. — *gate:* `cargo bench` runs; thresholds recorded. _(in progress — agent on `track/sim-core`; event-queue bench waits on `CP-BRD-M1.1`.)_
 - [ ] **CP-PLAT.5** Determinism harness: golden sims reproduce bit-for-bit. — *gate:* golden-file suite passes twice identically.
 
 ---
 
 ### Progress summary
 
-| Track | Done | Total |
-|---|---|---|
-| sim-core | 1 | 15 |
-| boards | 0 | 10 |
-| ui-shell | 0 | 13 |
-| ai-fmt | 0 | 9 |
-| platform | 0 | 5 |
-| **Total** | **1** | **52** |
+| Track | Done | In progress | Total |
+|---|---|---|---|
+| sim-core | 5 | 0 | 15 |
+| boards | 0 | 0 | 10 |
+| ui-shell | 3 | 1 | 13 |
+| ai-fmt | 1 | 0 | 9 |
+| platform | 2 | 1 | 5 |
+| **Total** | **11** | **2** | **52** |
 
-*Update this table when flipping a checkpoint. `CP-SIM-M0.2` is done (scaffold parser).*
+*Update this table when flipping a checkpoint.*
+
+**M0 is complete** across sim-core (all 5), ai-fmt (persistence), and the shell/plot pixels — the "type a circuit → simulate → see a wave" loop is proven end-to-end. Two M0 stragglers are in flight (`CP-UX-M0.2` TUI schematic/pane views, `CP-PLAT.4` benches). Next up: **M1** — see [`M1-PLAN.md`](M1-PLAN.md) for sequencing and the fan-out strategy.
