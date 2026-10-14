@@ -55,7 +55,7 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 
 ### M0 — shell + first pixels
 - [x] **CP-UX-M0.1** eesh parser + core commands (`add`/`wire`/`probe`/`run`/`show`/`help`). — *gate:* parse/dispatch tests; a scripted session builds a circuit graph. _(`set <param>`: follow-up.)_
-- [~] **CP-UX-M0.2** TUI shell pane + schematic list/net view. — *gate:* renders a built circuit; layout snapshot test. _(in progress — agent on `track/ui-shell`.)_
+- [x] **CP-UX-M0.2** TUI shell pane + schematic list/net view. — *gate:* `Schematic` + `Screen`/`Pane` render-to-string widgets; layout tests assert panes compose, fit width, and list every part. _(Live crossterm event loop + docking is M1: `CP-UX-M1.4`.)_
 - [x] **CP-UX-M0.3** Braille waveform plot widget. — *gate:* plotting a known sine matches a golden ASCII snapshot.
 - [x] **CP-UX-M0.4** probe → plot pipeline (consume `Signal`). — *gate:* shell `run` + `ee demo` plot the RC curve from `CP-SIM-M0.4`.
 
@@ -110,11 +110,11 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 |---|---|---|---|
 | sim-core | 5 | 0 | 15 |
 | boards | 0 | 0 | 10 |
-| ui-shell | 3 | 1 | 13 |
+| ui-shell | 4 | 0 | 13 |
 | ai-fmt | 1 | 0 | 9 |
 | platform | 3 | 0 | 5 |
-| **Total** | **12** | **1** | **52** |
+| **Total** | **13** | **0** | **52** |
 
 *Update this table when flipping a checkpoint.*
 
-**M0 is complete** across sim-core (all 5), ai-fmt (persistence), and the shell/plot pixels — the "type a circuit → simulate → see a wave" loop is proven end-to-end. Two M0 stragglers are in flight (`CP-UX-M0.2` TUI schematic/pane views, `CP-PLAT.4` benches). Next up: **M1** — see [`M1-PLAN.md`](M1-PLAN.md) for sequencing and the fan-out strategy.
+**🎉 M0 is complete.** Every M0 checkpoint across sim-core (all 5), ui-shell (shell + plot + schematic/pane views), ai-fmt (persistence), and platform (CI + wasm + benches) is green — the "type a circuit → simulate → see a wave" loop is proven end-to-end, with 48 workspace tests passing. Next up: **M1** — see [`M1-PLAN.md`](M1-PLAN.md) for sequencing and the fan-out strategy.
