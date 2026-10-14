@@ -9,5 +9,9 @@
 //! stalls the solver. See docs/ARCHITECTURE.md § "The TUI." (Roadmap M0+.)
 
 pub mod plot;
+pub mod schematic;
+pub mod screen;
 
 pub use plot::Plot;
+pub use schematic::Schematic;
+pub use screen::{Pane, Screen};
