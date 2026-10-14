@@ -1,90 +1,80 @@
 //! `ee` — the ee-assist binary.
 //!
-//! At M0 this becomes the full app: it owns session/project state and runs the
-//! TUI event loop wiring the shell, engines, instruments, and AI copilot
-//! together. For now it's an end-to-end smoke test of the M0 compute path —
-//! parse a netlist, build the circuit, simulate a transient, and draw the
-//! result in the terminal — proving every crate links and the pieces fit.
-//! See docs/ROADMAP.md.
+//! At M0 this is the interactive shell: an `eesh` REPL driven by
+//! [`ee_shell::Shell`], which parses commands, mutates the circuit, runs the
+//! engine, and renders waveforms in the terminal. It reads commands from a TTY
+//! (interactive) or a pipe (scripted), so the same path is used either way.
+//! `ee demo` runs a built-in RC low-pass script. The full TUI event loop lands
+//! as this grows (docs/ROADMAP.md).
 
-use ee_fmt::netlist;
-use ee_sim::{Analysis, Engine};
-use ee_tui::Plot;
+use std::io::{self, BufRead, IsTerminal, Write};
 
-/// The circuit, as you would type it. An RC low-pass: a 5 V step through 1 kΩ
-/// into 1 µF, so τ = R·C = 1 ms.
-const NETLIST: &str = "\
-.title rc-lowpass
-V1 in  gnd 5
-R1 in  out 1k
-C1 out gnd 1u
-";
+use ee_shell::Shell;
+
+/// The built-in demo: an RC low-pass, typed as shell commands.
+const DEMO: &str = "\
+add V1 in  gnd 5
+add R1 in  out 1k
+add C1 out gnd 1u
+probe out
+run tran 5m
+show";
 
 fn main() {
-    println!("ee-assist — AI-assisted EE workbench (scaffold)\n");
-    println!("netlist:");
-    for line in NETLIST.lines() {
-        println!("  {line}");
+    let mut shell = Shell::new();
+
+    if std::env::args().nth(1).as_deref() == Some("demo") {
+        run_script(&mut shell, DEMO.lines());
+        return;
     }
-    println!();
 
-    // ── Parse: text → circuit. ──
-    let circuit = match netlist::parse(NETLIST) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("netlist error, {e}");
-            std::process::exit(1);
+    let stdin = io::stdin();
+    if stdin.is_terminal() {
+        repl(&mut shell);
+    } else {
+        // Piped / scripted: execute each line, output to stdout, errors to stderr.
+        run_script(&mut shell, stdin.lock().lines().map_while(Result::ok));
+    }
+}
+
+/// Run a sequence of command lines, printing each command's output.
+fn run_script<I, S>(shell: &mut Shell, lines: I)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    for line in lines {
+        match shell.execute(line.as_ref()) {
+            Ok(out) if !out.is_empty() => println!("{out}"),
+            Ok(_) => {}
+            Err(e) => eprintln!("error: {e}"),
         }
-    };
+    }
+}
 
-    // ── Simulate: transient over 5 τ, 20 µs steps. ──
-    let analysis = Analysis::Transient {
-        duration: 5e-3,
-        step: Some(20e-6),
-    };
-    let signals = match Engine::new().run(&circuit, &analysis) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("simulation failed: {e}");
-            std::process::exit(1);
+/// Interactive read-eval-print loop with a prompt.
+fn repl(shell: &mut Shell) {
+    println!("ee-assist — eesh (M0). Type `help`, or `add R1 in out 1k`. Ctrl-D to quit.\n");
+    let stdin = io::stdin();
+    let mut line = String::new();
+    loop {
+        print!("ee> ");
+        let _ = io::stdout().flush();
+        line.clear();
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) => {
+                println!();
+                break; // EOF (Ctrl-D)
+            }
+            Ok(_) => match shell.execute(line.trim_end()) {
+                Ok(out) if !out.is_empty() => println!("{out}"),
+                Ok(_) => {}
+                Err(e) => eprintln!("error: {e}"),
+            },
+            Err(e) => {
+                eprintln!("input error: {e}");
+                break;
+            }
         }
-    };
-
-    // ── Draw v(out) in the braille scope. `out` is R1's second terminal. ──
-    let out = circuit.part_by_ref("R1").expect("R1 exists").terminals[1];
-    let out_name = format!("v(n{})", circuit.resolve(out).0);
-    let Some(sig) = signals.iter().find(|s| s.name == out_name) else {
-        eprintln!("no signal for the output node");
-        std::process::exit(1);
-    };
-    let Some(y) = sig.real() else { return };
-
-    // Time axis in milliseconds so the labels read nicely.
-    let x_ms: Vec<f64> = sig.x.iter().map(|t| t * 1e3).collect();
-    let plot = Plot::new("v(out): RC step response")
-        .units("V", "ms")
-        .size(72, 16);
-    println!("{}", plot.render(&x_ms, y));
-
-    // A couple of measured points against the textbook RC curve.
-    let sample_at = |t_target: f64| -> f64 {
-        let i = (0..sig.x.len())
-            .min_by(|&a, &b| {
-                let (da, db) = ((sig.x[a] - t_target).abs(), (sig.x[b] - t_target).abs());
-                da.total_cmp(&db)
-            })
-            .unwrap_or(0);
-        y[i]
-    };
-    println!(
-        "\n  v(out) @ 1τ (1 ms) = {:.3} V   (textbook 63.2% → 3.161 V)",
-        sample_at(1e-3)
-    );
-    println!(
-        "  v(out) @ 5τ (5 ms) = {:.3} V   (textbook 99.3% → 4.966 V)",
-        sample_at(5e-3)
-    );
-    println!(
-        "\ntype a circuit → simulate → see it. next: the interactive shell (docs/ROADMAP.md)."
-    );
+    }
 }
