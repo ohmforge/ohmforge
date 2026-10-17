@@ -2,6 +2,26 @@
 
 `eesh` is a dedicated REPL for building, wiring, probing, running, and reasoning about circuits. It's keyboard-first, scriptable, and speaks the same API the TUI and AI use — so anything you can click or ask for, you can type, and vice-versa.
 
+## Implemented today (M1/M2)
+
+The grammar below (under "Command families") is the **design target**. What ships and is tested today is a focused subset — see [`tutorials/getting-started.md`](tutorials/getting-started.md) for a worked session:
+
+```
+add <ref> <nodeA> <nodeB> <value>   # kind from the ref's first letter: R C L V I D
+wire <nodeA> <nodeB>                 # merge two named nets
+probe <node>                         # mark a node to plot on the next run
+run [tran [<dur>]] | run op          # transient (braille scope) or DC operating point
+show                                 # list placed parts
+undo · checkpoint <name> · restore <name>
+help
+```
+
+- **Part kind is inferred from the reference's first letter** (`R1`→resistor, `C1`→capacitor, `V1`→source, …); there is no `<type>` token yet. 3-/4-terminal and controlled devices (BJT/MOSFET/VCVS/…) are modeled by the engine but not yet placeable from this grammar — build those via the netlist/project formats or the engine API.
+- **Scripting** (`set`, `repeat … { }`, `$vars`, deterministic replay) and **comments** (`#`) run through the script engine: pipe a file in — `ee < script.eesh` or `cat script.eesh | ee`. The interactive REPL runs one command per line.
+- The binary also has non-REPL showcases: `ee demo` (RC scope), `ee bode`, `ee amp`, `ee cosim`, and `ee tui` (interactive panels).
+
+Everything from here down is the broader design the shell is growing toward; not all of it is wired yet.
+
 ## Design principles
 
 - **Terse but readable.** `add r R1 4k7 a b` beats clicking through menus.

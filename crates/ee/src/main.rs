@@ -7,7 +7,7 @@
 //! voltage overlay). The full dockable TUI event loop lands as this grows
 //! (docs/ROADMAP.md).
 
-use std::io::{self, BufRead, IsTerminal};
+use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
 
 use ee_core::graph::PartKind;
@@ -42,7 +42,7 @@ const RESET: &str = "\x1b[0m";
 
 fn main() {
     match std::env::args().nth(1).as_deref() {
-        Some("demo") => run_script(&mut Shell::new(), DEMO.lines()),
+        Some("demo") => run_lines(&mut Shell::new(), DEMO.lines()),
         Some("bode") => demo_bode(),
         Some("amp") => demo_amp(),
         Some("cosim") => demo_cosim(),
@@ -59,8 +59,21 @@ fn main() {
                     eprintln!("{RED}repl error:{RESET} {e}");
                 }
             } else {
-                // Piped / scripted: run each line, output to stdout, errors to stderr.
-                run_script(&mut shell, stdin.lock().lines().map_while(Result::ok));
+                // Piped / scripted: run the whole input through the script engine so
+                // comments, `repeat` loops, and `$vars` work — not just one command
+                // per line (stdin may be an `.eesh` script).
+                let mut src = String::new();
+                if stdin.lock().read_to_string(&mut src).is_ok() {
+                    match shell.run_script(&src) {
+                        Ok(run) => {
+                            let t = run.transcript;
+                            if !t.trim_end().is_empty() {
+                                println!("{}", t.trim_end_matches('\n'));
+                            }
+                        }
+                        Err(e) => eprintln!("error: {e}"),
+                    }
+                }
             }
         }
     }
@@ -291,7 +304,7 @@ fn demo_cosim() {
 }
 
 /// Run a sequence of command lines, printing each command's output.
-fn run_script<I, S>(shell: &mut Shell, lines: I)
+fn run_lines<I, S>(shell: &mut Shell, lines: I)
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
