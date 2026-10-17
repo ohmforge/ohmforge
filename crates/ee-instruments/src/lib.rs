@@ -15,6 +15,7 @@ pub mod bode;
 pub mod dmm;
 pub mod fft;
 pub mod funcgen;
+pub mod logic_analyzer;
 pub mod math;
 pub mod oscilloscope;
 pub mod psu;
@@ -24,6 +25,10 @@ pub use bode::{corner_3db, Bode};
 pub use dmm::{measure, DmmMode, DmmReading, Multimeter};
 pub use fft::{fft, magnitude_spectrum, peak_bin, Window};
 pub use funcgen::{FuncGen, Waveform};
+pub use logic_analyzer::{
+    decode_i2c, decode_spi, decode_uart, DigitalChannel, I2cEvent, Level, LogicAnalyzer, Parity,
+    SpiConfig, UartConfig, UartFrame,
+};
 pub use math::{math_channel, MathOp};
 pub use oscilloscope::{CursorReadout, Cursors, Oscilloscope, Slope, Timebase, Trigger};
 pub use psu::{BenchPsu, PsuMode, PsuOutput};
