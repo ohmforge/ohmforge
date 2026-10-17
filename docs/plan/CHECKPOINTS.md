@@ -28,7 +28,7 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 ### M2 — statistical + scale
 - [ ] **CP-SIM-M2.1** Noise analysis (output spectral density). — *gate:* resistor thermal-noise floor matches `4kTR` within tol.
 - [ ] **CP-SIM-M2.2** Monte-Carlo + component tolerances (seeded, deterministic). — *gate:* fixed seed reproduces the same spread bit-for-bit.
-- [ ] **CP-SIM-M2.3** Controlled + behavioral sources (VCVS/VCCS/…). — *gate:* an ideal-gain VCVS stage matches expected transfer.
+- [x] **CP-SIM-M2.3** Controlled sources (VCVS/VCCS/CCVS/CCCS). — *gate:* gain-10 VCVS exact at op-point and flat in AC; VCCS `Vout=G·Vin·R`; an ideal op-amp (huge-gain VCVS) non-inverting config → 1+Rf/Rg=10; CCVS/CCCS current-sense. Stamped in real + complex MNA. `PartKind::{Vcvs,Vccs,Ccvs,Cccs}` (native format round-trips the gain/ref; SPICE export defers).
 - [ ] **CP-SIM-M2.4** Sparse solver path for large nets. — *gate:* criterion bench shows target scaling on a 1k-node ladder.
 
 ---

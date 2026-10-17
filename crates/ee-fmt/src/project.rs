@@ -291,6 +291,11 @@ fn take_kind(rest: &str) -> Result<(PartKind, &str), ErrorKind> {
         return Ok((PartKind::Other(name.to_string()), remainder));
     }
     let (tok, remainder) = split_first_token(rest);
+    // Controlled sources carry a gain (and, for the CC pair, a case-sensitive
+    // control reference), so parse them off the raw token before upper-casing.
+    if let Some(result) = parse_controlled(tok) {
+        return Ok((result?, remainder));
+    }
     let kind = match tok.to_ascii_uppercase().as_str() {
         "R" => PartKind::Resistor,
         "C" => PartKind::Capacitor,
@@ -360,8 +365,45 @@ fn write_kind(kind: &PartKind) -> String {
         PartKind::Diode => "D".to_string(),
         PartKind::Bjt(pol, _) => format!("Q{}", polarity_letter(*pol)),
         PartKind::Mosfet(pol, _) => format!("M{}", polarity_letter(*pol)),
+        PartKind::Vcvs(e) => format!("vcvs({e})"),
+        PartKind::Vccs(g) => format!("vccs({g})"),
+        PartKind::Ccvs(r, ctrl) => format!("ccvs({r},{ctrl})"),
+        PartKind::Cccs(f, ctrl) => format!("cccs({f},{ctrl})"),
         PartKind::Other(name) => format!("other({name})"),
     }
+}
+
+/// Parse a controlled-source kind token like `vcvs(10)` or `ccvs(2000,Vsense)`,
+/// case-preserving (the control reference is case-sensitive). `None` if the token
+/// isn't a controlled source.
+fn parse_controlled(tok: &str) -> Option<Result<PartKind, ErrorKind>> {
+    let open = tok.find('(')?;
+    let head = tok[..open].to_ascii_lowercase();
+    if !matches!(head.as_str(), "vcvs" | "vccs" | "ccvs" | "cccs") {
+        return None;
+    }
+    let bad = || ErrorKind::UnknownKind(tok.to_string());
+    let Some(inner) = tok.strip_suffix(')').map(|t| &t[open + 1..]) else {
+        return Some(Err(ErrorKind::UnterminatedOther));
+    };
+    Some(match head.as_str() {
+        "vcvs" => inner.trim().parse().map(PartKind::Vcvs).map_err(|_| bad()),
+        "vccs" => inner.trim().parse().map(PartKind::Vccs).map_err(|_| bad()),
+        _ => match inner.split_once(',') {
+            Some((g, ctrl)) => match g.trim().parse::<f64>() {
+                Ok(gain) => {
+                    let ctrl = ctrl.trim().to_string();
+                    Ok(if head == "ccvs" {
+                        PartKind::Ccvs(gain, ctrl)
+                    } else {
+                        PartKind::Cccs(gain, ctrl)
+                    })
+                }
+                Err(_) => Err(bad()),
+            },
+            None => Err(bad()),
+        },
+    })
 }
 
 /// `n` for an N-type transistor, `p` for P-type.
@@ -602,6 +644,10 @@ R3 R 1k a ground
             PartKind::Diode => "D".into(),
             PartKind::Bjt(..) => "Q".into(),
             PartKind::Mosfet(..) => "M".into(),
+            PartKind::Vcvs(_) => "E".into(),
+            PartKind::Vccs(_) => "G".into(),
+            PartKind::Ccvs(..) => "H".into(),
+            PartKind::Cccs(..) => "F".into(),
             PartKind::Other(n) => format!("other:{n}"),
         }
     }

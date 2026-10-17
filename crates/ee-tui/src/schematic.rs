@@ -118,6 +118,10 @@ pub(crate) fn kind_label(kind: &PartKind) -> &str {
         PartKind::Diode => "Diode",
         PartKind::Bjt(..) => "BJT",
         PartKind::Mosfet(..) => "MOSFET",
+        PartKind::Vcvs(_) => "VCVS",
+        PartKind::Vccs(_) => "VCCS",
+        PartKind::Ccvs(..) => "CCVS",
+        PartKind::Cccs(..) => "CCCS",
         PartKind::Other(name) => name,
     }
 }

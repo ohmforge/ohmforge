@@ -339,7 +339,14 @@ pub fn export(circuit: &Circuit) -> String {
 fn is_exportable(kind: &PartKind) -> bool {
     !matches!(
         kind,
-        PartKind::Other(_) | PartKind::Diode | PartKind::Bjt(..) | PartKind::Mosfet(..)
+        PartKind::Other(_)
+            | PartKind::Diode
+            | PartKind::Bjt(..)
+            | PartKind::Mosfet(..)
+            | PartKind::Vcvs(_)
+            | PartKind::Vccs(_)
+            | PartKind::Ccvs(..)
+            | PartKind::Cccs(..)
     )
 }
 
@@ -614,6 +621,10 @@ R2 mid 0   1k
             PartKind::Diode => "D".into(),
             PartKind::Bjt(..) => "Q".into(),
             PartKind::Mosfet(..) => "M".into(),
+            PartKind::Vcvs(_) => "E".into(),
+            PartKind::Vccs(_) => "G".into(),
+            PartKind::Ccvs(..) => "H".into(),
+            PartKind::Cccs(..) => "F".into(),
             PartKind::Other(n) => format!("other:{n}"),
         }
     }
