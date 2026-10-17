@@ -1,14 +1,16 @@
 //! The shipped `examples/formats/` files are real: each is loaded here and
 //! proven to do what its guide claims — the SPICE deck imports and simulates to
-//! the divider midpoint, and the native project round-trips byte-for-byte and
-//! simulates. If an example drifts from the code, this test fails.
+//! the divider midpoint, the KiCad netlist imports and simulates to the same
+//! midpoint, and the native project round-trips byte-for-byte and simulates. If
+//! an example drifts from the code, this test fails.
 
-use ee_fmt::{import_spice, load_project, save_project};
+use ee_fmt::{import_kicad, import_spice, load_project, save_project, to_bom_csv};
 use ee_sim::{Analysis, Engine};
 
 /// The example files, embedded at compile time (paths are relative to this
 /// source file: `crates/ee-fmt/tests/` → repo root `examples/formats/`).
 const DIVIDER_CIR: &str = include_str!("../../../examples/formats/divider.cir");
+const DIVIDER_NET: &str = include_str!("../../../examples/formats/divider.net");
 const RC_LOWPASS: &str = include_str!("../../../examples/formats/rc-lowpass.eeproj");
 
 /// Read one solved node voltage by its resolved-net signal name.
@@ -39,6 +41,30 @@ fn example_spice_deck_imports_and_simulates() {
         (node_volts(&circuit, out) - 5.0).abs() < 1e-9,
         "divider midpoint is 5 V"
     );
+}
+
+#[test]
+fn example_kicad_netlist_imports_and_simulates() {
+    let circuit = import_kicad(DIVIDER_NET).expect("the example KiCad netlist imports");
+    assert_eq!(circuit.parts().len(), 3, "V1, R1, R2");
+
+    // The source parsed its `DC 10` value, and the two equal resistors put the
+    // `/out` midpoint at 5 V — a real solve of the imported topology.
+    assert_eq!(
+        circuit.part_by_ref("V1").unwrap().value.unwrap().magnitude,
+        10.0
+    );
+    let out = circuit.part_by_ref("R1").unwrap().terminals[1];
+    assert!(
+        (node_volts(&circuit, out) - 5.0).abs() < 1e-9,
+        "KiCad divider midpoint is 5 V"
+    );
+
+    // And its BOM lists every part: the two 1 kΩ resistors group to qty 2.
+    let bom = to_bom_csv(&circuit);
+    assert!(bom.starts_with("kind,value,quantity,references\n"), "{bom}");
+    assert!(bom.contains("Resistor,1000Ω,2,R1 R2\n"), "{bom}");
+    assert!(bom.contains("Voltage source,10V,1,V1\n"), "{bom}");
 }
 
 #[test]
