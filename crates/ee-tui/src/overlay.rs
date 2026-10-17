@@ -9,7 +9,7 @@
 //! Like the rest of `ee-tui` this is a pure render-to-`String` layer with no
 //! terminal event loop (that is `CP-UX-M1.4`) and — crucially — **no dependency on
 //! `ee-sim`**. The op-point voltages come in as data: either the single-sample
-//! [`Signal`]s a DC solve emits (named `v(n<net>)`), via
+//! [`Signal`](ee_core::Signal)s a DC solve emits (named `v(n<net>)`), via
 //! [`NodeVoltages::from_signals`], or a map the caller builds by hand with
 //! [`NodeVoltages::set`]. Ground is always 0 V and need not be supplied; an
 //! unknown/unsolved net renders as `?` rather than panicking.
