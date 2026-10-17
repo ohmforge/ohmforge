@@ -10,7 +10,7 @@
 //! already are.
 //!
 //! The crossterm raw-mode glue (reading real key/mouse events, drawing the frame)
-//! lives in the sibling [`run`](crate::run) module as a thin `pub fn run` wrapper
+//! lives in the sibling [`run`](mod@crate::run) module as a thin `pub fn run` wrapper
 //! the binary calls; it only translates OS events into [`AppEvent`]s and prints
 //! what [`App::render`] returns. That split is deliberate: the gate below this
 //! comment is all pure logic.
@@ -137,7 +137,7 @@ pub enum KeyCode {
 
 /// A key press: a [`KeyCode`] plus whether Ctrl was held.
 ///
-/// This is the abstract key the state machine reacts to; [`run`](crate::run) maps
+/// This is the abstract key the state machine reacts to; [`run`](fn@crate::run) maps
 /// real crossterm key events onto it. Only the Ctrl modifier matters to the app
 /// (Ctrl-P palette, Ctrl-C quit, Ctrl-arrows resize), so that is all we carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,7 +185,7 @@ pub struct MouseEvent {
 
 /// An abstract input event the state machine understands.
 ///
-/// [`run`](crate::run) produces these from crossterm; the tests build them
+/// [`run`](fn@crate::run) produces these from crossterm; the tests build them
 /// directly. Nothing here depends on a terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppEvent {

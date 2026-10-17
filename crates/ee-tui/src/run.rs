@@ -5,7 +5,7 @@
 //! and mouse capture, translate each crossterm event into an [`AppEvent`], feed
 //! it to the pure [`App`] state machine, and print whatever [`App::render`]
 //! returns. The interesting logic is in [`app`](crate::app) and is unit-tested
-//! without a tty; the translation functions here ([`map_key`], [`map_mouse`])
+//! without a tty; the translation functions here (`map_key`, `map_mouse`)
 //! are pure and tested too, so only the `run` loop itself (I/O) is untested.
 //!
 //! The binary calls [`run`] with a [`Backend`] (e.g. `ee-shell`'s `Shell`):

@@ -213,7 +213,7 @@ impl Shell {
                 &self.circuit,
                 &Analysis::Transient {
                     duration,
-                    step: None, // engine default: duration / 1000
+                    step: None, // None = engine-chosen adaptive timestep (LTE control)
                 },
             )
             .map_err(ShellError::Sim)?;
