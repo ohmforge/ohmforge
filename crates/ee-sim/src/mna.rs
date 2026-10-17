@@ -46,6 +46,17 @@ impl System {
         }
     }
 
+    /// Add `val` to the matrix entry at (`row`, `col`); a ground index (`None`)
+    /// is the reference and is dropped. This is the raw, possibly *asymmetric*
+    /// entry stamp a multiport nonlinear device uses for its Jacobian (a BJT or
+    /// MOSFET transconductance is not symmetric); the two-terminal, symmetric
+    /// [`stamp_conductance`](Self::stamp_conductance) is the special case.
+    pub fn stamp_matrix(&mut self, row: Option<usize>, col: Option<usize>, val: f64) {
+        if let (Some(r), Some(c)) = (row, col) {
+            *self.at(r, c) += val;
+        }
+    }
+
     /// Stamp a current source of `amps` flowing from node `j` into node `i`.
     pub fn stamp_current(&mut self, i: Option<usize>, j: Option<usize>, amps: f64) {
         if let Some(i) = i {

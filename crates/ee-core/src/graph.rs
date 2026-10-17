@@ -34,8 +34,88 @@ pub enum PartKind {
     /// `I_s ≈ 1e-14 A`, emission `n = 1`, thermal voltage `V_t ≈ 0.0259 V`); an
     /// optional [`Value`] in amperes overrides `I_s`. (`CP-SIM-M1.1`.)
     Diode,
+    /// Bipolar junction transistor, Ebers–Moll injection model. Terminals are
+    /// `[collector, base, emitter]`; the [`Polarity`] selects NPN (`N`) or
+    /// PNP (`P`). Carries its own [`BjtModel`] parameters. (`CP-SIM-M1.2`.)
+    Bjt(Polarity, BjtModel),
+    /// MOSFET, level-1 square-law model with the body tied to the source.
+    /// Terminals are `[drain, gate, source]`; the [`Polarity`] selects NMOS
+    /// (`N`) or PMOS (`P`). Carries its own [`MosfetModel`] parameters.
+    /// (`CP-SIM-M1.2`.)
+    Mosfet(Polarity, MosfetModel),
     /// Anything not yet modeled natively, identified by name.
     Other(String),
+}
+
+/// Semiconductor channel/junction polarity. For a [`PartKind::Bjt`] this is NPN
+/// (`N`) vs. PNP (`P`); for a [`PartKind::Mosfet`] it is n-channel (`N`) vs.
+/// p-channel (`P`). It flips every current and controlling-voltage sign in the
+/// device model, so one set of equations serves both halves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Polarity {
+    /// NPN bipolar / n-channel MOSFET.
+    N,
+    /// PNP bipolar / p-channel MOSFET.
+    P,
+}
+
+impl Polarity {
+    /// The sign the model multiplies its controlling voltages and terminal
+    /// currents by: `+1` for `N`, `−1` for `P`.
+    pub const fn sign(self) -> f64 {
+        match self {
+            Polarity::N => 1.0,
+            Polarity::P => -1.0,
+        }
+    }
+}
+
+/// Ebers–Moll parameters for a [`PartKind::Bjt`]. Defaults are a generic
+/// small-signal silicon transistor at 300 K.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BjtModel {
+    /// Transport saturation current `I_s` (A).
+    pub is: f64,
+    /// Forward current gain `β_F` (dimensionless).
+    pub bf: f64,
+    /// Reverse current gain `β_R` (dimensionless).
+    pub br: f64,
+    /// Thermal voltage `V_t = kT/q` (V).
+    pub vt: f64,
+}
+
+impl Default for BjtModel {
+    fn default() -> Self {
+        Self {
+            is: 1e-14,
+            bf: 100.0,
+            br: 1.0,
+            vt: 0.025_852,
+        }
+    }
+}
+
+/// Level-1 (square-law) parameters for a [`PartKind::Mosfet`]. Defaults are a
+/// generic enhancement device: a 1 V threshold, 1 mA/V² transconductance, and no
+/// channel-length modulation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MosfetModel {
+    /// Threshold voltage magnitude `V_th` (V); the [`Polarity`] sets its sign.
+    pub vth: f64,
+    /// Transconductance parameter `K = ½·µ·Cox·W/L` (A/V²).
+    pub kp: f64,
+    /// Channel-length-modulation coefficient `λ` (1/V).
+    pub lambda: f64,
+}
+
+impl Default for MosfetModel {
+    fn default() -> Self {
+        Self {
+            vth: 1.0,
+            kp: 1e-3,
+            lambda: 0.0,
+        }
+    }
 }
 
 /// How an independent source varies over time.
