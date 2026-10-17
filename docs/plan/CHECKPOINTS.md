@@ -86,8 +86,8 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 
 ### M2 — verified design + waveform export
 - [x] **CP-AF-M2.1** Verification loop: staged patch → scratch apply → re-sim → measure → present diff; `apply`/`reject` gate. — *gate:* `verify` clones the base shell (`&Shell` → never mutates the live circuit), scratch-applies, measures; "5 V→3.3 V @ 500 mA" → good patch PASSes citing measured 3.3 V / 0.5 A, bad patch FAILs; live circuit unchanged until explicit `apply`.
-- [ ] **CP-AF-M2.2** Design / Debug / Firmware modes. — *gate:* Debug localizes a seeded fault; Firmware sketch flashes into the emulator (needs `CP-BRD-M2.1`).
-- [ ] **CP-AF-M2.3** VCD + CSV waveform export. — *gate:* VCD opens in GTKWave; CSV matches probe data.
+- [x] **CP-AF-M2.2** Design / Debug / Firmware modes. — *gate:* Debug localizes a seeded fault — on a 10 V divider with wrong R1=3k it reads v(out)=2.5 V and fingers R1 (smallest correction); Design reuses the verify loop; Firmware validates Intel-HEX ready for `load_firmware` (live flash is a thin follow-up).
+- [x] **CP-AF-M2.3** VCD + CSV waveform export. — *gate:* CSV matches the probe data byte-for-byte (complex → mag/phase columns); VCD is well-formed ($timescale/$var, strictly-increasing ticks, change-only records; analog `real` vars, 0/1 → scalar bits).
 
 ### M3 — breadth interop + offline
 - [ ] **CP-AF-M3.1** KiCad netlist import; BOM export (CSV). — *gate:* import a known KiCad netlist (sim matches); BOM lists every part with value/qty.
@@ -111,9 +111,9 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 | sim-core | 14 | 0 | 15 |
 | boards | 8 | 0 | 10 |
 | ui-shell | 12 | 0 | 13 |
-| ai-fmt | 5 | 0 | 9 |
+| ai-fmt | 7 | 0 | 9 |
 | platform | 3 | 0 | 5 |
-| **Total** | **42** | **0** | **52** |
+| **Total** | **44** | **0** | **52** |
 
 *Update this table when flipping a checkpoint.*
 

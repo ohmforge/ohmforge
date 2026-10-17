@@ -4,7 +4,7 @@
 //! Each mode is the same honest machinery wearing a different hat
 //! (docs/AI.md § Capabilities):
 //!
-//! * **Design** — the verification loop you already have ([`crate::verify`]):
+//! * **Design** — the verification loop you already have ([`verify`](fn@crate::verify)):
 //!   propose → scratch-apply → re-simulate → measure against a [`Spec`] →
 //!   present; nothing applies without approval. Re-exported here as the mode
 //!   surface ([`design`], [`Designer`], [`DesignOutcome`]).
