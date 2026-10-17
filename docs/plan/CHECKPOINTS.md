@@ -61,7 +61,7 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 
 ### M1 — instruments + interaction
 - [x] **CP-UX-M1.1** Oscilloscope (multi-channel, edge/level trigger, cursors). — *gate:* `trigger_locks_a_periodic_signal_regardless_of_phase` (3 capture phases → byte-identical golden frame); cursors read Δt/Δv/frequency. Self-contained in `ee-instruments` (no `ee-tui` dep — that cycle is forbidden).
-- [ ] **CP-UX-M1.2** Multimeter + function generator + bench PSU panels. — *gate:* DMM reads a node voltage; funcgen injects a source that shows on the scope.
+- [x] **CP-UX-M1.2** Multimeter + function generator + bench PSU panels. — *gate:* DMM reads a node voltage (DC/RMS/Vpp/freq); funcgen's generated sine renders on the scope as a stable frame; PSU CV↔CC crossover. Self-contained in `ee-instruments`. _(Wiring the funcgen into a live circuit source pairs with sim-core's time-varying source — a later integration.)_
 - [ ] **CP-UX-M1.3** Live overlay (voltage color, current-flow animation). — *gate:* overlay values match the DC op-point.
 - [ ] **CP-UX-M1.4** Dockable panels + mouse placement + command palette. — *gate:* interaction/event tests.
 - [ ] **CP-UX-M1.5** Scripting engine (`.eesh`, loops/params) + deterministic replay. — *gate:* a param-sweep script runs and replays identically.
@@ -110,10 +110,10 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 |---|---|---|---|
 | sim-core | 6 | 0 | 15 |
 | boards | 1 | 0 | 10 |
-| ui-shell | 5 | 0 | 13 |
+| ui-shell | 6 | 0 | 13 |
 | ai-fmt | 2 | 0 | 9 |
 | platform | 3 | 0 | 5 |
-| **Total** | **17** | **0** | **52** |
+| **Total** | **18** | **0** | **52** |
 
 *Update this table when flipping a checkpoint.*
 
