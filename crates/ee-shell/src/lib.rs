@@ -347,6 +347,23 @@ impl Shell {
     }
 }
 
+/// Drive the live TUI with the shell as its command backend.
+///
+/// This is the one seam between `ee-shell` and `ee-tui`'s interactive app
+/// (`CP-UX-M1.4`): the TUI calls [`execute`](Shell::execute) for each line the
+/// user runs and reads [`circuit`](Shell::circuit) to draw the schematic, while
+/// the dependency arrow stays `ee-shell → ee-tui`. The binary wires the live app
+/// with `ee_tui::run(Shell::new())`.
+impl ee_tui::Backend for Shell {
+    fn execute(&mut self, line: &str) -> Result<String, String> {
+        Shell::execute(self, line).map_err(|e| e.to_string())
+    }
+
+    fn circuit(&self) -> &Circuit {
+        Shell::circuit(self)
+    }
+}
+
 /// Map a reference's leading letter to a part kind and its value's unit —
 /// `R`→Ω, `C`→F, `L`→H, `V`→V, `I`→A. (Mirrors `ee-fmt`'s private netlist classifier.)
 fn classify(reference: &str) -> Result<(PartKind, Unit), ShellError> {
