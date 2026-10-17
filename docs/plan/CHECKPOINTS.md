@@ -68,7 +68,7 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 
 ### M2 — analysis views
 - [x] **CP-UX-M2.1** Logic analyzer + protocol-decode view (UART/SPI/I²C). — *gate:* an 8-N-1 capture of `"Hi!"` decodes to `[0x48,0x69,0x21]`; SPI mode-0 + I²C start/addr/ack/data/stop decoders; multi-channel timing view with annotated frames, fits width.
-- [ ] **CP-UX-M2.2** Breadboard view. — *gate:* renders a small circuit as a breadboard layout (snapshot).
+- [x] **CP-UX-M2.2** Breadboard view. — *gate:* `plain_render_matches_golden_snapshot` — nets→columns (union-find-collapsed, ground leftmost), parts→rows with standard designators (R/C/L/V/I/D/Q/M/E/G/H/F), power rails + trench; composes full-width into `Screen`.
 - [x] **CP-UX-M2.3** Bode/spectrum panel + scope math/FFT channels. — *gate:* Bode panel renders magnitude+phase vs log-f with the −3 dB corner; hand-rolled radix-2 FFT validated against a direct DFT (<1e-9), a pure sine → one dominant bin; scope math channels (A±B, A·B).
 - [x] **CP-UX-M2.4** Session snapshots / undo / named checkpoints. — *gate:* `undo` reverts the last mutating command (auto-snapshot before add/wire/probe); named `checkpoint`/`restore`; friendly errors on nothing-to-undo / unknown checkpoint.
 
@@ -110,10 +110,10 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 |---|---|---|---|
 | sim-core | 14 | 0 | 15 |
 | boards | 8 | 0 | 10 |
-| ui-shell | 12 | 0 | 13 |
+| ui-shell | 13 | 0 | 13 |
 | ai-fmt | 7 | 0 | 9 |
 | platform | 4 | 0 | 5 |
-| **Total** | **45** | **0** | **52** |
+| **Total** | **46** | **0** | **52** |
 
 *Update this table when flipping a checkpoint.*
 
