@@ -2247,6 +2247,47 @@ impl Engine {
     }
 }
 
+/// Internal hooks for benchmarks and solver-equivalence tests — **not** part of
+/// the stable API (hidden from the docs, no semver promise). They assemble the
+/// linear DC MNA system for a circuit and solve it with a *forced* dense or
+/// sparse path, so a bench can race the two solvers on one identical matrix at a
+/// size where [`Engine::run`] would otherwise auto-pick sparse. (`CP-SIM-M2.4`.)
+#[doc(hidden)]
+pub mod bench_support {
+    use super::*;
+
+    /// Assemble the linear DC system (resistors, independent and controlled
+    /// sources, inductor shorts) for `circuit` into a system built by `make` (so
+    /// the backing — dense or sparse — is forced) — the identical stamp
+    /// [`solve_dc`] uses, minus the nonlinear Newton loop (so it is exact for a
+    /// purely linear network such as a resistor ladder). Panics on a malformed
+    /// circuit; this is bench / test setup, never a shipped path.
+    fn linear_dc_system(circuit: &Circuit, make: fn(usize) -> System) -> System {
+        let layout = Layout::build(circuit);
+        let size = layout.n_nodes()
+            + layout.vsources.len()
+            + layout.n_controlled_branches()
+            + layout.inductors.len();
+        let mut sys = make(size);
+        stamp_resistors(&mut sys, circuit, &layout).expect("resistor stamp");
+        stamp_vsources(&mut sys, circuit, &layout, None, 1.0).expect("vsource stamp");
+        stamp_current_sources(&mut sys, circuit, &layout, None, 1.0).expect("current stamp");
+        stamp_controlled_sources(&mut sys, circuit, &layout).expect("controlled stamp");
+        stamp_inductor_shorts(&mut sys, circuit, &layout).expect("inductor stamp");
+        sys
+    }
+
+    /// Solve `circuit`'s linear DC operating point with the forced dense backing.
+    pub fn dc_solve_dense(circuit: &Circuit) -> Option<Vec<f64>> {
+        linear_dc_system(circuit, System::dense).solve()
+    }
+
+    /// Solve `circuit`'s linear DC operating point with the forced sparse backing.
+    pub fn dc_solve_sparse(circuit: &Circuit) -> Option<Vec<f64>> {
+        linear_dc_system(circuit, System::sparse).solve()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4604,5 +4645,108 @@ mod tests {
                 },
             )
             .is_ok());
+    }
+
+    // --- Sparse solver routing — CP-SIM-M2.4 -------------------------------
+
+    /// An `n`-rung resistor ladder (10 V source, series 1 kΩ into each rung node,
+    /// 1 kΩ shunt to ground), returning the circuit and the ordered rung nets.
+    fn ladder(n: usize) -> (Circuit, NetId, Vec<NetId>) {
+        let mut c = Circuit::new("ladder");
+        let vin = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("10", Unit::Volt),
+            vec![vin, NetId::GROUND],
+        );
+        let mut nodes = Vec::with_capacity(n);
+        let mut prev = vin;
+        for i in 0..n {
+            let node = c.new_net();
+            c.add_part(
+                format!("Rs{i}"),
+                PartKind::Resistor,
+                v("1k", Unit::Ohm),
+                vec![prev, node],
+            );
+            c.add_part(
+                format!("Rp{i}"),
+                PartKind::Resistor,
+                v("1k", Unit::Ohm),
+                vec![node, NetId::GROUND],
+            );
+            prev = node;
+        }
+        for i in 1..=n {
+            nodes.push(NetId(1 + i as u32)); // rung nets follow vin (= net 1)
+        }
+        (c, vin, nodes)
+    }
+
+    /// A large ladder clears [`mna::SPARSE_THRESHOLD`], so `Engine::run` takes the
+    /// sparse path. Its operating point must (a) match the forced *dense* solve of
+    /// the very same matrix bit-for-bit — proving the sparse path is wired in
+    /// correctly — and (b) be physically right: v(vin) = 10 V exactly and every
+    /// rung node a positive, strictly attenuated voltage.
+    #[test]
+    fn large_ladder_uses_sparse_and_matches_dense() {
+        let n = 200; // system size 202 ≥ SPARSE_THRESHOLD (64) → sparse path
+        assert!(
+            n + 2 >= crate::mna::SPARSE_THRESHOLD,
+            "test must exercise the sparse path"
+        );
+        let (c, vin, nodes) = ladder(n);
+
+        // Engine (auto-dispatch → sparse) vs the forced dense solve of the matrix.
+        let sigs = Engine::new().run(&c, &Analysis::OperatingPoint).unwrap();
+        let dense = bench_support::dc_solve_dense(&c).expect("dense ladder solves");
+
+        // v(vin) is pinned to the source: exactly 10 V.
+        let vin_name = format!("v(n{})", c.resolve(vin).0);
+        let vin_sig = sigs.iter().find(|s| s.name == vin_name).unwrap();
+        assert_eq!(vin_sig.real().unwrap()[0], 10.0, "v(vin) must be 10 V");
+
+        // Each node's sparse-engine voltage equals the dense solve to the bit, and
+        // the rung voltages attenuate monotonically toward ground.
+        let layout = Layout::build(&c);
+        let mut last = 10.0;
+        for &net in &nodes {
+            let idx = layout.node_of(&c, net).unwrap();
+            let name = format!("v(n{})", c.resolve(net).0);
+            let got = sigs
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap()
+                .real()
+                .unwrap()[0];
+            assert_eq!(got, dense[idx], "node {net:?}: sparse engine != dense");
+            assert!(got > 0.0 && got < last, "ladder not monotone at {net:?}");
+            last = got;
+        }
+    }
+
+    /// Below the threshold the engine keeps the dense path and its byte-exact
+    /// prior results; a small ladder's op point is unchanged and still matches the
+    /// forced dense solve. (Regression guard that dispatch did not perturb small
+    /// circuits.)
+    #[test]
+    fn small_ladder_stays_dense_and_unchanged() {
+        let n = 4; // size 6 < SPARSE_THRESHOLD → dense path
+        let (c, _vin, nodes) = ladder(n);
+        let sigs = Engine::new().run(&c, &Analysis::OperatingPoint).unwrap();
+        let dense = bench_support::dc_solve_dense(&c).unwrap();
+        let layout = Layout::build(&c);
+        for &net in &nodes {
+            let idx = layout.node_of(&c, net).unwrap();
+            let name = format!("v(n{})", c.resolve(net).0);
+            let got = sigs
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap()
+                .real()
+                .unwrap()[0];
+            assert_eq!(got, dense[idx]);
+        }
     }
 }

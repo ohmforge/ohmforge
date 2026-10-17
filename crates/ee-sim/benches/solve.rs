@@ -8,6 +8,16 @@
 //!   per timestep, fixed modest step counts so timings stay stable).
 //! - `op_point_scaling` — op-point solve of an N-rung ladder for a few N, so the
 //!   dense stamp+solve cost curve (≈ O(N³)) is visible.
+//! - `sparse_vs_dense` — the `CP-SIM-M2.4` gate: the dense `O(N³)` solve raced
+//!   head-to-head against the sparse path on the identical ladder matrix at
+//!   N ≈ 250…1000, where the sparse path's near-linear factorization pulls
+//!   markedly ahead.
+//! - `sparse_scaling` — the sparse path alone over N = 1000…4000, to show it
+//!   keeps scaling where the dense cube is already impractical.
+//!
+//! The head-to-head uses [`ee_sim::bench_support`], a hidden hook that forces
+//! each solver on one assembled matrix (the engine itself auto-picks sparse
+//! above its threshold, so there is otherwise no way to time dense at N ≈ 1000).
 //!
 //! Run a quick pass with, e.g.:
 //! `cargo bench -p ee-sim -- --warm-up-time 0.2 --measurement-time 1.0 --sample-size 20`
@@ -17,7 +27,7 @@ use std::hint::black_box;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use ee_core::graph::{Circuit, NetId, PartKind};
 use ee_core::{Unit, Value};
-use ee_sim::{Analysis, Engine};
+use ee_sim::{bench_support, Analysis, Engine};
 
 /// Parse an engineering-notation value, panicking on a bad literal (bench setup).
 fn val(s: &str, unit: Unit) -> Option<Value> {
@@ -171,10 +181,43 @@ fn bench_op_point_scaling(c: &mut Criterion) {
     group.finish();
 }
 
+/// The `CP-SIM-M2.4` gate: dense vs sparse on the *same* ladder matrix. For each
+/// N the dense `O(N³)` elimination and the near-linear sparse factorization solve
+/// the identical system, so the ratio of their timings is the scaling win.
+fn bench_sparse_vs_dense(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sparse_vs_dense");
+    // Each solve rebuilds and factors from the circuit, so timings are per solve.
+    for n in [250usize, 500, 1000] {
+        let circuit = resistor_ladder(n);
+        group.bench_with_input(BenchmarkId::new("dense", n), &circuit, |b, circuit| {
+            b.iter(|| bench_support::dc_solve_dense(black_box(circuit)).unwrap())
+        });
+        group.bench_with_input(BenchmarkId::new("sparse", n), &circuit, |b, circuit| {
+            b.iter(|| bench_support::dc_solve_sparse(black_box(circuit)).unwrap())
+        });
+    }
+    group.finish();
+}
+
+/// The sparse path alone, out to N = 4000 — where a dense solve (≈ 6·10¹⁰ flops)
+/// would be impractical — so its own scaling curve is visible end to end.
+fn bench_sparse_scaling(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sparse_scaling");
+    for n in [1000usize, 2000, 4000] {
+        let circuit = resistor_ladder(n);
+        group.bench_with_input(BenchmarkId::from_parameter(n), &circuit, |b, circuit| {
+            b.iter(|| bench_support::dc_solve_sparse(black_box(circuit)).unwrap())
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_op_point,
     bench_transient,
-    bench_op_point_scaling
+    bench_op_point_scaling,
+    bench_sparse_vs_dense,
+    bench_sparse_scaling
 );
 criterion_main!(benches);
