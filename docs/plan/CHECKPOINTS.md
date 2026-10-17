@@ -18,7 +18,7 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 - [x] **CP-SIM-M0.5** `Signal` type + results from an analysis. — *gate:* transient returns `Vec<Signal>` with correct units/length; consumed headless by the shell + `ee demo`.
 
 ### M1 — nonlinear + frequency domain
-- [ ] **CP-SIM-M1.1** Nonlinear device framework + Newton–Raphson; diode/LED. — *gate:* diode I–V matches Shockley within tol (`diode_iv`).
+- [x] **CP-SIM-M1.1** Nonlinear device framework + Newton–Raphson; diode. — *gate:* `diode_iv` matches Shockley to machine precision; `diode_resistor_op_converges` (Vd=0.6925 V, residual 1e-17); `nonconvergence_is_reported`; linear circuits stay single-iteration. `trait NonlinearDevice` so BJT/MOSFET (M1.2) drop in; SPICE `pnjlim` junction limiting.
 - [ ] **CP-SIM-M1.2** BJT + MOSFET models. — *gate:* common-emitter DC sweep hits known operating points.
 - [ ] **CP-SIM-M1.3** Convergence aids (gmin/source stepping, junction limiting). — *gate:* a known-stiff netlist that failed now converges.
 - [ ] **CP-SIM-M1.4** AC small-signal (complex MNA). — *gate:* RC low-pass shows −3 dB at `fc` and −45° phase within tol (`rc_ac_bode`).
@@ -108,12 +108,12 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 
 | Track | Done | In progress | Total |
 |---|---|---|---|
-| sim-core | 5 | 0 | 15 |
+| sim-core | 6 | 0 | 15 |
 | boards | 1 | 0 | 10 |
 | ui-shell | 5 | 0 | 13 |
 | ai-fmt | 2 | 0 | 9 |
 | platform | 3 | 0 | 5 |
-| **Total** | **16** | **0** | **52** |
+| **Total** | **17** | **0** | **52** |
 
 *Update this table when flipping a checkpoint.*
 
