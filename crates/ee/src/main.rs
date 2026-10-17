@@ -45,6 +45,7 @@ fn main() {
         Some("demo") => run_script(&mut Shell::new(), DEMO.lines()),
         Some("bode") => demo_bode(),
         Some("amp") => demo_amp(),
+        Some("cosim") => demo_cosim(),
         Some("tui") => {
             if let Err(e) = ee_tui::run(Shell::new()) {
                 eprintln!("{RED}tui error:{RESET} {e}");
@@ -217,6 +218,76 @@ fn demo_amp() {
         "\n  Vb={vb:.2} V  Vc={vc:.2} V  Ve={ve:.2} V   →  Vbe={:.3} V, Ic≈{ic_ma:.2} mA (active region)",
         vb - ve,
     );
+}
+
+/// `ee cosim` — co-simulation: real AVR firmware drives pin D13, and the
+/// lockstep bridge lights a simulated LED in the analog circuit.
+fn demo_cosim() {
+    use ee_mcu::avr::Uno;
+
+    // Tiny firmware: make D13 (PB5) an output and drive it high, then spin.
+    //   SBI DDRB,5  (0x9A25) · SBI PORTB,5 (0x9A2D) · RJMP -1 (0xCFFF)
+    let firmware: [u8; 6] = [0x25, 0x9A, 0x2D, 0x9A, 0xFF, 0xCF];
+    let mut uno = Uno::new();
+    if uno.load_firmware(&firmware).is_err() {
+        eprintln!("{RED}failed to load firmware{RESET}");
+        std::process::exit(1);
+    }
+    let d13 = Uno::digital_pin_id(13).expect("D13");
+
+    // Circuit on the D13 pin: a 220 Ω resistor into an LED (diode) to ground.
+    // `VPIN` is the boundary element — the pin's drive, pushed in by the loop.
+    let mut c = Circuit::new("cosim-led");
+    let pin = c.new_net();
+    let anode = c.new_net();
+    let gnd = ee_core::NetId::GROUND;
+    c.add_part(
+        "VPIN",
+        PartKind::VoltageSource,
+        val("0", Unit::Volt),
+        vec![pin, gnd],
+    );
+    c.add_part(
+        "R1",
+        PartKind::Resistor,
+        val("220", Unit::Ohm),
+        vec![pin, anode],
+    );
+    c.add_part("D1", PartKind::Diode, None, vec![anode, gnd]);
+
+    println!("Co-simulation: AVR firmware drives D13 → a simulated LED.\n");
+    let engine = Engine::new();
+    let mut io = uno.pin_io();
+    for step in 1..=6 {
+        uno.step_with_io(&mut io); // sample circuit → run one instruction → publish pin drives
+        let high = io.drive(d13).level() == Some(true);
+        c.set_value("VPIN", Value::new(if high { 5.0 } else { 0.0 }, Unit::Volt));
+        let signals = match engine.run(&c, &Analysis::OperatingPoint) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("{RED}simulation failed:{RESET} {e}");
+                std::process::exit(1);
+            }
+        };
+        let v = NodeVoltages::from_signals(&signals);
+        let (vpin, va) = (
+            v.get(c.resolve(pin)).unwrap_or(0.0),
+            v.get(c.resolve(anode)).unwrap_or(0.0),
+        );
+        let i_ma = (vpin - va) / 220.0 * 1e3;
+        let state = if high {
+            "HIGH → LED lit"
+        } else {
+            "low  → LED off"
+        };
+        println!("  step {step}: D13 {state}   v(d13)={vpin:.2} V, I(LED)={i_ma:.1} mA");
+        if high {
+            println!(
+                "\n  digitalWrite(13, HIGH) in firmware → {i_ma:.1} mA through the simulated LED."
+            );
+            break;
+        }
+    }
 }
 
 /// Run a sequence of command lines, printing each command's output.

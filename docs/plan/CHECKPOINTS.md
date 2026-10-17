@@ -43,7 +43,7 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 - [x] **CP-BRD-M1.5** Uno board def + firmware load (`.hex`). — *gate:* `blink.hex` (committed fixture, regenerated from a documented assembly listing) loads via Intel-HEX; D13/PB5 toggles at 1.000 s/toggle (~1 Hz). ELF still `UnsupportedFormat`.
 
 ### M2 — co-simulation + more cores
-- [~] **CP-BRD-M2.1** Co-sim bridge: pin↔net, clock sync. — *gate:* `analogRead` returns a divider's voltage; `digitalWrite` lights a sim LED. _(Bridge surface merged — `PinIo`, `McuCore::{next_event, step_to_cycle}`, pin↔peripheral map, 5 cosim tests; the lockstep loop + demo live in the `ee` binary — integrator's next step.)_
+- [x] **CP-BRD-M2.1** Co-sim bridge: pin↔net, clock sync. — *gate:* `analogRead` of 2.5 V → ADC code 512 (cosim tests); **`ee cosim`** runs real AVR firmware whose `digitalWrite(13,HIGH)` drives the lockstep bridge → a simulated LED lights at 19.4 mA. Surface (`PinIo`, `McuCore::{next_event, step_to_cycle}`) in `ee-mcu`; lockstep loop in the `ee` binary.
 - [ ] **CP-BRD-M2.2** Mixed-signal boundary elements (threshold, drive strength, rise/fall). — *gate:* boundary behavior test at configured thresholds.
 - [ ] **CP-BRD-M2.3** Cortex-M0+ core + RP2040 (Raspberry Pi Pico). — *gate:* ARMv6-M (Thumb) test-vectors; Pico blink toggles a pin.
 - [ ] **CP-BRD-M2.4** ATmega2560 / ATtiny variants. — *gate:* variant peripheral map test.
@@ -109,11 +109,11 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 | Track | Done | In progress | Total |
 |---|---|---|---|
 | sim-core | 12 | 0 | 15 |
-| boards | 5 | 1 | 10 |
+| boards | 6 | 0 | 10 |
 | ui-shell | 10 | 0 | 13 |
 | ai-fmt | 5 | 0 | 9 |
 | platform | 3 | 0 | 5 |
-| **Total** | **35** | **1** | **52** |
+| **Total** | **36** | **0** | **52** |
 
 *Update this table when flipping a checkpoint.*
 
