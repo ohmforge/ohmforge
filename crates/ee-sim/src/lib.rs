@@ -66,6 +66,9 @@ pub enum SimError {
     Unsupported(&'static str),
     /// The MNA matrix is singular — usually a floating node or missing ground.
     Singular,
+    /// Newton–Raphson did not reach the voltage/current tolerance within the
+    /// iteration cap. Carries the cap that was hit.
+    NonConvergence(usize),
 }
 
 impl fmt::Display for SimError {
@@ -79,6 +82,12 @@ impl fmt::Display for SimError {
                 write!(
                     f,
                     "circuit is singular — a floating node or no path to ground?"
+                )
+            }
+            SimError::NonConvergence(iters) => {
+                write!(
+                    f,
+                    "nonlinear solve did not converge within {iters} Newton–Raphson iterations"
                 )
             }
         }
@@ -123,7 +132,8 @@ fn validate(circuit: &Circuit) -> Result<(), SimError> {
             | PartKind::Capacitor
             | PartKind::Inductor
             | PartKind::VoltageSource
-            | PartKind::CurrentSource => {}
+            | PartKind::CurrentSource
+            | PartKind::Diode => {}
             PartKind::Other(_) => {
                 return Err(SimError::Unsupported("nonlinear/unknown device (M1)"))
             }
@@ -286,16 +296,222 @@ fn stamp_inductor_shorts(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Nonlinear devices + Newton–Raphson
+// ---------------------------------------------------------------------------
+
+/// Newton–Raphson iteration cap. Hitting it is reported as
+/// [`SimError::NonConvergence`]. Convergence aids (gmin / source stepping) that
+/// let far more circuits reach this cap arrive at `CP-SIM-M1.3`.
+const NR_MAX_ITERS: usize = 100;
+/// Converged when the largest node-voltage change between iterations is below
+/// this, in volts.
+const NR_V_TOL: f64 = 1e-9;
+/// …and the largest device-current change between iterations is below this, in
+/// amperes. Both must hold at once.
+const NR_I_TOL: f64 = 1e-12;
+
+/// The contract a nonlinear two-terminal device fulfils for the Newton–Raphson
+/// loop. Given the branch voltage `v = v(a) − v(b)` it reports the current it
+/// carries and its small-signal conductance `g = dI/dV` at that bias, plus a
+/// limiting rule that keeps the per-iteration voltage step sane. The solver
+/// stamps the device's Norton companion (a conductance `g` in parallel with a
+/// current source `I_eq = I(v) − g·v`) and iterates. New device types (BJT /
+/// MOSFET at `CP-SIM-M1.2`) implement these three methods and drop straight in.
+trait NonlinearDevice {
+    /// Terminal nets `(a, b)`; the branch voltage is `v(a) − v(b)`.
+    fn terminals(&self) -> (NetId, NetId);
+    /// Linearize about branch voltage `v`, returning `(I(v), dI/dV)`.
+    fn evaluate(&self, v: f64) -> (f64, f64);
+    /// Junction limiting: given the raw branch voltage from the last solve and
+    /// the previous iteration's (already limited) value, return a limited
+    /// voltage so `exp` cannot run away between iterations.
+    fn limit(&self, v_new: f64, v_old: f64) -> f64;
+}
+
+/// Shockley-diode model parameters. Defaults are a generic small-signal silicon
+/// diode at 300 K.
+#[derive(Debug, Clone, Copy)]
+struct DiodeModel {
+    /// Saturation current `I_s` (A).
+    is: f64,
+    /// Emission coefficient `n` (dimensionless).
+    n: f64,
+    /// Thermal voltage `V_t = kT/q` (V).
+    vt: f64,
+}
+
+impl Default for DiodeModel {
+    fn default() -> Self {
+        Self {
+            is: 1e-14,
+            n: 1.0,
+            vt: 0.025_852,
+        }
+    }
+}
+
+/// A junction diode across `(a, b)` = `(anode, cathode)`.
+struct Diode {
+    a: NetId,
+    b: NetId,
+    model: DiodeModel,
+}
+
+impl NonlinearDevice for Diode {
+    fn terminals(&self) -> (NetId, NetId) {
+        (self.a, self.b)
+    }
+
+    fn evaluate(&self, v: f64) -> (f64, f64) {
+        // Shockley: I = Is·(exp(V/(n·Vt)) − 1), and g = dI/dV = (Is/(n·Vt))·exp(V/(n·Vt)).
+        let vte = self.model.n * self.model.vt;
+        let ex = (v / vte).exp();
+        let i = self.model.is * (ex - 1.0);
+        let g = (self.model.is / vte) * ex;
+        (i, g)
+    }
+
+    fn limit(&self, v_new: f64, v_old: f64) -> f64 {
+        // Standard SPICE pn-junction limiting (`pnjlim`): once the forward
+        // voltage is past `vcrit` and the step exceeds a thermal voltage, map the
+        // raw Newton step through a logarithm so `exp` cannot overflow. Reverse
+        // and small steps pass through untouched. Fuller aids are `CP-SIM-M1.3`.
+        let vte = self.model.n * self.model.vt;
+        let vcrit = vte * (vte / (std::f64::consts::SQRT_2 * self.model.is)).ln();
+        if v_new > vcrit && (v_new - v_old).abs() > vte {
+            if v_old > 0.0 {
+                let arg = 1.0 + (v_new - v_old) / vte;
+                if arg > 0.0 {
+                    v_old + vte * arg.ln()
+                } else {
+                    vcrit
+                }
+            } else if v_new > 0.0 {
+                vte * (v_new / vte).ln()
+            } else {
+                v_new
+            }
+        } else {
+            v_new
+        }
+    }
+}
+
+/// Build the diode model for a part: defaults, with `I_s` overridden by the
+/// part's value (amperes) when a sensible positive magnitude is present.
+fn diode_model(part: &Part) -> DiodeModel {
+    let mut m = DiodeModel::default();
+    if let Some(v) = &part.value {
+        if v.magnitude > 0.0 && v.magnitude.is_finite() {
+            m.is = v.magnitude;
+        }
+    }
+    m
+}
+
+/// Collect every nonlinear device in the circuit as a boxed [`NonlinearDevice`].
+/// This is the one place a new device kind is wired into the solver.
+fn collect_nonlinear(circuit: &Circuit) -> Result<Vec<Box<dyn NonlinearDevice>>, SimError> {
+    let mut devices: Vec<Box<dyn NonlinearDevice>> = Vec::new();
+    for part in circuit.parts() {
+        if matches!(part.kind, PartKind::Diode) {
+            let (a, b) = terminals2(part)?;
+            devices.push(Box::new(Diode {
+                a,
+                b,
+                model: diode_model(part),
+            }));
+        }
+    }
+    Ok(devices)
+}
+
+/// Newton–Raphson solve of an MNA system that may contain nonlinear devices.
+///
+/// `stamp_linear` stamps every *linear* contribution (R / V / I, and the C / L
+/// companions during a transient step) into a fresh [`System`] — exactly the
+/// system the M0 solver built. Each iteration rebuilds that system, linearizes
+/// every nonlinear device about the running guess and stamps its Norton
+/// companion, solves, applies junction limiting, and tests convergence on both
+/// the node-voltage step and the device-current step.
+///
+/// With **no** nonlinear devices the routine stamps and solves exactly once,
+/// reproducing the linear M0 result bit-for-bit — so the existing linear tests
+/// do not move.
+fn solve_nr(
+    circuit: &Circuit,
+    layout: &Layout,
+    size: usize,
+    devices: &[Box<dyn NonlinearDevice>],
+    stamp_linear: &dyn Fn(&mut System) -> Result<(), SimError>,
+) -> Result<Vec<f64>, SimError> {
+    // Purely linear: one stamp-and-solve is exact (and identical to M0).
+    if devices.is_empty() {
+        let mut sys = System::new(size);
+        stamp_linear(&mut sys)?;
+        return sys.solve().ok_or(SimError::Singular);
+    }
+
+    let mut x = vec![0.0; size]; // initial guess: every node at 0 V
+    let mut v_prev = vec![0.0; devices.len()]; // last (limited) branch voltages
+    let mut i_prev = vec![0.0; devices.len()]; // last device currents
+
+    for _ in 0..NR_MAX_ITERS {
+        let mut sys = System::new(size);
+        stamp_linear(&mut sys)?;
+
+        let mut i_now = vec![0.0; devices.len()];
+        for (k, dev) in devices.iter().enumerate() {
+            let (a, b) = dev.terminals();
+            let (na, nb) = (layout.node_of(circuit, a), layout.node_of(circuit, b));
+            let v = dev.limit(across(&x, na, nb), v_prev[k]);
+            v_prev[k] = v;
+            let (i, g) = dev.evaluate(v);
+            i_now[k] = i;
+            // Norton companion: conductance `g` in parallel with a current source
+            // `I_eq = i − g·v`. The constant part moves to the RHS exactly as the
+            // C / L companions do — `stamp_current(a, b, g·v − i)`.
+            sys.stamp_conductance(na, nb, g);
+            sys.stamp_current(na, nb, g * v - i);
+        }
+
+        let x_new = sys.solve().ok_or(SimError::Singular)?;
+        // A diverging solution (overflow → inf/NaN) must never read as converged.
+        // `f64::max` ignores NaN, so test finiteness explicitly before the tol
+        // check rather than letting a NaN step fold to a spurious zero.
+        let finite = x_new.iter().chain(&i_now).all(|v| v.is_finite());
+        let dv = x_new
+            .iter()
+            .zip(&x)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max);
+        let di = i_now
+            .iter()
+            .zip(&i_prev)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max);
+        x = x_new;
+        i_prev = i_now;
+        if finite && dv < NR_V_TOL && di < NR_I_TOL {
+            return Ok(x);
+        }
+    }
+    Err(SimError::NonConvergence(NR_MAX_ITERS))
+}
+
 /// Solve the DC operating point: resistors + sources, capacitors open, inductors
-/// shorted.
+/// shorted, and any nonlinear device driven to steady state by Newton–Raphson.
 fn solve_dc(circuit: &Circuit, layout: &Layout) -> Result<Vec<f64>, SimError> {
     let size = layout.n_nodes() + layout.vsources.len() + layout.inductors.len();
-    let mut sys = System::new(size);
-    stamp_resistors(&mut sys, circuit, layout)?;
-    stamp_vsources(&mut sys, circuit, layout)?;
-    stamp_current_sources(&mut sys, circuit, layout)?;
-    stamp_inductor_shorts(&mut sys, circuit, layout)?;
-    sys.solve().ok_or(SimError::Singular)
+    let devices = collect_nonlinear(circuit)?;
+    solve_nr(circuit, layout, size, &devices, &|sys| {
+        stamp_resistors(sys, circuit, layout)?;
+        stamp_vsources(sys, circuit, layout)?;
+        stamp_current_sources(sys, circuit, layout)?;
+        stamp_inductor_shorts(sys, circuit, layout)?;
+        Ok(())
+    })
 }
 
 /// Voltage across a two-terminal device (`v(plus) - v(minus)`), ground = 0 V.
@@ -355,6 +571,10 @@ fn transient(
         })
         .collect::<Result<_, _>>()?;
 
+    // Nonlinear devices are re-linearized inside the per-step Newton–Raphson
+    // loop, on top of the C / L companions.
+    let diodes = collect_nonlinear(circuit)?;
+
     let mut times: Vec<f64> = Vec::with_capacity(steps + 1);
     let mut traces: Vec<Vec<f64>> = vec![Vec::with_capacity(steps + 1); n];
     let mut cap_prev = vec![0.0; caps.len()]; // 0 V initial condition (UIC)
@@ -363,21 +583,23 @@ fn transient(
     // t = 0: hold each capacitor at its initial voltage (a 0 V source), solve the
     // rest, and record. This is the true starting point of every curve.
     {
-        let mut sys = System::new(n + m + caps.len());
-        stamp_resistors(&mut sys, circuit, layout)?;
-        stamp_vsources(&mut sys, circuit, layout)?;
-        stamp_current_sources(&mut sys, circuit, layout)?;
-        // Inductors are open at t = 0 (i(0) = 0), so they are not stamped at all.
-        for (ci, (a, b, _)) in caps.iter().enumerate() {
-            let k = n + m + ci;
-            sys.stamp_vsource(
-                layout.node_of(circuit, *a),
-                layout.node_of(circuit, *b),
-                k,
-                0.0,
-            );
-        }
-        let x0 = sys.solve().ok_or(SimError::Singular)?;
+        let stamp = |sys: &mut System| -> Result<(), SimError> {
+            stamp_resistors(sys, circuit, layout)?;
+            stamp_vsources(sys, circuit, layout)?;
+            stamp_current_sources(sys, circuit, layout)?;
+            // Inductors are open at t = 0 (i(0) = 0), so they are not stamped.
+            for (ci, (a, b, _)) in caps.iter().enumerate() {
+                let k = n + m + ci;
+                sys.stamp_vsource(
+                    layout.node_of(circuit, *a),
+                    layout.node_of(circuit, *b),
+                    k,
+                    0.0,
+                );
+            }
+            Ok(())
+        };
+        let x0 = solve_nr(circuit, layout, n + m + caps.len(), &diodes, &stamp)?;
         times.push(0.0);
         for (d, trace) in traces.iter_mut().enumerate() {
             trace.push(x0[d]);
@@ -391,26 +613,28 @@ fn transient(
         }
     }
 
-    // t = h, 2h, … : companion-stamp the capacitors and advance.
+    // t = h, 2h, … : companion-stamp the reactive devices, Newton-solve, advance.
     for k in 1..=steps {
-        let mut sys = System::new(n + m);
-        stamp_resistors(&mut sys, circuit, layout)?;
-        stamp_vsources(&mut sys, circuit, layout)?;
-        stamp_current_sources(&mut sys, circuit, layout)?;
-        for (ci, (a, b, c)) in caps.iter().enumerate() {
-            let g_eq = c / h;
-            let (ia, ib) = (layout.node_of(circuit, *a), layout.node_of(circuit, *b));
-            sys.stamp_conductance(ia, ib, g_eq);
-            sys.stamp_current(ia, ib, g_eq * cap_prev[ci]);
-        }
-        for (li, (a, b, l)) in inds.iter().enumerate() {
-            let g_eq = h / l;
-            let (ia, ib) = (layout.node_of(circuit, *a), layout.node_of(circuit, *b));
-            sys.stamp_conductance(ia, ib, g_eq);
-            // History source `i_prev` oriented a → b: current flows from a into b.
-            sys.stamp_current(ib, ia, ind_prev[li]);
-        }
-        let x = sys.solve().ok_or(SimError::Singular)?;
+        let stamp = |sys: &mut System| -> Result<(), SimError> {
+            stamp_resistors(sys, circuit, layout)?;
+            stamp_vsources(sys, circuit, layout)?;
+            stamp_current_sources(sys, circuit, layout)?;
+            for (ci, (a, b, c)) in caps.iter().enumerate() {
+                let g_eq = c / h;
+                let (ia, ib) = (layout.node_of(circuit, *a), layout.node_of(circuit, *b));
+                sys.stamp_conductance(ia, ib, g_eq);
+                sys.stamp_current(ia, ib, g_eq * cap_prev[ci]);
+            }
+            for (li, (a, b, l)) in inds.iter().enumerate() {
+                let g_eq = h / l;
+                let (ia, ib) = (layout.node_of(circuit, *a), layout.node_of(circuit, *b));
+                sys.stamp_conductance(ia, ib, g_eq);
+                // History source `i_prev` oriented a → b: current flows a into b.
+                sys.stamp_current(ib, ia, ind_prev[li]);
+            }
+            Ok(())
+        };
+        let x = solve_nr(circuit, layout, n + m, &diodes, &stamp)?;
         times.push(k as f64 * h);
         for (d, trace) in traces.iter_mut().enumerate() {
             trace.push(x[d]);
@@ -714,5 +938,134 @@ mod tests {
             .run(&c, &Analysis::OperatingPoint)
             .unwrap_err();
         assert_eq!(err, SimError::Singular);
+    }
+
+    // --- Nonlinear (diode) — CP-SIM-M1.1 -----------------------------------
+
+    /// Model constants the tests check against (must match [`DiodeModel`] defaults).
+    const IS: f64 = 1e-14;
+    const VTE: f64 = 1.0 * 0.025_852; // n·Vt with n = 1
+
+    #[test]
+    fn diode_iv() {
+        // Force a known forward current with an ideal current source and read the
+        // junction voltage back: it must equal the inverse-Shockley prediction
+        // V = n·Vt·ln(I/Is + 1), and the model's own I(V) at that point equals I.
+        for &i in &[1e-9, 1e-6, 1e-3, 1e-2, 0.1_f64] {
+            let mut c = Circuit::new("diode_iv");
+            let node = c.new_net();
+            // I injected from ground into `node`; the diode (anode = node,
+            // cathode = gnd) carries it forward to ground.
+            c.add_part(
+                "I1",
+                PartKind::CurrentSource,
+                v(&format!("{i}"), Unit::Ampere),
+                vec![NetId::GROUND, node],
+            );
+            c.add_part("D1", PartKind::Diode, None, vec![node, NetId::GROUND]);
+
+            let layout = Layout::build(&c);
+            let x = solve_dc(&c, &layout).unwrap();
+            let vd = x[layout.node_of(&c, node).unwrap()];
+
+            let expected = VTE * (i / IS + 1.0).ln();
+            assert!(
+                (vd - expected).abs() <= 1e-7,
+                "I={i}: vd={vd}, expected {expected}, err {}",
+                (vd - expected).abs()
+            );
+            let i_model = IS * ((vd / VTE).exp() - 1.0);
+            assert!(
+                (i_model - i).abs() <= 1e-9 + 1e-6 * i,
+                "I={i}: model current {i_model} (rel err {})",
+                (i_model - i).abs() / i
+            );
+        }
+    }
+
+    #[test]
+    fn diode_resistor_op_converges() {
+        // 5 V ─ 1k ─ diode ─ gnd. The operating point must settle to a sane
+        // junction drop whose Shockley current equals the resistor current
+        // (KCL at the midpoint — the real convergence check).
+        let mut c = Circuit::new("diode_r");
+        let vin = c.new_net();
+        let mid = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("5", Unit::Volt),
+            vec![vin, NetId::GROUND],
+        );
+        c.add_part("R1", PartKind::Resistor, v("1k", Unit::Ohm), vec![vin, mid]);
+        c.add_part("D1", PartKind::Diode, None, vec![mid, NetId::GROUND]);
+
+        let layout = Layout::build(&c);
+        let x = solve_dc(&c, &layout).unwrap();
+        let vd = x[layout.node_of(&c, mid).unwrap()];
+
+        // Silicon junction drop lands in the usual window.
+        assert!(
+            (0.6..0.8).contains(&vd),
+            "junction drop {vd} V out of the expected window"
+        );
+        let i_r = (5.0 - vd) / 1000.0; // resistor current
+        assert!(i_r > 0.0, "diode not forward-biased");
+        // KCL at `mid`: the diode's own I(vd) equals the resistor current.
+        let i_d = IS * ((vd / VTE).exp() - 1.0);
+        assert!(
+            (i_d - i_r).abs() <= 1e-9 + 1e-6 * i_r,
+            "I_d={i_d} vs I_R={i_r} (rel err {})",
+            (i_d - i_r).abs() / i_r
+        );
+    }
+
+    #[test]
+    fn nonconvergence_is_reported() {
+        // Pathological: an absurd 1e300 A forced through a lone diode drives the
+        // junction past the floating-point exp range, so Newton-Raphson can never
+        // settle. The solver must hit the cap and report it — no panic, no hang.
+        let mut c = Circuit::new("runaway");
+        let node = c.new_net();
+        c.add_part(
+            "I1",
+            PartKind::CurrentSource,
+            v("1e300", Unit::Ampere),
+            vec![NetId::GROUND, node],
+        );
+        c.add_part("D1", PartKind::Diode, None, vec![node, NetId::GROUND]);
+
+        let err = Engine::new()
+            .run(&c, &Analysis::OperatingPoint)
+            .unwrap_err();
+        assert!(
+            matches!(err, SimError::NonConvergence(_)),
+            "expected non-convergence, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn linear_circuit_is_unaffected_by_the_nr_path() {
+        // A circuit with no nonlinear devices must take exactly one solve and give
+        // the same answer as the old linear path (regression guard for the divider).
+        let mut c = Circuit::new("divider");
+        let vin = c.new_net();
+        let mid = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("10", Unit::Volt),
+            vec![vin, NetId::GROUND],
+        );
+        c.add_part("R1", PartKind::Resistor, v("1k", Unit::Ohm), vec![vin, mid]);
+        c.add_part(
+            "R2",
+            PartKind::Resistor,
+            v("1k", Unit::Ohm),
+            vec![mid, NetId::GROUND],
+        );
+        let layout = Layout::build(&c);
+        let x = solve_dc(&c, &layout).unwrap();
+        assert!((x[layout.node_of(&c, mid).unwrap()] - 5.0).abs() < 1e-12);
     }
 }

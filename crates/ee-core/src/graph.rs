@@ -28,6 +28,12 @@ pub enum PartKind {
     VoltageSource,
     /// Independent current source (value in amperes).
     CurrentSource,
+    /// Semiconductor junction diode (Shockley model). Terminals are
+    /// `[anode, cathode]`; forward current flows anode → cathode. Model
+    /// parameters default to a small-signal silicon diode (saturation current
+    /// `I_s ≈ 1e-14 A`, emission `n = 1`, thermal voltage `V_t ≈ 0.0259 V`); an
+    /// optional [`Value`] in amperes overrides `I_s`. (`CP-SIM-M1.1`.)
+    Diode,
     /// Anything not yet modeled natively, identified by name.
     Other(String),
 }
