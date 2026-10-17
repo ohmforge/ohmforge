@@ -1,0 +1,5 @@
+add V1 in gnd 5
+add R1 in out 1k
+add C1 out gnd 1u
+probe out
+run tran 5m

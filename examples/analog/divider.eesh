@@ -1,0 +1,4 @@
+add V1 in gnd 10
+add R1 in out 1k
+add R2 out gnd 1k
+run op

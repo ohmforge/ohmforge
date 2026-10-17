@@ -1,0 +1,4 @@
+add V1 in gnd 5
+add R1 in a 1k
+add D1 a gnd 1e-14
+run op
