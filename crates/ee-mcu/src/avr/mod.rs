@@ -32,5 +32,5 @@ pub use self::core::Avr;
 pub use board::Uno;
 pub use decode::decode;
 pub use isa::{Instr, Ptr, PtrMode};
-pub use periph::{Peripherals, Port};
+pub use periph::{pin_id, pin_location, Peripherals, Port, PIN_COUNT};
 pub use sreg::Sreg;

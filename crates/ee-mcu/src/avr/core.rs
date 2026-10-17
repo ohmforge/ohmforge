@@ -28,11 +28,11 @@
 //! priority) one — pushing the return address, clearing `I`, and jumping to the
 //! vector. `RETI` pops the address and re-enables interrupts.
 
-use crate::{FirmwareError, McuCore};
+use crate::{FirmwareError, McuCore, PinIo};
 
 use super::decode::decode;
 use super::isa::{Instr, Ptr, PtrMode};
-use super::periph::{Peripherals, Port};
+use super::periph::{Peripherals, Port, PIN_COUNT};
 use super::sreg::Sreg;
 
 /// Flash size in 16-bit words (ATmega328P: 32 KiB).
@@ -212,6 +212,16 @@ impl Avr {
     /// The resolved logic level on `port` pin `bit`.
     pub fn pin(&self, port: Port, bit: u8) -> bool {
         self.periph.pin(port, bit)
+    }
+
+    /// A single co-simulation step: sample `io`'s input voltages, execute one
+    /// instruction, then publish the pin drives back into `io`. The
+    /// fine-grained counterpart to [`step_to_cycle`](McuCore::step_to_cycle),
+    /// useful when a caller wants to exchange pin state every instruction.
+    pub fn step_with_io(&mut self, io: &mut PinIo) {
+        self.periph.sample_inputs(io);
+        self.step();
+        self.periph.publish_drives(io);
     }
 
     // --- Interrupts ---
@@ -781,6 +791,26 @@ impl McuCore for Avr {
         while (self.cycles as f64) / self.f_cpu < t {
             self.step();
         }
+    }
+
+    fn pin_count(&self) -> usize {
+        PIN_COUNT
+    }
+
+    fn next_event(&self) -> Option<u64> {
+        self.periph.next_event_in().map(|d| self.cycles + d)
+    }
+
+    fn step_to_cycle(&mut self, until_cycle: u64, io: &mut PinIo) -> u64 {
+        // Sample the circuit's node voltages (held constant over the interval)
+        // once at entry, run whole instructions to the cycle bound, then publish
+        // the resulting pin drives back for the loop to reconcile.
+        self.periph.sample_inputs(io);
+        while self.cycles < until_cycle {
+            self.step();
+        }
+        self.periph.publish_drives(io);
+        self.cycles
     }
 
     fn load_firmware(&mut self, image: &[u8]) -> Result<(), FirmwareError> {
