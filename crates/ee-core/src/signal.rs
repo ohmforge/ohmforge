@@ -30,6 +30,11 @@ pub struct Complex {
 }
 
 impl Complex {
+    /// The additive identity `0 + 0j`.
+    pub const ZERO: Complex = Complex { re: 0.0, im: 0.0 };
+    /// The multiplicative identity `1 + 0j`.
+    pub const ONE: Complex = Complex { re: 1.0, im: 0.0 };
+
     pub const fn new(re: f64, im: f64) -> Self {
         Self { re, im }
     }
@@ -47,6 +52,60 @@ impl Complex {
     /// Phase in degrees, `atan2(im, re)`.
     pub fn phase_deg(&self) -> f64 {
         self.im.atan2(self.re).to_degrees()
+    }
+
+    /// Complex conjugate `re − im·j`.
+    pub fn conj(&self) -> Complex {
+        Complex::new(self.re, -self.im)
+    }
+
+    /// The reciprocal `1 / z`. Returns a non-finite value for `z = 0`, exactly as
+    /// `f64` division does — callers that pivot (the AC solver) guard against it.
+    pub fn inv(&self) -> Complex {
+        let d = self.re * self.re + self.im * self.im;
+        Complex::new(self.re / d, -self.im / d)
+    }
+}
+
+// Hand-rolled complex arithmetic so the AC solver reads like the real one, with
+// no `num-complex` dependency (keeps `ee-core` dependency-free and wasm32-clean).
+impl core::ops::Add for Complex {
+    type Output = Complex;
+    fn add(self, rhs: Complex) -> Complex {
+        Complex::new(self.re + rhs.re, self.im + rhs.im)
+    }
+}
+
+impl core::ops::Sub for Complex {
+    type Output = Complex;
+    fn sub(self, rhs: Complex) -> Complex {
+        Complex::new(self.re - rhs.re, self.im - rhs.im)
+    }
+}
+
+impl core::ops::Mul for Complex {
+    type Output = Complex;
+    fn mul(self, rhs: Complex) -> Complex {
+        Complex::new(
+            self.re * rhs.re - self.im * rhs.im,
+            self.re * rhs.im + self.im * rhs.re,
+        )
+    }
+}
+
+impl core::ops::Div for Complex {
+    type Output = Complex;
+    // `a / b == a · (1/b)` — the multiply is the division, not a misplaced op.
+    #[allow(clippy::suspicious_arithmetic_impl)]
+    fn div(self, rhs: Complex) -> Complex {
+        self * rhs.inv()
+    }
+}
+
+impl core::ops::Neg for Complex {
+    type Output = Complex;
+    fn neg(self) -> Complex {
+        Complex::new(-self.re, -self.im)
     }
 }
 
@@ -161,5 +220,24 @@ mod tests {
         assert!((z.magnitude() - 1.0).abs() < 1e-12);
         assert!((z.phase_deg() - 90.0).abs() < 1e-9);
         assert!(z.magnitude_db().abs() < 1e-9);
+    }
+
+    #[test]
+    fn complex_arithmetic_matches_by_hand() {
+        let a = Complex::new(1.0, 2.0);
+        let b = Complex::new(3.0, -1.0);
+        assert_eq!(a + b, Complex::new(4.0, 1.0));
+        assert_eq!(a - b, Complex::new(-2.0, 3.0));
+        // (1+2j)(3−j) = 3 − j + 6j − 2j² = 5 + 5j.
+        assert_eq!(a * b, Complex::new(5.0, 5.0));
+        // z·(1/z) == 1, and z/z == 1.
+        let q = a * a.inv();
+        assert!((q.re - 1.0).abs() < 1e-12 && q.im.abs() < 1e-12);
+        let r = (a / b) * b;
+        assert!((r.re - a.re).abs() < 1e-12 && (r.im - a.im).abs() < 1e-12);
+        assert_eq!(-a, Complex::new(-1.0, -2.0));
+        assert_eq!(a.conj(), Complex::new(1.0, -2.0));
+        assert_eq!(Complex::ZERO + a, a);
+        assert_eq!(Complex::ONE * a, a);
     }
 }

@@ -14,14 +14,17 @@
 //! stays `wasm32`-clean — the same rules as `ee-core`.
 
 mod mna;
+mod mna_complex;
 
 use std::collections::BTreeMap;
 use std::error::Error;
+use std::f64::consts::TAU;
 use std::fmt;
 
-use ee_core::graph::{Circuit, NetId, Part, PartKind};
-use ee_core::{Signal, Unit};
+use ee_core::graph::{Circuit, NetId, Part, PartKind, Waveform};
+use ee_core::{Complex, Signal, Unit};
 use mna::System;
+use mna_complex::ComplexSystem;
 
 /// The analyses the engine can run.
 #[derive(Debug, Clone)]
@@ -31,7 +34,10 @@ pub enum Analysis {
     /// Time-domain transient over `duration` seconds. `step` is the timestep;
     /// `None` picks `duration / 1000`.
     Transient { duration: f64, step: Option<f64> },
-    /// Small-signal AC sweep (Bode). Not yet implemented (arrives at M1.4).
+    /// Small-signal AC sweep (Bode) over `[f_start, f_stop]` hertz, log-spaced at
+    /// `points_per_decade`. The circuit is linearized about its DC operating point
+    /// and driven by a 1∠0 stimulus on every source marked as an AC drive (a
+    /// source carrying a [`Waveform::Sine`]). (`CP-SIM-M1.4`.)
     Ac {
         f_start: f64,
         f_stop: f64,
@@ -115,7 +121,11 @@ impl Engine {
                 Ok(op_signals(&layout, &x))
             }
             Analysis::Transient { duration, step } => transient(circuit, &layout, *duration, *step),
-            Analysis::Ac { .. } => Err(SimError::Unsupported("AC analysis (CP-SIM-M1.4)")),
+            Analysis::Ac {
+                f_start,
+                f_stop,
+                points_per_decade,
+            } => ac(circuit, &layout, *f_start, *f_stop, *points_per_decade),
             Analysis::DcSweep { .. } => Err(SimError::Unsupported("DC sweep (CP-SIM-M1.5)")),
             Analysis::Parametric { .. } => {
                 Err(SimError::Unsupported("parametric sweep (CP-SIM-M1.5)"))
@@ -210,6 +220,63 @@ fn magnitude(part: &Part) -> Result<f64, SimError> {
         .ok_or_else(|| SimError::MissingValue(part.reference.clone()))
 }
 
+/// The value an independent source presents at transient time `t`.
+///
+/// `t = None` asks for the DC / operating-point bias — the constant for
+/// [`Waveform::Dc`], the `offset` of a sine, the `v1` of a pulse — which is also
+/// what the `t = 0` transient sample uses. `t = Some(secs)` evaluates the
+/// waveform formula at that time. A `Dc` source needs a [`Value`]; a `Sine` or
+/// `Pulse` carries its own levels and needs none.
+fn source_value(part: &Part, t: Option<f64>) -> Result<f64, SimError> {
+    Ok(match &part.waveform {
+        Waveform::Dc => magnitude(part)?,
+        Waveform::Sine {
+            amplitude,
+            freq,
+            offset,
+            phase_deg,
+        } => match t {
+            None => *offset,
+            Some(t) => offset + amplitude * (TAU * freq * t + phase_deg.to_radians()).sin(),
+        },
+        Waveform::Pulse {
+            v1,
+            v2,
+            delay,
+            width,
+            period,
+        } => match t {
+            None => *v1,
+            Some(t) => pulse_value(*v1, *v2, *delay, *width, *period, t),
+        },
+    })
+}
+
+/// A single/repeating pulse level at time `t` (no rise/fall time): `v1` before
+/// `delay`, `v2` for `width` after it, `v1` for the rest of each `period`. A
+/// `period <= 0` makes the pulse fire once and stay at `v1` afterwards.
+fn pulse_value(v1: f64, v2: f64, delay: f64, width: f64, period: f64, t: f64) -> f64 {
+    if t < delay {
+        return v1;
+    }
+    let mut local = t - delay;
+    if period > 0.0 {
+        local %= period;
+    }
+    if local < width {
+        v2
+    } else {
+        v1
+    }
+}
+
+/// Whether a source is the AC small-signal drive: a source carrying a sine
+/// waveform. Such sources are stamped with a 1∠0 stimulus in AC analysis; every
+/// other source is quiet (a short for V, an open for I), as in SPICE.
+fn is_ac_drive(part: &Part) -> bool {
+    matches!(part.waveform, Waveform::Sine { .. })
+}
+
 /// The two nets a two-terminal part connects, or an error.
 fn terminals2(part: &Part) -> Result<(NetId, NetId), SimError> {
     match part.terminals.as_slice() {
@@ -237,11 +304,18 @@ fn stamp_resistors(sys: &mut System, circuit: &Circuit, layout: &Layout) -> Resu
     Ok(())
 }
 
-/// Stamp every voltage source, each using its own branch-current row.
-fn stamp_vsources(sys: &mut System, circuit: &Circuit, layout: &Layout) -> Result<(), SimError> {
+/// Stamp every voltage source, each using its own branch-current row. `t` selects
+/// the source level: `None` for the operating-point bias, `Some(secs)` for the
+/// waveform value at that transient time.
+fn stamp_vsources(
+    sys: &mut System,
+    circuit: &Circuit,
+    layout: &Layout,
+    t: Option<f64>,
+) -> Result<(), SimError> {
     for (branch, &pi) in layout.vsources.iter().enumerate() {
         let part = &circuit.parts()[pi];
-        let volts = magnitude(part)?;
+        let volts = source_value(part, t)?;
         let (plus, minus) = terminals2(part)?;
         let k = layout.n_nodes() + branch;
         sys.stamp_vsource(
@@ -255,16 +329,18 @@ fn stamp_vsources(sys: &mut System, circuit: &Circuit, layout: &Layout) -> Resul
 }
 
 /// Stamp every independent current source. `I` from terminal `a` to terminal `b`
-/// drives that current from `a` into `b` (no new unknown — a pure RHS term), so it
-/// is identical in the operating point and in every transient step.
+/// drives that current from `a` into `b` (no new unknown — a pure RHS term). `t`
+/// selects the level: `None` for the operating-point bias, `Some(secs)` for the
+/// waveform value at that transient time (a DC source is the same either way).
 fn stamp_current_sources(
     sys: &mut System,
     circuit: &Circuit,
     layout: &Layout,
+    t: Option<f64>,
 ) -> Result<(), SimError> {
     for part in circuit.parts() {
         if matches!(part.kind, PartKind::CurrentSource) {
-            let amps = magnitude(part)?;
+            let amps = source_value(part, t)?;
             let (a, b) = terminals2(part)?;
             // `stamp_current(i, j, amps)` injects `amps` flowing from `j` into `i`,
             // so `(b, a)` reads as "amps from a into b" — the source's own direction.
@@ -507,8 +583,9 @@ fn solve_dc(circuit: &Circuit, layout: &Layout) -> Result<Vec<f64>, SimError> {
     let devices = collect_nonlinear(circuit)?;
     solve_nr(circuit, layout, size, &devices, &|sys| {
         stamp_resistors(sys, circuit, layout)?;
-        stamp_vsources(sys, circuit, layout)?;
-        stamp_current_sources(sys, circuit, layout)?;
+        // Operating point: sources at their bias (`None`).
+        stamp_vsources(sys, circuit, layout, None)?;
+        stamp_current_sources(sys, circuit, layout, None)?;
         stamp_inductor_shorts(sys, circuit, layout)?;
         Ok(())
     })
@@ -585,8 +662,9 @@ fn transient(
     {
         let stamp = |sys: &mut System| -> Result<(), SimError> {
             stamp_resistors(sys, circuit, layout)?;
-            stamp_vsources(sys, circuit, layout)?;
-            stamp_current_sources(sys, circuit, layout)?;
+            // t = 0 uses the waveform bias (sine → offset, pulse → v1).
+            stamp_vsources(sys, circuit, layout, None)?;
+            stamp_current_sources(sys, circuit, layout, None)?;
             // Inductors are open at t = 0 (i(0) = 0), so they are not stamped.
             for (ci, (a, b, _)) in caps.iter().enumerate() {
                 let k = n + m + ci;
@@ -615,10 +693,12 @@ fn transient(
 
     // t = h, 2h, … : companion-stamp the reactive devices, Newton-solve, advance.
     for k in 1..=steps {
+        let t = k as f64 * h;
         let stamp = |sys: &mut System| -> Result<(), SimError> {
             stamp_resistors(sys, circuit, layout)?;
-            stamp_vsources(sys, circuit, layout)?;
-            stamp_current_sources(sys, circuit, layout)?;
+            // Sources evaluated at the current transient time.
+            stamp_vsources(sys, circuit, layout, Some(t))?;
+            stamp_current_sources(sys, circuit, layout, Some(t))?;
             for (ci, (a, b, c)) in caps.iter().enumerate() {
                 let g_eq = c / h;
                 let (ia, ib) = (layout.node_of(circuit, *a), layout.node_of(circuit, *b));
@@ -658,6 +738,190 @@ fn transient(
                 Unit::Volt,
                 times.clone(),
                 y,
+            )
+        })
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
+// AC small-signal analysis (CP-SIM-M1.4)
+// ---------------------------------------------------------------------------
+
+/// Log-spaced sweep frequencies from `f_start` to `f_stop` at `points_per_decade`.
+/// Endpoints are included (the last point lands on `f_stop`).
+fn log_frequencies(f_start: f64, f_stop: f64, ppd: u32) -> Vec<f64> {
+    let decades = (f_stop / f_start).log10();
+    let n = (decades * ppd as f64).round().max(1.0) as usize;
+    let mut out = Vec::with_capacity(n + 1);
+    for i in 0..=n {
+        out.push(f_start * 10f64.powf(i as f64 / ppd as f64));
+    }
+    // Pin the last sample exactly on f_stop (float drift in the exponent aside).
+    if let Some(last) = out.last_mut() {
+        *last = f_stop;
+    }
+    out
+}
+
+/// Small-signal AC analysis: linearize about the DC operating point, then solve a
+/// complex MNA system at each log-spaced frequency and return one complex
+/// [`Signal`] per node (the node-voltage phasor vs. frequency).
+///
+/// Reactive devices enter by their admittance — a capacitor as `jωC`, an inductor
+/// as `1/(jωL)` — so, unlike the DC operating point, inductors are **not** branch
+/// shorts here and add no branch row; the only branch rows are the voltage
+/// sources'. Nonlinear devices (the diode) are replaced by their small-signal
+/// conductance `g = dI/dV` evaluated at the DC bias, reusing the Newton–Raphson
+/// operating point. The stimulus is a 1∠0 phasor on every AC-drive source
+/// ([`is_ac_drive`]); all other sources are quiet (V → short, I → open).
+fn ac(
+    circuit: &Circuit,
+    layout: &Layout,
+    f_start: f64,
+    f_stop: f64,
+    points_per_decade: u32,
+) -> Result<Vec<Signal>, SimError> {
+    if !f_start.is_finite()
+        || !f_stop.is_finite()
+        || f_start <= 0.0
+        || f_stop <= f_start
+        || points_per_decade == 0
+    {
+        return Err(SimError::BadValue("AC sweep range/points".into()));
+    }
+
+    // Bias point for linearizing nonlinear devices (and verifying the topology).
+    let x_dc = solve_dc(circuit, layout)?;
+
+    let n = layout.n_nodes();
+    let m = layout.vsources.len();
+    let size = n + m; // inductors are admittances in AC — no branch rows.
+
+    // Precompute every frequency-independent stamp once.
+    // Resistors → real conductance G.
+    let mut conductances: Vec<(Option<usize>, Option<usize>, f64)> = Vec::new();
+    // Capacitors → jωC; inductors → 1/(jωL). Stored as (nodes, value) in F / H.
+    let mut caps: Vec<(Option<usize>, Option<usize>, f64)> = Vec::new();
+    let mut inds: Vec<(Option<usize>, Option<usize>, f64)> = Vec::new();
+    for part in circuit.parts() {
+        match part.kind {
+            PartKind::Resistor => {
+                let r = magnitude(part)?;
+                if r <= 0.0 {
+                    return Err(SimError::BadValue(part.reference.clone()));
+                }
+                let (a, b) = terminals2(part)?;
+                conductances.push((
+                    layout.node_of(circuit, a),
+                    layout.node_of(circuit, b),
+                    1.0 / r,
+                ));
+            }
+            PartKind::Capacitor => {
+                let (a, b) = terminals2(part)?;
+                caps.push((
+                    layout.node_of(circuit, a),
+                    layout.node_of(circuit, b),
+                    magnitude(part)?,
+                ));
+            }
+            PartKind::Inductor => {
+                let l = magnitude(part)?;
+                if l <= 0.0 {
+                    return Err(SimError::BadValue(part.reference.clone()));
+                }
+                let (a, b) = terminals2(part)?;
+                inds.push((layout.node_of(circuit, a), layout.node_of(circuit, b), l));
+            }
+            _ => {}
+        }
+    }
+
+    // Diodes → small-signal conductance g at the DC bias (real admittance).
+    let devices = collect_nonlinear(circuit)?;
+    let diode_g: Vec<(Option<usize>, Option<usize>, f64)> = devices
+        .iter()
+        .map(|dev| {
+            let (a, b) = dev.terminals();
+            let (na, nb) = (layout.node_of(circuit, a), layout.node_of(circuit, b));
+            let v = across(&x_dc, na, nb);
+            let (_, g) = dev.evaluate(v);
+            (na, nb, g)
+        })
+        .collect();
+
+    // Voltage sources → branch row k with a 1∠0 drive (else a 0 V short).
+    let vsource_stamps: Vec<(Option<usize>, Option<usize>, usize, Complex)> = layout
+        .vsources
+        .iter()
+        .enumerate()
+        .map(|(branch, &pi)| {
+            let part = &circuit.parts()[pi];
+            let (plus, minus) = terminals2(part)?;
+            let drive = if is_ac_drive(part) {
+                Complex::ONE
+            } else {
+                Complex::ZERO
+            };
+            Ok::<_, SimError>((
+                layout.node_of(circuit, plus),
+                layout.node_of(circuit, minus),
+                n + branch,
+                drive,
+            ))
+        })
+        .collect::<Result<_, _>>()?;
+
+    // AC-drive current sources → a 1∠0 injection a → b (quiet ones are open).
+    let mut csource_drives: Vec<(Option<usize>, Option<usize>)> = Vec::new();
+    for part in circuit.parts() {
+        if matches!(part.kind, PartKind::CurrentSource) && is_ac_drive(part) {
+            let (a, b) = terminals2(part)?;
+            csource_drives.push((layout.node_of(circuit, a), layout.node_of(circuit, b)));
+        }
+    }
+
+    let freqs = log_frequencies(f_start, f_stop, points_per_decade);
+    let mut per_node: Vec<Vec<Complex>> = vec![Vec::with_capacity(freqs.len()); n];
+
+    for &f in &freqs {
+        let w = TAU * f;
+        let mut sys = ComplexSystem::new(size);
+        for &(a, b, g) in &conductances {
+            sys.stamp_admittance(a, b, Complex::new(g, 0.0));
+        }
+        for &(a, b, c) in &caps {
+            sys.stamp_admittance(a, b, Complex::new(0.0, w * c)); // jωC
+        }
+        for &(a, b, l) in &inds {
+            sys.stamp_admittance(a, b, Complex::new(0.0, -1.0 / (w * l))); // 1/(jωL)
+        }
+        for &(a, b, g) in &diode_g {
+            sys.stamp_admittance(a, b, Complex::new(g, 0.0));
+        }
+        for &(plus, minus, k, drive) in &vsource_stamps {
+            sys.stamp_vsource(plus, minus, k, drive);
+        }
+        for &(a, b) in &csource_drives {
+            // 1∠0 from a into b — same direction convention as the DC stamp.
+            sys.stamp_current(b, a, Complex::ONE);
+        }
+
+        let x = sys.solve().ok_or(SimError::Singular)?;
+        for (d, col) in per_node.iter_mut().enumerate() {
+            col.push(x[d]);
+        }
+    }
+
+    Ok(per_node
+        .into_iter()
+        .enumerate()
+        .map(|(d, col)| {
+            Signal::freq(
+                format!("v(n{})", layout.inv[d]),
+                Unit::Volt,
+                freqs.clone(),
+                col,
             )
         })
         .collect())
@@ -1067,5 +1331,268 @@ mod tests {
         let layout = Layout::build(&c);
         let x = solve_dc(&c, &layout).unwrap();
         assert!((x[layout.node_of(&c, mid).unwrap()] - 5.0).abs() < 1e-12);
+    }
+
+    // --- Time-varying sources — CP-SIM-M1 ----------------------------------
+
+    #[test]
+    fn sine_source_reproduces_its_formula_in_transient() {
+        // An unloaded sine voltage source (1 MΩ bleed to ground so the node is not
+        // floating) must trace offset + A·sin(2πf t + φ) at every sampled time.
+        let (amp, freq, offset, phase_deg) = (2.0, 1_000.0, 1.0, 30.0_f64);
+        let mut c = Circuit::new("sine");
+        let out = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            None, // a sine carries its own levels — no DC Value needed
+            vec![out, NetId::GROUND],
+        );
+        c.add_part(
+            "R1",
+            PartKind::Resistor,
+            v("1meg", Unit::Ohm),
+            vec![out, NetId::GROUND],
+        );
+        assert!(c.set_waveform(
+            "V1",
+            Waveform::Sine {
+                amplitude: amp,
+                freq,
+                offset,
+                phase_deg,
+            },
+        ));
+
+        let h = 2e-6; // 500 steps per 1 kHz cycle
+        let sigs = Engine::new()
+            .run(
+                &c,
+                &Analysis::Transient {
+                    duration: 2e-3,
+                    step: Some(h),
+                },
+            )
+            .unwrap();
+        let name = format!("v(n{})", c.resolve(out).0);
+        let sig = sigs.iter().find(|s| s.name == name).unwrap();
+
+        // t = 0 holds the DC bias (the offset), per the waveform contract.
+        let y = sig.real().unwrap();
+        assert!((y[0] - offset).abs() < 1e-9, "t=0 bias {} != offset", y[0]);
+        // Every t > 0 sample matches the analytic sine within tight tolerance.
+        for (&t, &val) in sig.x.iter().zip(y).skip(1) {
+            let expected = offset + amp * (TAU * freq * t + phase_deg.to_radians()).sin();
+            assert!(
+                (val - expected).abs() <= 1e-6,
+                "t={t}: got {val}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn pulse_source_steps_v1_to_v2_at_the_right_times() {
+        // PULSE(v1=0, v2=5, delay=1ms, width=1ms, period=4ms): low until 1 ms,
+        // high for [1,2) ms, low again, then it repeats one period later.
+        let mut c = Circuit::new("pulse");
+        let out = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            None,
+            vec![out, NetId::GROUND],
+        );
+        c.add_part(
+            "R1",
+            PartKind::Resistor,
+            v("1meg", Unit::Ohm),
+            vec![out, NetId::GROUND],
+        );
+        assert!(c.set_waveform(
+            "V1",
+            Waveform::Pulse {
+                v1: 0.0,
+                v2: 5.0,
+                delay: 1e-3,
+                width: 1e-3,
+                period: 4e-3,
+            },
+        ));
+
+        let h = 1e-5;
+        let sigs = Engine::new()
+            .run(
+                &c,
+                &Analysis::Transient {
+                    duration: 6e-3,
+                    step: Some(h),
+                },
+            )
+            .unwrap();
+        let name = format!("v(n{})", c.resolve(out).0);
+        let sig = sigs.iter().find(|s| s.name == name).unwrap();
+
+        // Sample the trace at representative instants and check the level.
+        let level_at = |target: f64| -> f64 {
+            let i = sig
+                .x
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| {
+                    (*a - target)
+                        .abs()
+                        .partial_cmp(&(*b - target).abs())
+                        .unwrap()
+                })
+                .unwrap()
+                .0;
+            sig.real().unwrap()[i]
+        };
+        assert!(level_at(0.5e-3).abs() < 1e-9, "before delay should be v1");
+        assert!(
+            (level_at(1.5e-3) - 5.0).abs() < 1e-9,
+            "in pulse should be v2"
+        );
+        assert!(level_at(3.0e-3).abs() < 1e-9, "after width should be v1");
+        // One period later (delay + period = 5 ms) the pulse is high again.
+        assert!(
+            (level_at(5.5e-3) - 5.0).abs() < 1e-9,
+            "next period should be v2"
+        );
+    }
+
+    // --- AC small-signal analysis — CP-SIM-M1.4 ----------------------------
+
+    #[test]
+    fn rc_ac_bode() {
+        // RC low-pass: V1(AC) ─ R ─•─ C ─ gnd, output v(out). H = 1/(1+jωRC),
+        // so |H| is −3 dB and ∠H is −45° at fc = 1/(2πRC); ≈0 dB far below,
+        // −20 dB/decade far above.
+        let (r, cap) = (1_000.0_f64, 159.154_943e-9_f64); // fc ≈ 1 kHz
+        let fc = 1.0 / (TAU * r * cap);
+
+        let mut c = Circuit::new("rc_ac");
+        let inp = c.new_net();
+        let out = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            None,
+            vec![inp, NetId::GROUND],
+        );
+        c.add_part("R1", PartKind::Resistor, v("1k", Unit::Ohm), vec![inp, out]);
+        c.add_part(
+            "C1",
+            PartKind::Capacitor,
+            Some(Value::new(cap, Unit::Farad)),
+            vec![out, NetId::GROUND],
+        );
+        // Mark V1 as the AC drive (a sine stimulus → 1∠0 in AC).
+        assert!(c.set_waveform(
+            "V1",
+            Waveform::Sine {
+                amplitude: 1.0,
+                freq: fc,
+                offset: 0.0,
+                phase_deg: 0.0,
+            },
+        ));
+
+        let sigs = Engine::new()
+            .run(
+                &c,
+                &Analysis::Ac {
+                    f_start: fc / 100.0,
+                    f_stop: fc * 100.0,
+                    points_per_decade: 20,
+                },
+            )
+            .unwrap();
+
+        let name = format!("v(n{})", c.resolve(out).0);
+        let sig = sigs.iter().find(|s| s.name == name).unwrap();
+        let (freqs, z) = (&sig.x, sig.complex().unwrap());
+
+        // Helper: the sample whose frequency is closest to a target.
+        let nearest = |target: f64| -> usize {
+            freqs
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| {
+                    (*a - target)
+                        .abs()
+                        .partial_cmp(&(*b - target).abs())
+                        .unwrap()
+                })
+                .unwrap()
+                .0
+        };
+
+        // At fc: −3 dB (±0.1 dB) and −45° (±1°).
+        let ic = nearest(fc);
+        assert!(
+            (freqs[ic] - fc).abs() / fc < 0.02,
+            "no sample near fc (got {} Hz)",
+            freqs[ic]
+        );
+        let db_fc = z[ic].magnitude_db();
+        let ph_fc = z[ic].phase_deg();
+        assert!((db_fc + 3.0103).abs() <= 0.1, "fc gain {db_fc} dB");
+        assert!((ph_fc + 45.0).abs() <= 1.0, "fc phase {ph_fc}°");
+
+        // Two decades below fc: essentially unity gain (≈ 0 dB).
+        let db_low = z[nearest(fc / 100.0)].magnitude_db();
+        assert!(db_low.abs() <= 0.1, "low-freq gain {db_low} dB");
+
+        // Far above fc the slope is −20 dB/decade: compare one decade apart.
+        let db_10fc = z[nearest(fc * 10.0)].magnitude_db();
+        let db_100fc = z[nearest(fc * 100.0)].magnitude_db();
+        let slope = db_100fc - db_10fc; // dB per decade
+        assert!(
+            (slope + 20.0).abs() <= 0.5,
+            "high-freq slope {slope} dB/decade (points {db_10fc}, {db_100fc})"
+        );
+        // And the input node is the 1∠0 reference (0 dB).
+        let in_name = format!("v(n{})", c.resolve(inp).0);
+        let in_sig = sigs.iter().find(|s| s.name == in_name).unwrap();
+        assert!(in_sig.complex().unwrap()[ic].magnitude_db().abs() < 1e-9);
+    }
+
+    #[test]
+    fn ac_rejects_a_bad_sweep_range() {
+        let mut c = Circuit::new("rc_ac");
+        let inp = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            None,
+            vec![inp, NetId::GROUND],
+        );
+        c.add_part(
+            "R1",
+            PartKind::Resistor,
+            v("1k", Unit::Ohm),
+            vec![inp, NetId::GROUND],
+        );
+        assert!(c.set_waveform(
+            "V1",
+            Waveform::Sine {
+                amplitude: 1.0,
+                freq: 1_000.0,
+                offset: 0.0,
+                phase_deg: 0.0,
+            },
+        ));
+        let err = Engine::new()
+            .run(
+                &c,
+                &Analysis::Ac {
+                    f_start: 0.0, // non-positive start is rejected
+                    f_stop: 1_000.0,
+                    points_per_decade: 10,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, SimError::BadValue(_)), "got {err:?}");
     }
 }
