@@ -22,6 +22,7 @@ use std::f64::consts::TAU;
 use std::fmt;
 
 use ee_core::graph::{BjtModel, Circuit, MosfetModel, NetId, Part, PartKind, Polarity, Waveform};
+use ee_core::value::Value;
 use ee_core::{Complex, Signal, Unit};
 use mna::System;
 use mna_complex::ComplexSystem;
@@ -75,6 +76,8 @@ pub enum SimError {
     /// Newton–Raphson did not reach the voltage/current tolerance within the
     /// iteration cap. Carries the cap that was hit.
     NonConvergence(usize),
+    /// A sweep names a part reference that is not in the circuit.
+    UnknownPart(String),
 }
 
 impl fmt::Display for SimError {
@@ -98,6 +101,7 @@ impl fmt::Display for SimError {
                     "nonlinear solve did not converge within {iters} Newton–Raphson iterations"
                 )
             }
+            SimError::UnknownPart(r) => write!(f, "no part named {r} to sweep"),
         }
     }
 }
@@ -128,10 +132,17 @@ impl Engine {
                 f_stop,
                 points_per_decade,
             } => ac(circuit, &layout, *f_start, *f_stop, *points_per_decade),
-            Analysis::DcSweep { .. } => Err(SimError::Unsupported("DC sweep (CP-SIM-M1.5)")),
-            Analysis::Parametric { .. } => {
-                Err(SimError::Unsupported("parametric sweep (CP-SIM-M1.5)"))
-            }
+            Analysis::DcSweep {
+                source,
+                start,
+                stop,
+                step,
+            } => dc_sweep(circuit, source, *start, *stop, *step),
+            Analysis::Parametric {
+                source,
+                values,
+                inner,
+            } => self.parametric(circuit, source, values, inner),
         }
     }
 }
@@ -1353,6 +1364,120 @@ fn op_signals(layout: &Layout, x: &[f64]) -> Vec<Signal> {
             )
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// DC sweep + parametric sweep (CP-SIM-M1.5)
+// ---------------------------------------------------------------------------
+
+/// The unit a sweep must drive its target source with, and the guard that the
+/// target exists and is an independent source we can retarget.
+fn sweep_source_unit(circuit: &Circuit, source: &str) -> Result<Unit, SimError> {
+    match circuit.part_by_ref(source) {
+        Some(p) if matches!(p.kind, PartKind::VoltageSource) => Ok(Unit::Volt),
+        Some(p) if matches!(p.kind, PartKind::CurrentSource) => Ok(Unit::Ampere),
+        Some(_) => Err(SimError::Unsupported(
+            "sweep target is not an independent source",
+        )),
+        None => Err(SimError::UnknownPart(source.to_string())),
+    }
+}
+
+/// The sample points a sweep visits: `start` to `stop` inclusive in steps of
+/// `step`. `step` must be finite, non-zero, and point from `start` toward `stop`.
+/// Endpoints are included — the count is nudged by a hair so float drift cannot
+/// drop the final sample — and a zero span yields the single point `[start]`.
+fn sweep_values(start: f64, stop: f64, step: f64) -> Result<Vec<f64>, SimError> {
+    if !start.is_finite() || !stop.is_finite() || !step.is_finite() || step == 0.0 {
+        return Err(SimError::BadValue("DC sweep range/step".into()));
+    }
+    let span = stop - start;
+    if span != 0.0 && span.signum() != step.signum() {
+        return Err(SimError::BadValue(
+            "DC sweep step points the wrong way".into(),
+        ));
+    }
+    let count = (span / step + 1e-9).floor() as usize; // number of whole steps
+    Ok((0..=count).map(|i| start + i as f64 * step).collect())
+}
+
+/// `Analysis::DcSweep`: step an independent source's level from `start` to `stop`
+/// by `step`, solve the DC operating point (convergence aids and all) at every
+/// sample, and return one [`Signal`] per node — the node voltage as a function of
+/// the swept level, with the swept level on the `x` axis.
+///
+/// The swept source is driven as a plain DC source at each level (any waveform it
+/// carried is dropped for the sweep, so the stepped value always takes effect).
+/// The topology never changes across the sweep, so the MNA layout is built once.
+fn dc_sweep(
+    circuit: &Circuit,
+    source: &str,
+    start: f64,
+    stop: f64,
+    step: f64,
+) -> Result<Vec<Signal>, SimError> {
+    let unit = sweep_source_unit(circuit, source)?;
+    let values = sweep_values(start, stop, step)?;
+
+    let mut work = circuit.clone();
+    work.set_waveform(source, Waveform::Dc); // sweep the DC level, ignore any waveform
+    let layout = Layout::build(&work);
+    let n = layout.n_nodes();
+    let mut traces: Vec<Vec<f64>> = vec![Vec::with_capacity(values.len()); n];
+    for &val in &values {
+        work.set_value(source, Value::new(val, unit));
+        let x = solve_dc(&work, &layout)?;
+        for (d, trace) in traces.iter_mut().enumerate() {
+            trace.push(x[d]);
+        }
+    }
+
+    Ok(traces
+        .into_iter()
+        .enumerate()
+        .map(|(d, y)| {
+            Signal::time(
+                format!("v(n{})", layout.inv[d]),
+                Unit::Volt,
+                values.clone(),
+                y,
+            )
+        })
+        .collect())
+}
+
+impl Engine {
+    /// `Analysis::Parametric`: run the boxed `inner` analysis once per value in
+    /// `values`, retargeting `source`'s DC level to each value first. Every signal
+    /// the inner run returns is tagged with the swept value (`"v(n2) @ V1=3"`) so
+    /// the families stay distinguishable, and the runs are concatenated in order.
+    ///
+    /// The inner analysis flows back through [`Engine::run`], so it may be any
+    /// analysis — an operating point, a transient, an AC sweep, even a nested
+    /// sweep. As in [`dc_sweep`], the swept source is driven as a DC source at the
+    /// swept level.
+    fn parametric(
+        &self,
+        circuit: &Circuit,
+        source: &str,
+        values: &[f64],
+        inner: &Analysis,
+    ) -> Result<Vec<Signal>, SimError> {
+        // Validate the target up front so an empty `values` list still rejects a typo.
+        let unit = sweep_source_unit(circuit, source)?;
+
+        let mut work = circuit.clone();
+        work.set_waveform(source, Waveform::Dc);
+        let mut out = Vec::new();
+        for &val in values {
+            work.set_value(source, Value::new(val, unit));
+            for mut sig in self.run(&work, inner)? {
+                sig.name = format!("{} @ {source}={val}", sig.name);
+                out.push(sig);
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -2620,5 +2745,244 @@ mod tests {
             "phase {}° not inverting",
             h.phase_deg()
         );
+    }
+
+    // --- DC sweep + parametric sweep — CP-SIM-M1.5 -------------------------
+
+    /// Build the 1k/1k divider driven by `V1` (DC, initial 0 V).
+    fn divider() -> (Circuit, NetId, NetId) {
+        let mut c = Circuit::new("divider");
+        let vin = c.new_net();
+        let mid = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("0", Unit::Volt),
+            vec![vin, NetId::GROUND],
+        );
+        c.add_part("R1", PartKind::Resistor, v("1k", Unit::Ohm), vec![vin, mid]);
+        c.add_part(
+            "R2",
+            PartKind::Resistor,
+            v("1k", Unit::Ohm),
+            vec![mid, NetId::GROUND],
+        );
+        (c, vin, mid)
+    }
+
+    #[test]
+    fn dc_sweep_divider_is_linear_in_the_source() {
+        // Sweep V1 0 → 10 V in 1 V steps: the midpoint tracks Vin/2 and the input
+        // node tracks the swept level, so the whole family is linear in the source.
+        let (c, vin, mid) = divider();
+        let sigs = Engine::new()
+            .run(
+                &c,
+                &Analysis::DcSweep {
+                    source: "V1".into(),
+                    start: 0.0,
+                    stop: 10.0,
+                    step: 1.0,
+                },
+            )
+            .unwrap();
+
+        let mid_name = format!("v(n{})", c.resolve(mid).0);
+        let mid_sig = sigs.iter().find(|s| s.name == mid_name).unwrap();
+        // 11 inclusive samples, the swept level on the x axis (0 … 10 V).
+        assert_eq!(mid_sig.x.len(), 11, "expected 11 sweep points");
+        assert!((mid_sig.x[0]).abs() < 1e-12);
+        assert!((mid_sig.x[10] - 10.0).abs() < 1e-9);
+        for (&xin, &vm) in mid_sig.x.iter().zip(mid_sig.real().unwrap()) {
+            assert!((vm - xin / 2.0).abs() <= 1e-9, "x={xin}: mid={vm}");
+        }
+
+        let vin_name = format!("v(n{})", c.resolve(vin).0);
+        let vin_sig = sigs.iter().find(|s| s.name == vin_name).unwrap();
+        for (&xin, &vv) in vin_sig.x.iter().zip(vin_sig.real().unwrap()) {
+            assert!((vv - xin).abs() <= 1e-9, "x={xin}: vin={vv}");
+        }
+    }
+
+    #[test]
+    fn dc_sweep_diode_matches_shockley() {
+        // Sweep the current forced through a diode (1 → 10 mA) and read the
+        // junction voltage back: each point is the inverse-Shockley law
+        // V = n·Vt·ln(I/Is + 1), solved by the Newton path at every sample.
+        let mut c = Circuit::new("diode_sweep");
+        let node = c.new_net();
+        c.add_part(
+            "I1",
+            PartKind::CurrentSource,
+            v("1m", Unit::Ampere),
+            vec![NetId::GROUND, node],
+        );
+        c.add_part("D1", PartKind::Diode, None, vec![node, NetId::GROUND]);
+
+        let sigs = Engine::new()
+            .run(
+                &c,
+                &Analysis::DcSweep {
+                    source: "I1".into(),
+                    start: 1e-3,
+                    stop: 10e-3,
+                    step: 1e-3,
+                },
+            )
+            .unwrap();
+
+        let name = format!("v(n{})", c.resolve(node).0);
+        let sig = sigs.iter().find(|s| s.name == name).unwrap();
+        assert_eq!(sig.x.len(), 10);
+        for (&i, &vd) in sig.x.iter().zip(sig.real().unwrap()) {
+            let expected = VTE * (i / IS + 1.0).ln();
+            assert!(
+                (vd - expected).abs() <= 1e-7,
+                "I={i}: vd={vd}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn parametric_runs_inner_once_per_value() {
+        // Parametric over V1 ∈ {2, 5, 8} V with an inner DC operating point of the
+        // divider: three runs × two nodes = six tagged signals, midpoint = Vin/2.
+        let (c, _vin, mid) = divider();
+        let values = vec![2.0, 5.0, 8.0];
+        let sigs = Engine::new()
+            .run(
+                &c,
+                &Analysis::Parametric {
+                    source: "V1".into(),
+                    values: values.clone(),
+                    inner: Box::new(Analysis::OperatingPoint),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(sigs.len(), 6, "2 nodes × 3 values");
+        let mid_raw = c.resolve(mid).0;
+        for &val in &values {
+            let tag = format!("v(n{mid_raw}) @ V1={val}");
+            let s = sigs
+                .iter()
+                .find(|s| s.name == tag)
+                .unwrap_or_else(|| panic!("missing tagged signal {tag}"));
+            assert!(
+                (s.real().unwrap()[0] - val / 2.0).abs() <= 1e-9,
+                "{tag}: mid={}",
+                s.real().unwrap()[0]
+            );
+        }
+    }
+
+    #[test]
+    fn parametric_over_transient_sweeps_the_bias() {
+        // An inner transient per value proves the inner analysis is a full run, not
+        // just an operating point: an RC charging from a swept rail settles toward
+        // that rail. Sweep V1 ∈ {1, 4} V; the last sample of v(out) nears the rail.
+        let mut c = Circuit::new("rc");
+        let vin = c.new_net();
+        let out = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("1", Unit::Volt),
+            vec![vin, NetId::GROUND],
+        );
+        c.add_part("R1", PartKind::Resistor, v("1k", Unit::Ohm), vec![vin, out]);
+        c.add_part(
+            "C1",
+            PartKind::Capacitor,
+            v("1u", Unit::Farad),
+            vec![out, NetId::GROUND],
+        );
+
+        let sigs = Engine::new()
+            .run(
+                &c,
+                &Analysis::Parametric {
+                    source: "V1".into(),
+                    values: vec![1.0, 4.0],
+                    inner: Box::new(Analysis::Transient {
+                        duration: 5e-3,
+                        step: Some(5e-6),
+                    }),
+                },
+            )
+            .unwrap();
+
+        let out_raw = c.resolve(out).0;
+        for &rail in &[1.0_f64, 4.0] {
+            let tag = format!("v(n{out_raw}) @ V1={rail}");
+            let s = sigs.iter().find(|s| s.name == tag).unwrap();
+            let y = s.real().unwrap();
+            assert!(y[0].abs() < 1e-9, "{tag}: starts uncharged");
+            assert!(
+                *y.last().unwrap() > 0.98 * rail,
+                "{tag}: ends at {} V, near {rail}",
+                y.last().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn sweep_rejects_bad_targets_and_steps() {
+        let (c, _vin, _mid) = divider();
+        let run = |a| Engine::new().run(&c, &a);
+
+        // Unknown source reference.
+        assert!(matches!(
+            run(Analysis::DcSweep {
+                source: "VX".into(),
+                start: 0.0,
+                stop: 10.0,
+                step: 1.0,
+            })
+            .unwrap_err(),
+            SimError::UnknownPart(_)
+        ));
+        // A resistor is not an independent source.
+        assert!(matches!(
+            run(Analysis::DcSweep {
+                source: "R1".into(),
+                start: 0.0,
+                stop: 10.0,
+                step: 1.0,
+            })
+            .unwrap_err(),
+            SimError::Unsupported(_)
+        ));
+        // Zero step, and a step pointing the wrong way, are both bad values.
+        assert!(matches!(
+            run(Analysis::DcSweep {
+                source: "V1".into(),
+                start: 0.0,
+                stop: 10.0,
+                step: 0.0,
+            })
+            .unwrap_err(),
+            SimError::BadValue(_)
+        ));
+        assert!(matches!(
+            run(Analysis::DcSweep {
+                source: "V1".into(),
+                start: 0.0,
+                stop: 10.0,
+                step: -1.0,
+            })
+            .unwrap_err(),
+            SimError::BadValue(_)
+        ));
+        // Parametric validates the target even with an empty value list.
+        assert!(matches!(
+            run(Analysis::Parametric {
+                source: "VX".into(),
+                values: vec![],
+                inner: Box::new(Analysis::OperatingPoint),
+            })
+            .unwrap_err(),
+            SimError::UnknownPart(_)
+        ));
     }
 }

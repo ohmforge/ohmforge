@@ -274,6 +274,20 @@ impl Circuit {
         }
     }
 
+    /// Override an existing part's primary [`Value`] by reference designator.
+    /// Returns `true` if a part with that reference was found and updated. This is
+    /// how a DC/parametric sweep retargets the source it steps: it points the
+    /// level at each sweep sample without rebuilding the circuit. (`CP-SIM-M1.5`.)
+    pub fn set_value(&mut self, reference: &str, value: Value) -> bool {
+        match self.parts.iter_mut().find(|p| p.reference == reference) {
+            Some(p) => {
+                p.value = Some(value);
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn parts(&self) -> &[Part] {
         &self.parts
     }
@@ -282,6 +296,7 @@ impl Circuit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::units::Unit;
 
     #[test]
     fn first_net_is_never_ground() {
@@ -343,5 +358,21 @@ mod tests {
         assert_eq!(c.part_by_ref("V1").unwrap().waveform, wf);
         // An unknown reference leaves the circuit untouched and reports false.
         assert!(!c.set_waveform("V9", Waveform::Dc));
+    }
+
+    #[test]
+    fn set_value_retargets_a_sources_level_by_reference() {
+        let mut c = Circuit::new("c");
+        let (a, b) = (c.new_net(), c.new_net());
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            Some(Value::new(1.0, Unit::Volt)),
+            vec![a, b],
+        );
+        assert!(c.set_value("V1", Value::new(7.0, Unit::Volt)));
+        assert_eq!(c.part_by_ref("V1").unwrap().value.unwrap().magnitude, 7.0);
+        // An unknown reference is a no-op reported as false.
+        assert!(!c.set_value("V9", Value::new(1.0, Unit::Volt)));
     }
 }
