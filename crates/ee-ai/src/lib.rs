@@ -39,6 +39,23 @@
 //!
 //! With a stubbed model but a real sim, [`ask`] answers a question grounded in
 //! a real operating-point read.
+//!
+//! ## This checkpoint (CP-AF-M2.1): the verification loop — the trust mechanism
+//!
+//! Design/debug answers must be *simulated* before they are shown, and the live
+//! circuit must never change without approval (docs/AI.md § The verification
+//! loop / Guardrails):
+//!
+//! * [`verify`] clones the base shell, scratch-applies a [`ProposedPatch`],
+//!   re-simulates, and **measures** the [`Spec`] quantities (node voltage, load
+//!   current), returning a structured [`Verdict`] that cites the real numbers.
+//!   It borrows the base immutably — it cannot touch the live circuit.
+//! * [`apply`] is the sole call that commits a patch onto a real shell;
+//!   [`reject`] discards one. Applying is always an explicit, separate step.
+//! * [`Designer`] + [`design`] tie this to the model: a `propose_patch` tool
+//!   stages a patch, the loop verifies it against a clone, and the measured
+//!   verdict is fed back so the model iterates on real evidence — nothing
+//!   auto-applies.
 
 pub mod client;
 pub mod config;
@@ -46,6 +63,7 @@ pub mod error;
 pub mod message;
 pub mod tools;
 pub mod transport;
+pub mod verify;
 
 pub use client::{Client, RunResult, ToolHandler, DEFAULT_MAX_TOKENS, DEFAULT_MAX_TOOL_TURNS};
 pub use config::{api_key_from_env, model_from_env, DEFAULT_MODEL};
@@ -56,6 +74,10 @@ pub use message::{
 };
 pub use tools::{ask, CircuitTools, EESH_TOOL, READ_OP_TOOL};
 pub use transport::{MockTransport, Transport};
+pub use verify::{
+    apply, design, reject, verify, Criterion, DesignOutcome, Designer, Measurement, Outcome, Spec,
+    Verdict, PROPOSE_PATCH_TOOL,
+};
 
 /// A change the AI proposes. Staged — never auto-applied; the user runs
 /// `apply`/`reject`. (docs/AI.md § Guardrails)
