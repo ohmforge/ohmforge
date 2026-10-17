@@ -58,12 +58,26 @@
 //!   stages a patch, the loop verifies it against a clone, and the measured
 //!   verdict is fed back so the model iterates on real evidence — nothing
 //!   auto-applies.
+//!
+//! ## This checkpoint (CP-AF-M3.2): offline mode — no API key needed
+//!
+//! When there is no key, no network, and no model, the copilot still earns its
+//! keep through deterministic heuristics:
+//!
+//! * [`offline`] — design-rule [`check`](offline::check)s over a
+//!   [`Circuit`](ee_core::graph::Circuit) (floating node, no path to ground, an
+//!   LED with no series resistor, a short across a source), pure value
+//!   [`calc`](offline::calc)ulators (divider, RC/RL, series/parallel R, LED
+//!   resistor), and a static [`parts`](offline::parts) catalog with keyword
+//!   search. It depends on `ee_core` alone — no [`Transport`], no
+//!   [`Client`], no key.
 
 pub mod client;
 pub mod config;
 pub mod error;
 pub mod message;
 pub mod modes;
+pub mod offline;
 pub mod tools;
 pub mod transport;
 pub mod verify;
@@ -78,6 +92,10 @@ pub use message::{
 pub use modes::{
     debug_circuit, firmware, localize_fault, parse_intel_hex, DebugOutcome, Debugger, FaultReport,
     FirmwareBuilder, FirmwareImage, FirmwareOutcome, HexError, Suspect,
+};
+pub use offline::{
+    calc::CalcError, check as drc_check, review as offline_review, CatalogEntry, Finding, Rule,
+    Severity,
 };
 pub use tools::{ask, CircuitTools, EESH_TOOL, READ_OP_TOOL};
 pub use transport::{MockTransport, Transport};
