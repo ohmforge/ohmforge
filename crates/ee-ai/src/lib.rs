@@ -46,7 +46,7 @@
 //! circuit must never change without approval (docs/AI.md § The verification
 //! loop / Guardrails):
 //!
-//! * [`verify`] clones the base shell, scratch-applies a [`ProposedPatch`],
+//! * [`verify`](fn@crate::verify) clones the base shell, scratch-applies a [`ProposedPatch`],
 //!   re-simulates, and **measures** the [`Spec`] quantities (node voltage, load
 //!   current), returning a structured [`Verdict`] that cites the real numbers.
 //!   It borrows the base immutably — it cannot touch the live circuit.

@@ -743,7 +743,7 @@ impl Peripherals {
     }
 
     /// Sample the co-sim exchange's input voltages into the peripherals: each
-    /// pin's voltage feeds the digital-input level (via [`LOGIC_THRESHOLD_V`]),
+    /// pin's voltage feeds the digital-input level (via `LOGIC_THRESHOLD_V`),
     /// and each Port C pin additionally feeds its ADC channel. Called at the top
     /// of a co-sim step.
     pub fn sample_inputs(&mut self, io: &PinIo) {

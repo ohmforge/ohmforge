@@ -43,7 +43,7 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 - [x] **CP-BRD-M1.5** Uno board def + firmware load (`.hex`). — *gate:* `blink.hex` (committed fixture, regenerated from a documented assembly listing) loads via Intel-HEX; D13/PB5 toggles at 1.000 s/toggle (~1 Hz). ELF still `UnsupportedFormat`.
 
 ### M2 — co-simulation + more cores
-- [ ] **CP-BRD-M2.1** Co-sim bridge: pin↔net, clock sync. — *gate:* `analogRead` returns a divider's voltage; `digitalWrite` lights a sim LED.
+- [~] **CP-BRD-M2.1** Co-sim bridge: pin↔net, clock sync. — *gate:* `analogRead` returns a divider's voltage; `digitalWrite` lights a sim LED. _(Bridge surface merged — `PinIo`, `McuCore::{next_event, step_to_cycle}`, pin↔peripheral map, 5 cosim tests; the lockstep loop + demo live in the `ee` binary — integrator's next step.)_
 - [ ] **CP-BRD-M2.2** Mixed-signal boundary elements (threshold, drive strength, rise/fall). — *gate:* boundary behavior test at configured thresholds.
 - [ ] **CP-BRD-M2.3** Cortex-M0+ core + RP2040 (Raspberry Pi Pico). — *gate:* ARMv6-M (Thumb) test-vectors; Pico blink toggles a pin.
 - [ ] **CP-BRD-M2.4** ATmega2560 / ATtiny variants. — *gate:* variant peripheral map test.
@@ -69,7 +69,7 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 ### M2 — analysis views
 - [ ] **CP-UX-M2.1** Logic analyzer + protocol-decode view (UART/SPI/I²C). — *gate:* decode a known UART capture.
 - [ ] **CP-UX-M2.2** Breadboard view. — *gate:* renders a small circuit as a breadboard layout (snapshot).
-- [ ] **CP-UX-M2.3** Bode/spectrum panel + scope math/FFT channels. — *gate:* Bode plot of `CP-SIM-M1.4` renders correctly.
+- [x] **CP-UX-M2.3** Bode/spectrum panel + scope math/FFT channels. — *gate:* Bode panel renders magnitude+phase vs log-f with the −3 dB corner; hand-rolled radix-2 FFT validated against a direct DFT (<1e-9), a pure sine → one dominant bin; scope math channels (A±B, A·B).
 - [ ] **CP-UX-M2.4** Session snapshots / undo / named checkpoints. — *gate:* undo restores prior graph state.
 
 ---
@@ -85,7 +85,7 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 - [x] **CP-AF-M1.3** AI tool layer over the circuit API (add/wire/set/run/read). — *gate:* `ask_is_grounded_in_a_real_sim_read` — stub model drives a REAL `Shell`+engine via `eesh`/`read_op` tools, builds a 12 V divider, and its answer (8.000000 V) matches the real solve (12·2k/3k). The AI does only what a user could; no network.
 
 ### M2 — verified design + waveform export
-- [ ] **CP-AF-M2.1** Verification loop: staged patch → scratch apply → re-sim → measure → present diff; `apply`/`reject` gate. — *gate:* "5 V→3.3 V @ 500 mA" yields a patch whose sim meets spec; nothing applies without approval.
+- [x] **CP-AF-M2.1** Verification loop: staged patch → scratch apply → re-sim → measure → present diff; `apply`/`reject` gate. — *gate:* `verify` clones the base shell (`&Shell` → never mutates the live circuit), scratch-applies, measures; "5 V→3.3 V @ 500 mA" → good patch PASSes citing measured 3.3 V / 0.5 A, bad patch FAILs; live circuit unchanged until explicit `apply`.
 - [ ] **CP-AF-M2.2** Design / Debug / Firmware modes. — *gate:* Debug localizes a seeded fault; Firmware sketch flashes into the emulator (needs `CP-BRD-M2.1`).
 - [ ] **CP-AF-M2.3** VCD + CSV waveform export. — *gate:* VCD opens in GTKWave; CSV matches probe data.
 
@@ -108,12 +108,12 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 
 | Track | Done | In progress | Total |
 |---|---|---|---|
-| sim-core | 11 | 0 | 15 |
-| boards | 5 | 0 | 10 |
-| ui-shell | 9 | 0 | 13 |
-| ai-fmt | 4 | 0 | 9 |
+| sim-core | 12 | 0 | 15 |
+| boards | 5 | 1 | 10 |
+| ui-shell | 10 | 0 | 13 |
+| ai-fmt | 5 | 0 | 9 |
 | platform | 3 | 0 | 5 |
-| **Total** | **32** | **0** | **52** |
+| **Total** | **35** | **1** | **52** |
 
 *Update this table when flipping a checkpoint.*
 
