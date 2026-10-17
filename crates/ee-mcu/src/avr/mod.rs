@@ -15,7 +15,9 @@
 //! - [`periph`] — the memory-mapped peripherals ([`Peripherals`]): GPIO, the
 //!   Timer0/Timer1 counters with PWM, the ADC, and the USART transmitter.
 //! - [`board`] — board definitions tying the core + peripherals to a pinout,
-//!   starting with the Arduino [`Uno`].
+//!   starting with the Arduino [`Uno`] (and [`Mega`] on the ATmega2560).
+//! - [`variant`] — per-part descriptors ([`AvrVariant`]) that size the shared
+//!   core into an ATmega328P, ATmega2560 or ATtiny85.
 //!
 //! It implements the supported-opcode **subset** correctly rather than the whole
 //! ISA; unimplemented encodings decode to [`Instr::Unknown`]. See [`decode`](mod@decode) for
@@ -27,10 +29,12 @@ pub mod decode;
 pub mod isa;
 pub mod periph;
 pub mod sreg;
+pub mod variant;
 
 pub use self::core::Avr;
-pub use board::Uno;
+pub use board::{Mega, Uno};
 pub use decode::decode;
 pub use isa::{Instr, Ptr, PtrMode};
 pub use periph::{pin_id, pin_location, Peripherals, Port, PIN_COUNT};
 pub use sreg::Sreg;
+pub use variant::{AvrVariant, TimerSpec};
