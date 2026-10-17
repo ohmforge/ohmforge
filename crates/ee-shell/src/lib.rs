@@ -31,6 +31,10 @@
 //! assert!(frame.contains('\u{2524}')); // a braille scope frame
 //! ```
 
+pub mod script;
+
+pub use script::{Recording, ScriptError, ScriptRun};
+
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
