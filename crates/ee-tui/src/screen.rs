@@ -142,6 +142,30 @@ impl Screen {
         out
     }
 
+    /// Lay out a full-width [`Breadboard`](crate::Breadboard) above a full-width
+    /// shell/log pane.
+    ///
+    /// The breadboard wants horizontal room, so unlike [`render`](Screen::render)
+    /// it spans the whole width rather than sharing the top row with a scope. The
+    /// board is clipped to fit if the view is narrower than its natural width.
+    pub fn render_breadboard(&self, circuit: &Circuit, shell: &[&str]) -> String {
+        let w = self.width.max(20);
+        let h = self.height.max(6);
+        let bottom_h = (h / 3).clamp(3, h - 3);
+        let top_h = h - bottom_h;
+
+        let top = crate::breadboard::Breadboard::new("breadboard").pane_lines(circuit, w, top_h);
+        let shell_body = shell.join("\n");
+        let bottom = Pane::new("shell", &shell_body).render(w, bottom_h);
+
+        let mut out = String::new();
+        for line in top.iter().chain(&bottom) {
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
+    }
+
     /// Lay out the three panes and return the composed frame.
     pub fn render(&self, circuit: &Circuit, scope: &str, shell: &[&str]) -> String {
         let w = self.width.max(20);
@@ -310,6 +334,31 @@ mod tests {
             assert!(
                 line.chars().count() <= width,
                 "line exceeds width {width}: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn breadboard_composition_spans_full_width_and_fits() {
+        let width = 80;
+        let height = 20;
+        let out = Screen::new()
+            .size(width, height)
+            .render_breadboard(&rc_circuit(), &["> place R1", "ok"]);
+
+        // The breadboard pane: a part reference, the trench, and tie-point holes.
+        assert!(out.contains("R1"), "breadboard pane:\n{out}");
+        assert!(out.contains('═'), "trench:\n{out}");
+        assert!(out.contains('·'), "tie-point holes:\n{out}");
+        // The shell pane still composes beneath it.
+        assert!(out.contains("ok"), "shell pane:\n{out}");
+
+        assert_eq!(out.lines().count(), height, "line count == height");
+        for line in out.lines() {
+            assert_eq!(
+                line.chars().count(),
+                width,
+                "line is not exactly {width} cells: {line:?}"
             );
         }
     }

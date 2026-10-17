@@ -9,6 +9,7 @@
 //! stalls the solver. See docs/ARCHITECTURE.md § "The TUI." (Roadmap M0+.)
 
 pub mod app;
+pub mod breadboard;
 pub mod overlay;
 pub mod plot;
 pub mod run;
@@ -16,6 +17,7 @@ pub mod schematic;
 pub mod screen;
 
 pub use app::{App, AppEvent, Backend, KeyCode, KeyEvent, MouseEvent, MouseKind, PanelId};
+pub use breadboard::Breadboard;
 pub use overlay::{NodeVoltages, Overlay};
 pub use plot::Plot;
 pub use run::run;
