@@ -19,7 +19,7 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 
 ### M1 — nonlinear + frequency domain
 - [x] **CP-SIM-M1.1** Nonlinear device framework + Newton–Raphson; diode. — *gate:* `diode_iv` matches Shockley to machine precision; `diode_resistor_op_converges` (Vd=0.6925 V, residual 1e-17); `nonconvergence_is_reported`; linear circuits stay single-iteration. `trait NonlinearDevice` so BJT/MOSFET (M1.2) drop in; SPICE `pnjlim` junction limiting.
-- [ ] **CP-SIM-M1.2** BJT + MOSFET models. — *gate:* common-emitter DC sweep hits known operating points.
+- [x] **CP-SIM-M1.2** BJT + MOSFET models. — *gate:* CE amp biases at Vbe≈0.65 V, Ic≈βF·Ib, Vc mid-rail; MOSFET square-law `Id=K(Vgs−Vth)²(1+λVds)`; CE small-signal AC gain |Av|≈gm·Rc. Generalized `NonlinearDevice` to an N-terminal Jacobian companion (BJT/MOSFET 3×3); `PartKind::{Bjt,Mosfet}(Polarity, Model)`.
 - [ ] **CP-SIM-M1.3** Convergence aids (gmin/source stepping, junction limiting). — *gate:* a known-stiff netlist that failed now converges.
 - [x] **CP-SIM-M1.4** AC small-signal (complex MNA). — *gate:* `rc_ac_bode` — RC low-pass is −3.010 dB and −45.0° at `fc`, ~−20 dB/decade rolloff. Complex MNA (`mna_complex.rs`), nonlinear devices biased via the NR op-point. **Also landed:** time-varying independent sources (`Waveform::{Dc,Sine,Pulse}`, `Circuit::set_waveform`) evaluated through transient — the M0 source follow-up.
 - [ ] **CP-SIM-M1.5** DC sweep + parametric sweep. — *gate:* sweep produces the expected response family (golden).
@@ -108,12 +108,12 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 
 | Track | Done | In progress | Total |
 |---|---|---|---|
-| sim-core | 7 | 0 | 15 |
+| sim-core | 8 | 0 | 15 |
 | boards | 3 | 0 | 10 |
 | ui-shell | 7 | 0 | 13 |
 | ai-fmt | 4 | 0 | 9 |
 | platform | 3 | 0 | 5 |
-| **Total** | **24** | **0** | **52** |
+| **Total** | **25** | **0** | **52** |
 
 *Update this table when flipping a checkpoint.*
 

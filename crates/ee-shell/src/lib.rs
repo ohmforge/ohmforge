@@ -376,6 +376,8 @@ fn kind_label(kind: &PartKind) -> &str {
         PartKind::VoltageSource => "source",
         PartKind::CurrentSource => "current source",
         PartKind::Diode => "diode",
+        PartKind::Bjt(..) => "BJT",
+        PartKind::Mosfet(..) => "MOSFET",
         PartKind::Other(name) => name,
     }
 }

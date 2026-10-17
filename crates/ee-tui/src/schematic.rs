@@ -116,6 +116,8 @@ pub(crate) fn kind_label(kind: &PartKind) -> &str {
         PartKind::VoltageSource => "V-source",
         PartKind::CurrentSource => "I-source",
         PartKind::Diode => "Diode",
+        PartKind::Bjt(..) => "BJT",
+        PartKind::Mosfet(..) => "MOSFET",
         PartKind::Other(name) => name,
     }
 }

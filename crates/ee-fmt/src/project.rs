@@ -40,7 +40,7 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{self, Write as _};
 
-use ee_core::graph::{Circuit, NetId, PartKind};
+use ee_core::graph::{BjtModel, Circuit, MosfetModel, NetId, PartKind, Polarity};
 use ee_core::units::Unit;
 use ee_core::value::{ParseError, Value};
 
@@ -298,6 +298,12 @@ fn take_kind(rest: &str) -> Result<(PartKind, &str), ErrorKind> {
         "V" => PartKind::VoltageSource,
         "I" => PartKind::CurrentSource,
         "D" => PartKind::Diode,
+        // Transistors: polarity preserved; model params default on load
+        // (custom-param round-trip is a documented follow-up).
+        "QN" => PartKind::Bjt(Polarity::N, BjtModel::default()),
+        "QP" => PartKind::Bjt(Polarity::P, BjtModel::default()),
+        "MN" => PartKind::Mosfet(Polarity::N, MosfetModel::default()),
+        "MP" => PartKind::Mosfet(Polarity::P, MosfetModel::default()),
         _ => return Err(ErrorKind::UnknownKind(tok.to_string())),
     };
     Ok((kind, remainder))
@@ -352,7 +358,17 @@ fn write_kind(kind: &PartKind) -> String {
         PartKind::VoltageSource => "V".to_string(),
         PartKind::CurrentSource => "I".to_string(),
         PartKind::Diode => "D".to_string(),
+        PartKind::Bjt(pol, _) => format!("Q{}", polarity_letter(*pol)),
+        PartKind::Mosfet(pol, _) => format!("M{}", polarity_letter(*pol)),
         PartKind::Other(name) => format!("other({name})"),
+    }
+}
+
+/// `n` for an N-type transistor, `p` for P-type.
+fn polarity_letter(pol: Polarity) -> &'static str {
+    match pol {
+        Polarity::N => "n",
+        Polarity::P => "p",
     }
 }
 
@@ -584,6 +600,8 @@ R3 R 1k a ground
             PartKind::VoltageSource => "V".into(),
             PartKind::CurrentSource => "I".into(),
             PartKind::Diode => "D".into(),
+            PartKind::Bjt(..) => "Q".into(),
+            PartKind::Mosfet(..) => "M".into(),
             PartKind::Other(n) => format!("other:{n}"),
         }
     }
