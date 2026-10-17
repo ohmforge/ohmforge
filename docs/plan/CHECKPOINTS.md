@@ -26,8 +26,8 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 - [x] **CP-SIM-M1.6** Adaptive timestep (LTE control). — *gate:* `adaptive_transient_beats_fixed_on_an_rc_step` — step-doubling LTE over a 20τ RC uses ~182 points vs 10001 fixed (~55×) at equal accuracy; grid coarsens and lands exactly on `duration`. `step: None` now means engine-chosen.
 
 ### M2 — statistical + scale
-- [ ] **CP-SIM-M2.1** Noise analysis (output spectral density). — *gate:* resistor thermal-noise floor matches `4kTR` within tol.
-- [ ] **CP-SIM-M2.2** Monte-Carlo + component tolerances (seeded, deterministic). — *gate:* fixed seed reproduces the same spread bit-for-bit.
+- [x] **CP-SIM-M2.1** Noise analysis (output spectral density). — *gate:* `resistor_thermal_noise` — a 1 kΩ output floor = 4kTR within 1e-6, flat over frequency; a divider gives 4kT·(R1∥R2). `Analysis::Noise`; transimpedance via the complex-MNA network. (`4kT` at 300.15 K.)
+- [x] **CP-SIM-M2.2** Monte-Carlo + component tolerances (seeded, deterministic). — *gate:* `monte_carlo_is_deterministic_under_a_fixed_seed` — seed 42 twice → bit-identical 400-sample vectors; ±5% divider mean ≈ 5 V. In-crate SplitMix64 (no dep), `Circuit::set_tolerance`, `Analysis::MonteCarlo`.
 - [x] **CP-SIM-M2.3** Controlled sources (VCVS/VCCS/CCVS/CCCS). — *gate:* gain-10 VCVS exact at op-point and flat in AC; VCCS `Vout=G·Vin·R`; an ideal op-amp (huge-gain VCVS) non-inverting config → 1+Rf/Rg=10; CCVS/CCCS current-sense. Stamped in real + complex MNA. `PartKind::{Vcvs,Vccs,Ccvs,Cccs}` (native format round-trips the gain/ref; SPICE export defers).
 - [ ] **CP-SIM-M2.4** Sparse solver path for large nets. — *gate:* criterion bench shows target scaling on a 1k-node ladder.
 
@@ -108,12 +108,12 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 
 | Track | Done | In progress | Total |
 |---|---|---|---|
-| sim-core | 12 | 0 | 15 |
+| sim-core | 14 | 0 | 15 |
 | boards | 6 | 0 | 10 |
 | ui-shell | 12 | 0 | 13 |
 | ai-fmt | 5 | 0 | 9 |
 | platform | 3 | 0 | 5 |
-| **Total** | **38** | **0** | **52** |
+| **Total** | **40** | **0** | **52** |
 
 *Update this table when flipping a checkpoint.*
 
