@@ -62,6 +62,23 @@ pub struct Shell {
     nets: HashMap<String, NetId>,
     /// Nodes to render on the next transient `run`, in the order probed.
     probes: Vec<String>,
+    /// Session-state snapshots taken before each mutating command, newest last;
+    /// `undo` pops the top to revert the last command (`CP-UX-M2.4`).
+    undo_stack: Vec<Snapshot>,
+    /// Named checkpoints the user can `restore` to at any time.
+    checkpoints: HashMap<String, Snapshot>,
+}
+
+/// A restorable capture of the shell's mutable session state.
+///
+/// Holds everything a command can change — the circuit graph, the node-name map,
+/// and the probe list — but **not** the undo stack or checkpoint map themselves,
+/// so a snapshot is a shallow, non-recursive clone of the session.
+#[derive(Debug, Clone)]
+struct Snapshot {
+    circuit: Circuit,
+    nets: HashMap<String, NetId>,
+    probes: Vec<String>,
 }
 
 impl Default for Shell {
@@ -77,6 +94,8 @@ impl Shell {
             circuit: Circuit::new("shell"),
             nets: HashMap::new(),
             probes: Vec::new(),
+            undo_stack: Vec::new(),
+            checkpoints: HashMap::new(),
         }
     }
 
@@ -86,7 +105,17 @@ impl Shell {
     }
 
     /// The command keywords — for help text and shell tab-completion.
-    pub const COMMANDS: &'static [&'static str] = &["add", "wire", "probe", "run", "show", "help"];
+    pub const COMMANDS: &'static [&'static str] = &[
+        "add",
+        "wire",
+        "probe",
+        "run",
+        "show",
+        "undo",
+        "checkpoint",
+        "restore",
+        "help",
+    ];
 
     /// The user's named nodes so far (for tab-completion). Ground aliases are
     /// not included — they resolve directly to the ground reference.
@@ -116,14 +145,127 @@ impl Shell {
         let command = words.next().expect("non-empty line has a first word");
         let args: Vec<&str> = words.collect();
         match command {
-            "add" => self.cmd_add(&args),
-            "wire" => self.cmd_wire(&args),
-            "probe" => self.cmd_probe(&args),
+            // Mutating commands snapshot the session first (on success only) so
+            // `undo` can revert exactly the last command.
+            "add" | "wire" | "probe" => {
+                let before = self.capture();
+                let result = match command {
+                    "add" => self.cmd_add(&args),
+                    "wire" => self.cmd_wire(&args),
+                    _ => self.cmd_probe(&args),
+                };
+                if result.is_ok() {
+                    self.undo_stack.push(before);
+                }
+                result
+            }
             "run" => self.cmd_run(&args),
             "show" => Ok(self.render_show()),
+            "undo" => self.cmd_undo(&args),
+            "checkpoint" => self.cmd_checkpoint(&args),
+            "restore" => self.cmd_restore(&args),
             "help" => Ok(Self::help_text()),
             other => Err(ShellError::UnknownCommand(other.to_string())),
         }
+    }
+
+    // ── snapshots / undo / named checkpoints (CP-UX-M2.4) ──────────────────
+
+    /// Capture the current restorable session state.
+    fn capture(&self) -> Snapshot {
+        Snapshot {
+            circuit: self.circuit.clone(),
+            nets: self.nets.clone(),
+            probes: self.probes.clone(),
+        }
+    }
+
+    /// Replace the session state from a snapshot (the undo/restore primitive).
+    fn restore_from(&mut self, snap: Snapshot) {
+        self.circuit = snap.circuit;
+        self.nets = snap.nets;
+        self.probes = snap.probes;
+    }
+
+    /// Push a manual snapshot of the session onto the undo stack. Mutating
+    /// commands do this automatically; call it to mark an extra undo point.
+    pub fn snapshot(&mut self) {
+        let snap = self.capture();
+        self.undo_stack.push(snap);
+    }
+
+    /// Revert the most recent snapshot (the last mutating command). Returns a
+    /// [`ShellError::NothingToUndo`] when the undo stack is empty.
+    pub fn undo(&mut self) -> Result<String, ShellError> {
+        match self.undo_stack.pop() {
+            Some(snap) => {
+                self.restore_from(snap);
+                let n = self.circuit.parts().len();
+                Ok(format!(
+                    "undone — {n} part{} remain",
+                    if n == 1 { "" } else { "s" }
+                ))
+            }
+            None => Err(ShellError::NothingToUndo),
+        }
+    }
+
+    /// Save the current session under `name`, overwriting any existing one.
+    pub fn checkpoint(&mut self, name: impl Into<String>) -> String {
+        let name = name.into();
+        let snap = self.capture();
+        self.checkpoints.insert(name.clone(), snap);
+        format!("checkpoint {name:?} saved")
+    }
+
+    /// Restore the session to a named checkpoint. Does **not** disturb the undo
+    /// stack's prior entries. Unknown names yield [`ShellError::UnknownCheckpoint`].
+    pub fn restore(&mut self, name: &str) -> Result<String, ShellError> {
+        match self.checkpoints.get(name).cloned() {
+            Some(snap) => {
+                self.restore_from(snap);
+                Ok(format!("restored checkpoint {name:?}"))
+            }
+            None => Err(ShellError::UnknownCheckpoint(name.to_string())),
+        }
+    }
+
+    /// The names of saved checkpoints (for tab-completion), unordered.
+    pub fn checkpoint_names(&self) -> Vec<&str> {
+        self.checkpoints.keys().map(String::as_str).collect()
+    }
+
+    /// `undo` — revert the last mutating command.
+    fn cmd_undo(&mut self, args: &[&str]) -> Result<String, ShellError> {
+        if !args.is_empty() {
+            return Err(ShellError::Usage {
+                command: "undo",
+                usage: "undo",
+            });
+        }
+        self.undo()
+    }
+
+    /// `checkpoint <name>` — save the session under a name.
+    fn cmd_checkpoint(&mut self, args: &[&str]) -> Result<String, ShellError> {
+        let [name] = args else {
+            return Err(ShellError::Usage {
+                command: "checkpoint",
+                usage: "checkpoint <name>",
+            });
+        };
+        Ok(self.checkpoint(*name))
+    }
+
+    /// `restore <name>` — return the session to a named checkpoint.
+    fn cmd_restore(&mut self, args: &[&str]) -> Result<String, ShellError> {
+        let [name] = args else {
+            return Err(ShellError::Usage {
+                command: "restore",
+                usage: "restore <name>",
+            });
+        };
+        self.restore(name)
     }
 
     // ── commands ──────────────────────────────────────────────────────────
@@ -299,6 +441,9 @@ impl Shell {
             "  run [tran [<dur>]]          transient (default 1 ms), plotting each probe",
             "  run op                      DC operating-point node-voltage table",
             "  show                        list the placed parts",
+            "  undo                        revert the last add/wire/probe",
+            "  checkpoint <name>           save the session under a name",
+            "  restore <name>              restore the session to a checkpoint",
             "  help                        show this help",
         ]
         .join("\n")
@@ -428,6 +573,10 @@ pub enum ShellError {
     DuplicateRef(String),
     /// A node named in `probe`/`wire` was never introduced by `add`.
     UnknownNode(String),
+    /// `undo` was called with an empty undo stack — a friendly no-op.
+    NothingToUndo,
+    /// `restore` named a checkpoint that was never saved.
+    UnknownCheckpoint(String),
     /// The simulation engine rejected or could not solve the circuit.
     Sim(SimError),
 }
@@ -458,6 +607,12 @@ impl fmt::Display for ShellError {
             ShellError::DuplicateRef(r) => write!(f, "a part named {r:?} already exists"),
             ShellError::UnknownNode(n) => {
                 write!(f, "unknown node {n:?} — add a part that uses it first")
+            }
+            ShellError::NothingToUndo => {
+                write!(f, "nothing to undo — no commands have been run yet")
+            }
+            ShellError::UnknownCheckpoint(n) => {
+                write!(f, "no checkpoint named {n:?} — `checkpoint {n}` saves one")
             }
             ShellError::Sim(e) => write!(f, "simulation failed: {e}"),
         }
@@ -591,6 +746,96 @@ mod tests {
         for c in ["add", "wire", "probe", "run", "show", "help"] {
             assert!(help.contains(c), "help names `{c}`:\n{help}");
         }
+    }
+
+    /// `undo` reverts the last mutating command: a part added, then undone, is
+    /// gone again — part count and references restored.
+    #[test]
+    fn undo_reverts_the_last_command() {
+        let mut sh = Shell::new();
+        sh.execute("add R1 a b 1k").unwrap();
+        assert_eq!(sh.circuit().parts().len(), 1);
+
+        // Add a second part, then undo it away.
+        sh.execute("add R2 b c 2k").unwrap();
+        assert_eq!(sh.circuit().parts().len(), 2);
+        let msg = sh.execute("undo").unwrap();
+        assert!(msg.contains("undone"), "{msg}");
+        assert_eq!(sh.circuit().parts().len(), 1, "R2 is gone");
+        assert!(
+            sh.circuit().part_by_ref("R2").is_none(),
+            "R2 reference gone"
+        );
+        assert!(sh.circuit().part_by_ref("R1").is_some(), "R1 remains");
+
+        // Undo again removes R1 too, back to the empty circuit.
+        sh.undo().unwrap();
+        assert_eq!(sh.circuit().parts().len(), 0);
+    }
+
+    /// A probe can be undone, and a failed command leaves no undo entry behind.
+    #[test]
+    fn undo_tracks_probes_and_skips_failed_commands() {
+        let mut sh = Shell::new();
+        sh.execute("add R1 in out 1k").unwrap();
+        sh.execute("probe out").unwrap();
+        assert_eq!(sh.node_names().len(), 2);
+
+        // A rejected `add` (bad value) must not push an undo point.
+        assert!(sh.execute("add R2 out gnd nope").is_err());
+        // One undo clears the probe; the next clears R1; the next is the error.
+        assert!(sh.undo().unwrap().contains("undone")); // probe
+        assert!(sh.undo().unwrap().contains("undone")); // add R1
+        assert_eq!(sh.circuit().parts().len(), 0);
+        assert!(matches!(sh.undo().unwrap_err(), ShellError::NothingToUndo));
+    }
+
+    /// A named checkpoint restores the session to exactly that point.
+    #[test]
+    fn named_checkpoint_restores_its_state() {
+        let mut sh = Shell::new();
+        sh.execute("add V1 in gnd 5").unwrap();
+        sh.execute("add R1 in out 1k").unwrap();
+        sh.execute("checkpoint stable").unwrap();
+        assert_eq!(sh.circuit().parts().len(), 2);
+
+        // Diverge from the checkpoint...
+        sh.execute("add C1 out gnd 1u").unwrap();
+        sh.execute("add R2 out gnd 2k").unwrap();
+        assert_eq!(sh.circuit().parts().len(), 4);
+
+        // ...then restore it.
+        let msg = sh.execute("restore stable").unwrap();
+        assert!(msg.contains("stable"), "{msg}");
+        assert_eq!(sh.circuit().parts().len(), 2, "back to the checkpoint");
+        assert!(sh.circuit().part_by_ref("V1").is_some());
+        assert!(sh.circuit().part_by_ref("R1").is_some());
+        assert!(sh.circuit().part_by_ref("C1").is_none());
+        assert!(sh.circuit().part_by_ref("R2").is_none());
+    }
+
+    /// `undo` on a fresh shell, and `restore` of an unknown name, are friendly
+    /// errors rather than panics.
+    #[test]
+    fn undo_and_restore_fail_friendly() {
+        let mut sh = Shell::new();
+        assert!(matches!(sh.undo().unwrap_err(), ShellError::NothingToUndo));
+        assert!(matches!(
+            sh.execute("undo").unwrap_err(),
+            ShellError::NothingToUndo
+        ));
+        let err = sh.execute("restore ghost").unwrap_err();
+        assert!(matches!(err, ShellError::UnknownCheckpoint(_)));
+        assert!(err.to_string().contains("ghost"), "{err}");
+
+        // Programmatic API matches the command path.
+        sh.execute("add R1 a b 1k").unwrap();
+        sh.snapshot();
+        sh.execute("add R2 a c 2k").unwrap();
+        sh.undo().unwrap(); // reverts the add (auto-snapshot)
+        assert_eq!(sh.circuit().parts().len(), 1);
+        sh.undo().unwrap(); // the manual snapshot
+        assert_eq!(sh.circuit().parts().len(), 1, "manual snapshot was post-R1");
     }
 
     /// Durations parse in engineering notation (`5m` → 5 ms) and drive the sim.
