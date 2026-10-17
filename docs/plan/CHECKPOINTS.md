@@ -67,10 +67,10 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 - [x] **CP-UX-M1.5** Scripting engine (`.eesh`, loops/params) + deterministic replay. — *gate:* `param_sweep_runs_and_replays_identically` — `repeat N as win { run tran ${win}m }` runs and `Recording::replay()` reproduces a byte-identical transcript. `Shell::run_script`.
 
 ### M2 — analysis views
-- [ ] **CP-UX-M2.1** Logic analyzer + protocol-decode view (UART/SPI/I²C). — *gate:* decode a known UART capture.
+- [x] **CP-UX-M2.1** Logic analyzer + protocol-decode view (UART/SPI/I²C). — *gate:* an 8-N-1 capture of `"Hi!"` decodes to `[0x48,0x69,0x21]`; SPI mode-0 + I²C start/addr/ack/data/stop decoders; multi-channel timing view with annotated frames, fits width.
 - [ ] **CP-UX-M2.2** Breadboard view. — *gate:* renders a small circuit as a breadboard layout (snapshot).
 - [x] **CP-UX-M2.3** Bode/spectrum panel + scope math/FFT channels. — *gate:* Bode panel renders magnitude+phase vs log-f with the −3 dB corner; hand-rolled radix-2 FFT validated against a direct DFT (<1e-9), a pure sine → one dominant bin; scope math channels (A±B, A·B).
-- [ ] **CP-UX-M2.4** Session snapshots / undo / named checkpoints. — *gate:* undo restores prior graph state.
+- [x] **CP-UX-M2.4** Session snapshots / undo / named checkpoints. — *gate:* `undo` reverts the last mutating command (auto-snapshot before add/wire/probe); named `checkpoint`/`restore`; friendly errors on nothing-to-undo / unknown checkpoint.
 
 ---
 
@@ -110,10 +110,10 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 |---|---|---|---|
 | sim-core | 12 | 0 | 15 |
 | boards | 6 | 0 | 10 |
-| ui-shell | 10 | 0 | 13 |
+| ui-shell | 12 | 0 | 13 |
 | ai-fmt | 5 | 0 | 9 |
 | platform | 3 | 0 | 5 |
-| **Total** | **36** | **0** | **52** |
+| **Total** | **38** | **0** | **52** |
 
 *Update this table when flipping a checkpoint.*
 
