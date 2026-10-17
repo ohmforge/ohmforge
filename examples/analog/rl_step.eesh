@@ -1,0 +1,5 @@
+add V1 in gnd 5
+add R1 in mid 100
+add L1 mid gnd 0.1
+probe mid
+run tran 5m

@@ -1,0 +1,6 @@
+add V1 in gnd 5
+add R1 in a 10
+add L1 a out 1m
+add C1 out gnd 1u
+probe out
+run tran 300u
