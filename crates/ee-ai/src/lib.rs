@@ -27,13 +27,24 @@
 //! * [`config`] — the pinned [`DEFAULT_MODEL`], its env overrides, and runtime
 //!   API-key handling (never committed).
 //!
-//! The concrete tools over the circuit API are the next checkpoint
-//! (CP-AF-M1.3); here the handler is a generic dispatch seam.
+//! ## This checkpoint (CP-AF-M1.3): tools over the circuit API — grounded ask
+//!
+//! The generic dispatch seam now carries concrete tools that map onto the same
+//! `eesh` shell and simulator a user drives (docs/AI.md § trust model):
+//!
+//! * [`tools`] — [`CircuitTools`], a [`ToolHandler`] over one live
+//!   [`ee_shell::Shell`], exposing an `eesh` tool (run a command line) and a
+//!   `read_op` tool (solve the operating point and read a node's voltage — the
+//!   grounding path), plus [`ask`] to run the whole loop and return the answer.
+//!
+//! With a stubbed model but a real sim, [`ask`] answers a question grounded in
+//! a real operating-point read.
 
 pub mod client;
 pub mod config;
 pub mod error;
 pub mod message;
+pub mod tools;
 pub mod transport;
 
 pub use client::{Client, RunResult, ToolHandler, DEFAULT_MAX_TOKENS, DEFAULT_MAX_TOOL_TURNS};
@@ -43,6 +54,7 @@ pub use message::{
     response_to_events, CacheControl, ContentBlock, ContentDelta, Message, ModelRequest,
     ModelResponse, Role, StopReason, StreamAssembler, StreamEvent, SystemBlock, Tool, Usage,
 };
+pub use tools::{ask, CircuitTools, EESH_TOOL, READ_OP_TOOL};
 pub use transport::{MockTransport, Transport};
 
 /// A change the AI proposes. Staged — never auto-applied; the user runs

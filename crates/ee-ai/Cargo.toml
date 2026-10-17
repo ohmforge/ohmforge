@@ -19,6 +19,10 @@ http = []
 
 [dependencies]
 ee-core = { workspace = true }
+# The tool layer (CP-AF-M1.3) drives the SAME shell + engine a user drives, so
+# the model can only do what a user could (docs/AI.md § trust model). No new
+# third-party crates: the shell already re-exports the sim engine it needs.
+ee-shell = { workspace = true }
 # No third-party deps: the Claude client is hand-rolled std-only (matching
 # ee-fmt's hand-written parsers) so the copilot loop is network-free and the
 # crate compiles for wasm32 without a TLS stack. Tool input/result and JSON
