@@ -1,0 +1,11 @@
+add V1 in gnd 5
+add R1 in out 1k
+add C1 out gnd 1u
+show
+undo
+show
+checkpoint rc
+add R2 out gnd 2k
+show
+restore rc
+show
