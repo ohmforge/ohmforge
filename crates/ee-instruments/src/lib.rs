@@ -8,17 +8,26 @@
 //! Instruments *consume* signals and *control* sources; they hold no solver
 //! state of their own.
 
+mod braille;
 mod fmt;
 
+pub mod bode;
 pub mod dmm;
+pub mod fft;
 pub mod funcgen;
+pub mod math;
 pub mod oscilloscope;
 pub mod psu;
+pub mod spectrum;
 
+pub use bode::{corner_3db, Bode};
 pub use dmm::{measure, DmmMode, DmmReading, Multimeter};
+pub use fft::{fft, magnitude_spectrum, peak_bin, Window};
 pub use funcgen::{FuncGen, Waveform};
+pub use math::{math_channel, MathOp};
 pub use oscilloscope::{CursorReadout, Cursors, Oscilloscope, Slope, Timebase, Trigger};
 pub use psu::{BenchPsu, PsuMode, PsuOutput};
+pub use spectrum::Spectrum;
 
 /// A named signal an instrument can display (a node voltage, a branch current,
 /// an MCU pin, or a math channel).
