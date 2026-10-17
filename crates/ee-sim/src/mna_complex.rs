@@ -56,6 +56,17 @@ impl ComplexSystem {
         }
     }
 
+    /// Add `y` to the matrix entry at (`row`, `col`); a ground index (`None`) is
+    /// the reference and is dropped. The complex twin of
+    /// [`stamp_matrix`](crate::mna::System::stamp_matrix): the raw, possibly
+    /// asymmetric entry stamp a linearized multiport device (BJT / MOSFET
+    /// small-signal admittance) contributes in AC analysis.
+    pub fn stamp_matrix(&mut self, row: Option<usize>, col: Option<usize>, y: Complex) {
+        if let (Some(r), Some(c)) = (row, col) {
+            *self.at(r, c) = *self.at(r, c) + y;
+        }
+    }
+
     /// Stamp a phasor current of `amps` flowing from node `j` into node `i`.
     pub fn stamp_current(&mut self, i: Option<usize>, j: Option<usize>, amps: Complex) {
         if let Some(i) = i {

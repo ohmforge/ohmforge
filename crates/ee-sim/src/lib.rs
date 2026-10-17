@@ -21,7 +21,7 @@ use std::error::Error;
 use std::f64::consts::TAU;
 use std::fmt;
 
-use ee_core::graph::{Circuit, NetId, Part, PartKind, Waveform};
+use ee_core::graph::{BjtModel, Circuit, MosfetModel, NetId, Part, PartKind, Polarity, Waveform};
 use ee_core::{Complex, Signal, Unit};
 use mna::System;
 use mna_complex::ComplexSystem;
@@ -66,7 +66,7 @@ pub enum SimError {
     MissingValue(String),
     /// A part's value is out of range (e.g. a zero-ohm resistor).
     BadValue(String),
-    /// A part does not have exactly two terminals.
+    /// A part is wired with the wrong number of terminals for its kind.
     WrongTerminals(String),
     /// A device or analysis not modeled at this milestone.
     Unsupported(&'static str),
@@ -82,7 +82,9 @@ impl fmt::Display for SimError {
         match self {
             SimError::MissingValue(r) => write!(f, "part {r} has no value"),
             SimError::BadValue(r) => write!(f, "part {r} has an invalid value"),
-            SimError::WrongTerminals(r) => write!(f, "part {r} must have exactly two terminals"),
+            SimError::WrongTerminals(r) => {
+                write!(f, "part {r} is wired with the wrong number of terminals")
+            }
             SimError::Unsupported(what) => write!(f, "unsupported at this milestone: {what}"),
             SimError::Singular => {
                 write!(
@@ -143,7 +145,9 @@ fn validate(circuit: &Circuit) -> Result<(), SimError> {
             | PartKind::Inductor
             | PartKind::VoltageSource
             | PartKind::CurrentSource
-            | PartKind::Diode => {}
+            | PartKind::Diode
+            | PartKind::Bjt(..)
+            | PartKind::Mosfet(..) => {}
             PartKind::Other(_) => {
                 return Err(SimError::Unsupported("nonlinear/unknown device (M1)"))
             }
@@ -285,6 +289,15 @@ fn terminals2(part: &Part) -> Result<(NetId, NetId), SimError> {
     }
 }
 
+/// The three nets a transistor connects — `[collector/drain, base/gate,
+/// emitter/source]` — or an error if it is not wired with exactly three.
+fn terminals3(part: &Part) -> Result<[NetId; 3], SimError> {
+    match part.terminals.as_slice() {
+        [a, b, c] => Ok([*a, *b, *c]),
+        _ => Err(SimError::WrongTerminals(part.reference.clone())),
+    }
+}
+
 /// Stamp every resistor as a conductance between its nodes.
 fn stamp_resistors(sys: &mut System, circuit: &Circuit, layout: &Layout) -> Result<(), SimError> {
     for part in circuit.parts() {
@@ -387,22 +400,93 @@ const NR_V_TOL: f64 = 1e-9;
 /// amperes. Both must hold at once.
 const NR_I_TOL: f64 = 1e-12;
 
-/// The contract a nonlinear two-terminal device fulfils for the Newton–Raphson
-/// loop. Given the branch voltage `v = v(a) − v(b)` it reports the current it
-/// carries and its small-signal conductance `g = dI/dV` at that bias, plus a
-/// limiting rule that keeps the per-iteration voltage step sane. The solver
-/// stamps the device's Norton companion (a conductance `g` in parallel with a
-/// current source `I_eq = I(v) − g·v`) and iterates. New device types (BJT /
-/// MOSFET at `CP-SIM-M1.2`) implement these three methods and drop straight in.
+/// The contract an N-terminal nonlinear device fulfils for the Newton–Raphson
+/// loop. Each iteration the solver reads the device's terminal voltages at the
+/// running guess and asks it to [`linearize`](NonlinearDevice::linearize): report
+/// the current flowing into every terminal and the Jacobian `∂I_i/∂V_j` of those
+/// currents, bundled with the RHS equivalent-current sources as a [`Companion`]
+/// that [`stamp_companion`] writes into the MNA system. A diode is the
+/// two-terminal case; a BJT and a MOSFET stamp a 3×3 block. (`CP-SIM-M1.2`.)
 trait NonlinearDevice {
-    /// Terminal nets `(a, b)`; the branch voltage is `v(a) − v(b)`.
-    fn terminals(&self) -> (NetId, NetId);
-    /// Linearize about branch voltage `v`, returning `(I(v), dI/dV)`.
-    fn evaluate(&self, v: f64) -> (f64, f64);
-    /// Junction limiting: given the raw branch voltage from the last solve and
-    /// the previous iteration's (already limited) value, return a limited
-    /// voltage so `exp` cannot run away between iterations.
-    fn limit(&self, v_new: f64, v_old: f64) -> f64;
+    /// The device's terminal nets, in the order [`linearize`](Self::linearize)
+    /// reads voltages and reports currents. The internal controlling/branch
+    /// voltages are formed from these inside the model.
+    fn terminals(&self) -> &[NetId];
+
+    /// Length of the limiting state the solver carries for this device across
+    /// iterations — its previously limited controlling voltages. `0` for a model
+    /// that never limits (the square-law MOSFET).
+    fn state_len(&self) -> usize;
+
+    /// Linearize about the terminal voltages `v` (volts, one per terminal in
+    /// [`terminals`](Self::terminals) order, ground = 0 V), returning the
+    /// [`Companion`] to stamp.
+    ///
+    /// When `limit` is set the model may damp the Newton step through its
+    /// junctions, reading and updating `state` (its previously limited
+    /// controlling voltages); AC analysis passes `limit = false` to linearize
+    /// exactly at the converged bias.
+    fn linearize(&self, v: &[f64], state: &mut [f64], limit: bool) -> Companion;
+}
+
+/// A nonlinear device's linearized multiport companion — the output of
+/// [`NonlinearDevice::linearize`]. Every vector is in the device's terminal order.
+struct Companion {
+    /// Terminal currents `I_i` (the current flowing *from node `i` into the
+    /// device*) at the linearization point — the solver's current-convergence
+    /// probe.
+    i: Vec<f64>,
+    /// RHS equivalent-current sources: `i_eq[a]` is injected into node `a`'s row,
+    /// equal to `Σ_j g[a][j]·V*_j − I_a` at the (possibly limited) linearization
+    /// point. The model precomputes it so junction limiting stays internal and
+    /// the stamped companion is self-consistent — the multiport generalization of
+    /// the two-terminal Norton source `I_eq = I(v) − g·v`.
+    i_eq: Vec<f64>,
+    /// Jacobian `g[i][j] = ∂I_i/∂V_j`, a dense `n × n` block in terminal order
+    /// (possibly asymmetric — a transconductance is not reciprocal).
+    g: Vec<Vec<f64>>,
+}
+
+/// Stamp an N-terminal device's linearized [`Companion`] into the system: the
+/// Jacobian block as the (possibly asymmetric) conductance matrix, and each
+/// equivalent-current source onto its node's RHS row. `nodes[i]` is terminal
+/// `i`'s MNA index (`None` = ground, dropped). This is the two-terminal Norton
+/// stamp generalized to a port matrix.
+fn stamp_companion(sys: &mut System, nodes: &[Option<usize>], c: &Companion) {
+    for (a, &node_a) in nodes.iter().enumerate() {
+        // `stamp_current(node_a, None, ·)` is a bare RHS add into node a.
+        sys.stamp_current(node_a, None, c.i_eq[a]);
+        for (b, &node_b) in nodes.iter().enumerate() {
+            sys.stamp_matrix(node_a, node_b, c.g[a][b]);
+        }
+    }
+}
+
+/// SPICE pn-junction limiting (`pnjlim`). Given the raw Newton voltage `v_new`
+/// across a junction and the previous iteration's limited value `v_old`, return a
+/// limited voltage so `exp(v/vte)` cannot run away between iterations: past the
+/// critical voltage a step beyond a thermal voltage `vte` is mapped through a
+/// logarithm. Reverse bias and sub-thermal steps pass through untouched. Shared
+/// by the diode and both BJT junctions. `vte` is the junction's emission-scaled
+/// thermal voltage, `is` its saturation current.
+fn pnjlim(v_new: f64, v_old: f64, vte: f64, is: f64) -> f64 {
+    let vcrit = vte * (vte / (std::f64::consts::SQRT_2 * is)).ln();
+    if v_new > vcrit && (v_new - v_old).abs() > vte {
+        if v_old > 0.0 {
+            let arg = 1.0 + (v_new - v_old) / vte;
+            if arg > 0.0 {
+                v_old + vte * arg.ln()
+            } else {
+                vcrit
+            }
+        } else if v_new > 0.0 {
+            vte * (v_new / vte).ln()
+        } else {
+            v_new
+        }
+    } else {
+        v_new
+    }
 }
 
 /// Shockley-diode model parameters. Defaults are a generic small-signal silicon
@@ -427,50 +511,195 @@ impl Default for DiodeModel {
     }
 }
 
-/// A junction diode across `(a, b)` = `(anode, cathode)`.
+/// A junction diode. Terminals `[anode, cathode]`; the branch voltage is
+/// `v(anode) − v(cathode)` and forward current flows anode → cathode.
 struct Diode {
-    a: NetId,
-    b: NetId,
+    nets: [NetId; 2],
     model: DiodeModel,
 }
 
 impl NonlinearDevice for Diode {
-    fn terminals(&self) -> (NetId, NetId) {
-        (self.a, self.b)
+    fn terminals(&self) -> &[NetId] {
+        &self.nets
     }
 
-    fn evaluate(&self, v: f64) -> (f64, f64) {
-        // Shockley: I = Is·(exp(V/(n·Vt)) − 1), and g = dI/dV = (Is/(n·Vt))·exp(V/(n·Vt)).
+    fn state_len(&self) -> usize {
+        1 // the single junction voltage
+    }
+
+    fn linearize(&self, v: &[f64], state: &mut [f64], limit: bool) -> Companion {
+        // Shockley: I = Is·(exp(V/(n·Vt)) − 1), g = dI/dV = (Is/(n·Vt))·exp(V/(n·Vt)).
         let vte = self.model.n * self.model.vt;
-        let ex = (v / vte).exp();
+        let mut vd = v[0] - v[1];
+        if limit {
+            vd = pnjlim(vd, state[0], vte, self.model.is);
+            state[0] = vd;
+        }
+        let ex = (vd / vte).exp();
         let i = self.model.is * (ex - 1.0);
         let g = (self.model.is / vte) * ex;
-        (i, g)
+        // Norton equivalent current into the anode, `g·v − I`; the cathode mirrors
+        // it. This reproduces the two-terminal stamp bit-for-bit.
+        let i_eq = g * vd - i;
+        Companion {
+            i: vec![i, -i],
+            i_eq: vec![i_eq, -i_eq],
+            g: vec![vec![g, -g], vec![-g, g]],
+        }
+    }
+}
+
+/// Ebers–Moll bipolar transistor. Terminals `[collector, base, emitter]`; the
+/// [`Polarity`] folds PNP onto the NPN equations by flipping every controlling
+/// voltage and terminal current.
+struct Bjt {
+    nets: [NetId; 3],
+    polarity: Polarity,
+    model: BjtModel,
+}
+
+impl NonlinearDevice for Bjt {
+    fn terminals(&self) -> &[NetId] {
+        &self.nets
     }
 
-    fn limit(&self, v_new: f64, v_old: f64) -> f64 {
-        // Standard SPICE pn-junction limiting (`pnjlim`): once the forward
-        // voltage is past `vcrit` and the step exceeds a thermal voltage, map the
-        // raw Newton step through a logarithm so `exp` cannot overflow. Reverse
-        // and small steps pass through untouched. Fuller aids are `CP-SIM-M1.3`.
-        let vte = self.model.n * self.model.vt;
-        let vcrit = vte * (vte / (std::f64::consts::SQRT_2 * self.model.is)).ln();
-        if v_new > vcrit && (v_new - v_old).abs() > vte {
-            if v_old > 0.0 {
-                let arg = 1.0 + (v_new - v_old) / vte;
-                if arg > 0.0 {
-                    v_old + vte * arg.ln()
-                } else {
-                    vcrit
-                }
-            } else if v_new > 0.0 {
-                vte * (v_new / vte).ln()
-            } else {
-                v_new
-            }
-        } else {
-            v_new
+    fn state_len(&self) -> usize {
+        2 // the internal (Vbe, Vbc) junction voltages
+    }
+
+    fn linearize(&self, v: &[f64], state: &mut [f64], limit: bool) -> Companion {
+        let BjtModel { is, bf, br, vt } = self.model;
+        let s = self.polarity.sign();
+        let (vc, vb, ve) = (v[0], v[1], v[2]);
+        // Internal NPN-oriented junction voltages; polarity folds PNP onto NPN.
+        let mut vbe = s * (vb - ve);
+        let mut vbc = s * (vb - vc);
+        if limit {
+            vbe = pnjlim(vbe, state[0], vt, is);
+            vbc = pnjlim(vbc, state[1], vt, is);
+            state[0] = vbe;
+            state[1] = vbc;
         }
+        let (evbe, evbc) = ((vbe / vt).exp(), (vbc / vt).exp());
+        // Ebers–Moll transport form: two junction diodes plus the transport source.
+        let ibe = is / bf * (evbe - 1.0); // base–emitter diode (base-current share)
+        let ibc = is / br * (evbc - 1.0); // base–collector diode (base-current share)
+        let it = is * (evbe - evbc); // transport current, collector → emitter
+                                     // Internal (NPN) terminal currents into [C, B, E] — they sum to zero.
+        let (ic0, ib0, ie0) = (it - ibc, ibe + ibc, -it - ibe);
+        // Junction/transport (trans)conductances at this bias.
+        let gpi = is / (bf * vt) * evbe; //  ∂ibe/∂Vbe
+        let gmu = is / (br * vt) * evbc; //  ∂ibc/∂Vbc
+        let gif = is / vt * evbe; //  ∂it/∂Vbe
+        let gir = is / vt * evbc; // −∂it/∂Vbc
+                                  // Each internal current's partials wrt the internal (Vbe, Vbc).
+        let (c_be, c_bc) = (gif, -gir - gmu);
+        let (b_be, b_bc) = (gpi, gmu);
+        let (e_be, e_bc) = (-gif - gpi, gir);
+        // Jacobian in node coordinates (vc, vb, ve). Because Vbe/Vbc each carry
+        // the polarity factor and so does the current, `s²` cancels and the block
+        // is polarity-independent.
+        let g = vec![
+            vec![gir + gmu, gif - gir - gmu, -gif], // ∂Ic/∂(vc, vb, ve)
+            vec![-gmu, gpi + gmu, -gpi],            // ∂Ib/∂(vc, vb, ve)
+            vec![-gir, gir - gif - gpi, gif + gpi], // ∂Ie/∂(vc, vb, ve)
+        ];
+        // Terminal currents carry the polarity sign; so do the Norton sources,
+        // formed from the internal partials at the limited (Vbe, Vbc).
+        let i = vec![s * ic0, s * ib0, s * ie0];
+        let i_eq = vec![
+            s * (c_be * vbe + c_bc * vbc - ic0),
+            s * (b_be * vbe + b_bc * vbc - ib0),
+            s * (e_be * vbe + e_bc * vbc - ie0),
+        ];
+        Companion { i, i_eq, g }
+    }
+}
+
+/// Level-1 (square-law) MOSFET with the body tied to the source. Terminals
+/// `[drain, gate, source]`; the [`Polarity`] folds PMOS onto the NMOS equations.
+struct Mosfet {
+    nets: [NetId; 3],
+    polarity: Polarity,
+    model: MosfetModel,
+}
+
+impl NonlinearDevice for Mosfet {
+    fn terminals(&self) -> &[NetId] {
+        &self.nets
+    }
+
+    fn state_len(&self) -> usize {
+        0 // square law — no junction exp, so no limiting needed
+    }
+
+    fn linearize(&self, v: &[f64], _state: &mut [f64], _limit: bool) -> Companion {
+        let s = self.polarity.sign();
+        // Internal n-channel orientation; `s²` cancels in the Jacobian so `mos_core`
+        // already returns the node-coordinate block.
+        let (i0, g) = mos_core(s * v[0], s * v[1], s * v[2], &self.model);
+        let i = vec![s * i0[0], s * i0[1], s * i0[2]];
+        let g: Vec<Vec<f64>> = g.iter().map(|row| row.to_vec()).collect();
+        // No limiting: the linearization point is the raw node voltages, so the
+        // Norton source follows straight from the Jacobian.
+        let i_eq = (0..3)
+            .map(|a| (0..3).map(|b| g[a][b] * v[b]).sum::<f64>() - i[a])
+            .collect();
+        Companion { i, i_eq, g }
+    }
+}
+
+/// Level-1 NMOS channel in internal (n-channel) coordinates: terminal currents
+/// into `[drain, gate, source]` and the 3×3 Jacobian `∂I_i/∂V_j`. The channel is
+/// symmetric about drain/source, so whichever terminal sits higher acts as the
+/// drain (keeping `Vds ≥ 0`); the gate draws no DC current.
+fn mos_core(vd: f64, vg: f64, vs: f64, m: &MosfetModel) -> ([f64; 3], [[f64; 3]; 3]) {
+    if vd >= vs {
+        let (id, gm, gds) = mos_chan(vg - vs, vd - vs, m);
+        (
+            [id, 0.0, -id],
+            [
+                [gds, gm, -(gm + gds)],
+                [0.0, 0.0, 0.0],
+                [-gds, -gm, gm + gds],
+            ],
+        )
+    } else {
+        // Source and drain swap roles: the physical source is the channel drain.
+        let (id, gm, gds) = mos_chan(vg - vd, vs - vd, m);
+        (
+            [-id, 0.0, id],
+            [
+                [gm + gds, -gm, -gds],
+                [0.0, 0.0, 0.0],
+                [-(gm + gds), gm, gds],
+            ],
+        )
+    }
+}
+
+/// The channel current `Id` (drain → source, `Vds ≥ 0`) and its derivatives
+/// `gm = ∂Id/∂Vgs`, `gds = ∂Id/∂Vds` across the three level-1 regions — cutoff,
+/// triode, saturation — with channel-length modulation `(1 + λ·Vds)`. `kp` is
+/// `K = ½·µ·Cox·W/L`.
+fn mos_chan(vgs: f64, vds: f64, m: &MosfetModel) -> (f64, f64, f64) {
+    let vov = vgs - m.vth; // gate overdrive
+    if vov <= 0.0 {
+        return (0.0, 0.0, 0.0); // cutoff
+    }
+    let clm = 1.0 + m.lambda * vds;
+    if vds < vov {
+        // Triode.
+        let id = m.kp * (2.0 * vov - vds) * vds * clm;
+        let gm = 2.0 * m.kp * vds * clm;
+        let gds = m.kp * ((2.0 * vov - 2.0 * vds) * clm + (2.0 * vov - vds) * vds * m.lambda);
+        (id, gm, gds)
+    } else {
+        // Saturation.
+        let id = m.kp * vov * vov * clm;
+        let gm = 2.0 * m.kp * vov * clm;
+        let gds = m.kp * vov * vov * m.lambda;
+        (id, gm, gds)
     }
 }
 
@@ -491,13 +720,29 @@ fn diode_model(part: &Part) -> DiodeModel {
 fn collect_nonlinear(circuit: &Circuit) -> Result<Vec<Box<dyn NonlinearDevice>>, SimError> {
     let mut devices: Vec<Box<dyn NonlinearDevice>> = Vec::new();
     for part in circuit.parts() {
-        if matches!(part.kind, PartKind::Diode) {
-            let (a, b) = terminals2(part)?;
-            devices.push(Box::new(Diode {
-                a,
-                b,
-                model: diode_model(part),
-            }));
+        match &part.kind {
+            PartKind::Diode => {
+                let (a, b) = terminals2(part)?;
+                devices.push(Box::new(Diode {
+                    nets: [a, b],
+                    model: diode_model(part),
+                }));
+            }
+            PartKind::Bjt(polarity, model) => {
+                devices.push(Box::new(Bjt {
+                    nets: terminals3(part)?,
+                    polarity: *polarity,
+                    model: *model,
+                }));
+            }
+            PartKind::Mosfet(polarity, model) => {
+                devices.push(Box::new(Mosfet {
+                    nets: terminals3(part)?,
+                    polarity: *polarity,
+                    model: *model,
+                }));
+            }
+            _ => {}
         }
     }
     Ok(devices)
@@ -530,33 +775,39 @@ fn solve_nr(
     }
 
     let mut x = vec![0.0; size]; // initial guess: every node at 0 V
-    let mut v_prev = vec![0.0; devices.len()]; // last (limited) branch voltages
-    let mut i_prev = vec![0.0; devices.len()]; // last device currents
+                                 // Per-device limiting memory (previous limited controlling voltages) and the
+                                 // previous iteration's terminal currents, for the current-convergence test.
+    let mut states: Vec<Vec<f64>> = devices.iter().map(|d| vec![0.0; d.state_len()]).collect();
+    let mut i_prev: Vec<Vec<f64>> = devices
+        .iter()
+        .map(|d| vec![0.0; d.terminals().len()])
+        .collect();
 
     for _ in 0..NR_MAX_ITERS {
         let mut sys = System::new(size);
         stamp_linear(&mut sys)?;
 
-        let mut i_now = vec![0.0; devices.len()];
+        let mut i_now: Vec<Vec<f64>> = Vec::with_capacity(devices.len());
         for (k, dev) in devices.iter().enumerate() {
-            let (a, b) = dev.terminals();
-            let (na, nb) = (layout.node_of(circuit, a), layout.node_of(circuit, b));
-            let v = dev.limit(across(&x, na, nb), v_prev[k]);
-            v_prev[k] = v;
-            let (i, g) = dev.evaluate(v);
-            i_now[k] = i;
-            // Norton companion: conductance `g` in parallel with a current source
-            // `I_eq = i − g·v`. The constant part moves to the RHS exactly as the
-            // C / L companions do — `stamp_current(a, b, g·v − i)`.
-            sys.stamp_conductance(na, nb, g);
-            sys.stamp_current(na, nb, g * v - i);
+            let nodes: Vec<Option<usize>> = dev
+                .terminals()
+                .iter()
+                .map(|&t| layout.node_of(circuit, t))
+                .collect();
+            let v: Vec<f64> = nodes.iter().map(|&nd| nd.map_or(0.0, |i| x[i])).collect();
+            // Linearize about the running guess (with junction limiting) and stamp
+            // the device's multiport Norton companion.
+            let comp = dev.linearize(&v, &mut states[k], true);
+            stamp_companion(&mut sys, &nodes, &comp);
+            i_now.push(comp.i);
         }
 
         let x_new = sys.solve().ok_or(SimError::Singular)?;
         // A diverging solution (overflow → inf/NaN) must never read as converged.
         // `f64::max` ignores NaN, so test finiteness explicitly before the tol
         // check rather than letting a NaN step fold to a spurious zero.
-        let finite = x_new.iter().chain(&i_now).all(|v| v.is_finite());
+        let finite =
+            x_new.iter().all(|v| v.is_finite()) && i_now.iter().flatten().all(|v| v.is_finite());
         let dv = x_new
             .iter()
             .zip(&x)
@@ -564,7 +815,8 @@ fn solve_nr(
             .fold(0.0, f64::max);
         let di = i_now
             .iter()
-            .zip(&i_prev)
+            .flatten()
+            .zip(i_prev.iter().flatten())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0, f64::max);
         x = x_new;
@@ -837,18 +1089,30 @@ fn ac(
         }
     }
 
-    // Diodes → small-signal conductance g at the DC bias (real admittance).
+    // Nonlinear devices → their small-signal Jacobian at the DC bias (a real
+    // admittance block). A diode reduces to one conductance between its nodes; a
+    // BJT / MOSFET contributes its full multiport transadmittance matrix. Flatten
+    // every entry to `(row, col, g)` so each stamps as a raw complex matrix entry.
     let devices = collect_nonlinear(circuit)?;
-    let diode_g: Vec<(Option<usize>, Option<usize>, f64)> = devices
-        .iter()
-        .map(|dev| {
-            let (a, b) = dev.terminals();
-            let (na, nb) = (layout.node_of(circuit, a), layout.node_of(circuit, b));
-            let v = across(&x_dc, na, nb);
-            let (_, g) = dev.evaluate(v);
-            (na, nb, g)
-        })
-        .collect();
+    let mut device_g: Vec<(Option<usize>, Option<usize>, f64)> = Vec::new();
+    for dev in &devices {
+        let nodes: Vec<Option<usize>> = dev
+            .terminals()
+            .iter()
+            .map(|&t| layout.node_of(circuit, t))
+            .collect();
+        let v: Vec<f64> = nodes
+            .iter()
+            .map(|&nd| nd.map_or(0.0, |i| x_dc[i]))
+            .collect();
+        // Linearize exactly at the bias (no limiting) and keep only the Jacobian.
+        let comp = dev.linearize(&v, &mut vec![0.0; dev.state_len()], false);
+        for (a, &na) in nodes.iter().enumerate() {
+            for (b, &nb) in nodes.iter().enumerate() {
+                device_g.push((na, nb, comp.g[a][b]));
+            }
+        }
+    }
 
     // Voltage sources → branch row k with a 1∠0 drive (else a 0 V short).
     let vsource_stamps: Vec<(Option<usize>, Option<usize>, usize, Complex)> = layout
@@ -896,8 +1160,8 @@ fn ac(
         for &(a, b, l) in &inds {
             sys.stamp_admittance(a, b, Complex::new(0.0, -1.0 / (w * l))); // 1/(jωL)
         }
-        for &(a, b, g) in &diode_g {
-            sys.stamp_admittance(a, b, Complex::new(g, 0.0));
+        for &(a, b, g) in &device_g {
+            sys.stamp_matrix(a, b, Complex::new(g, 0.0));
         }
         for &(plus, minus, k, drive) in &vsource_stamps {
             sys.stamp_vsource(plus, minus, k, drive);
@@ -1594,5 +1858,468 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, SimError::BadValue(_)), "got {err:?}");
+    }
+
+    // --- BJT (Ebers–Moll) — CP-SIM-M1.2 ------------------------------------
+
+    #[test]
+    fn bjt_common_emitter_bias() {
+        // CE stage (the acceptance gate): Vcc = 10 V, base fed through RB = 1 MΩ,
+        // collector load RC = 4.7 kΩ, emitter grounded. NPN Q1 = [C, B, E]. Hand
+        // analysis: Vbe lands in the silicon window, Ib = (Vcc − Vbe)/RB,
+        // Ic = βF·Ib, and Vc = Vcc − Ic·RC sits mid-rail (forward-active).
+        let mut c = Circuit::new("ce");
+        let vcc = c.new_net();
+        let base = c.new_net();
+        let coll = c.new_net();
+        c.add_part(
+            "Vcc",
+            PartKind::VoltageSource,
+            v("10", Unit::Volt),
+            vec![vcc, NetId::GROUND],
+        );
+        c.add_part(
+            "RB",
+            PartKind::Resistor,
+            v("1meg", Unit::Ohm),
+            vec![vcc, base],
+        );
+        c.add_part(
+            "RC",
+            PartKind::Resistor,
+            v("4.7k", Unit::Ohm),
+            vec![vcc, coll],
+        );
+        c.add_part(
+            "Q1",
+            PartKind::Bjt(Polarity::N, BjtModel::default()),
+            None,
+            vec![coll, base, NetId::GROUND],
+        );
+
+        let layout = Layout::build(&c);
+        let x = solve_dc(&c, &layout).unwrap();
+        let vb = x[layout.node_of(&c, base).unwrap()];
+        let vc = x[layout.node_of(&c, coll).unwrap()];
+
+        // Vbe = Vb (emitter at ground) in the classic 0.6–0.7 V window.
+        assert!(
+            (0.6..0.7).contains(&vb),
+            "Vbe = {vb} V out of the silicon window"
+        );
+        // Collector sits between the rails: forward-active, not saturated or off.
+        assert!(vc > vb && vc < 10.0, "Vc = {vc} V not in the active range");
+
+        let m = BjtModel::default();
+        let ib = (10.0 - vb) / 1e6; // resistor current into the base
+        let ic = (10.0 - vc) / 4.7e3; // resistor current into the collector
+                                      // Current gain: Ic ≈ βF·Ib within 2%.
+        assert!(
+            (ic / ib - m.bf).abs() / m.bf <= 0.02,
+            "Ic/Ib = {} vs βF = {}",
+            ic / ib,
+            m.bf
+        );
+        // KCL at the collector: the transistor's own Ebers–Moll collector current
+        // equals the resistor current it draws. (Vbe = Vb, Vbc = Vb − Vc.)
+        let (vbe, vbc) = (vb, vb - vc);
+        let it = m.is * ((vbe / m.vt).exp() - (vbc / m.vt).exp());
+        let ibc = m.is / m.br * ((vbc / m.vt).exp() - 1.0);
+        let ic_model = it - ibc;
+        assert!(
+            (ic_model - ic).abs() <= 1e-9 + 1e-3 * ic,
+            "Ic(model) = {ic_model} vs Ic(R) = {ic}"
+        );
+    }
+
+    #[test]
+    fn bjt_active_region_relations() {
+        // Force the base current with an ideal source (Ib = 10 µA into the base)
+        // and read the collector back: an NPN in forward active must obey both
+        // Ic ≈ βF·Ib and Ic ≈ Is·exp(Vbe/Vt). Vcc = 5 V through RC = 1 kΩ keeps the
+        // collector above the base (active).
+        let ib = 10e-6;
+        let mut c = Circuit::new("bjt_active");
+        let vcc = c.new_net();
+        let base = c.new_net();
+        let coll = c.new_net();
+        c.add_part(
+            "Vcc",
+            PartKind::VoltageSource,
+            v("5", Unit::Volt),
+            vec![vcc, NetId::GROUND],
+        );
+        c.add_part(
+            "RC",
+            PartKind::Resistor,
+            v("1k", Unit::Ohm),
+            vec![vcc, coll],
+        );
+        // Ib injected from ground into the base — the sole base-node path.
+        c.add_part(
+            "IB",
+            PartKind::CurrentSource,
+            v("10u", Unit::Ampere),
+            vec![NetId::GROUND, base],
+        );
+        c.add_part(
+            "Q1",
+            PartKind::Bjt(Polarity::N, BjtModel::default()),
+            None,
+            vec![coll, base, NetId::GROUND],
+        );
+
+        let layout = Layout::build(&c);
+        let x = solve_dc(&c, &layout).unwrap();
+        let vb = x[layout.node_of(&c, base).unwrap()];
+        let vc = x[layout.node_of(&c, coll).unwrap()];
+        let m = BjtModel::default();
+
+        let ic = (5.0 - vc) / 1e3; // collector current through RC
+                                   // βF relation.
+        assert!(
+            (ic / ib - m.bf).abs() / m.bf <= 0.02,
+            "Ic/Ib = {} vs βF = {}",
+            ic / ib,
+            m.bf
+        );
+        // Exponential law: Ic ≈ Is·exp(Vbe/Vt), Vbe = Vb (emitter grounded).
+        let ic_exp = m.is * (vb / m.vt).exp();
+        assert!(
+            (ic_exp - ic).abs() / ic <= 0.02,
+            "Is·exp(Vbe/Vt) = {ic_exp} vs Ic = {ic} (Vbe = {vb})"
+        );
+    }
+
+    #[test]
+    fn pnp_mirrors_npn_active_region() {
+        // PNP validates the polarity fold: emitter at +5 V, collector load RC to
+        // ground, base current pulled out by a source (|Ib| = 10 µA). Forward
+        // active ⇒ Veb in the silicon window and |Ic| ≈ βF·|Ib|.
+        let ib = 10e-6;
+        let mut c = Circuit::new("pnp_active");
+        let vee = c.new_net(); // emitter rail (+5 V)
+        let base = c.new_net();
+        let coll = c.new_net();
+        c.add_part(
+            "Vee",
+            PartKind::VoltageSource,
+            v("5", Unit::Volt),
+            vec![vee, NetId::GROUND],
+        );
+        c.add_part(
+            "RC",
+            PartKind::Resistor,
+            v("1k", Unit::Ohm),
+            vec![coll, NetId::GROUND],
+        );
+        // Pull Ib out of the base (base → ground), the sole base-node path.
+        c.add_part(
+            "IB",
+            PartKind::CurrentSource,
+            v("10u", Unit::Ampere),
+            vec![base, NetId::GROUND],
+        );
+        c.add_part(
+            "Q1",
+            PartKind::Bjt(Polarity::P, BjtModel::default()),
+            None,
+            vec![coll, base, vee],
+        );
+
+        let layout = Layout::build(&c);
+        let x = solve_dc(&c, &layout).unwrap();
+        let vb = x[layout.node_of(&c, base).unwrap()];
+        let vc = x[layout.node_of(&c, coll).unwrap()];
+
+        let veb = 5.0 - vb; // emitter at +5 V
+        assert!((0.6..0.7).contains(&veb), "Veb = {veb} V out of the window");
+        assert!(vc < vb, "Vc = {vc} not below Vb = {vb} — PNP not active");
+        let ic = vc / 1e3; // transistor sources this into the collector node
+        let m = BjtModel::default();
+        assert!(
+            (ic / ib - m.bf).abs() / m.bf <= 0.02,
+            "|Ic|/|Ib| = {} vs βF = {}",
+            ic / ib,
+            m.bf
+        );
+    }
+
+    // --- MOSFET (level-1 square law) — CP-SIM-M1.2 -------------------------
+
+    #[test]
+    fn mosfet_saturation_square_law() {
+        // NMOS common-source: Vdd = 5 V through RD = 200 Ω, gate held at 3 V,
+        // source grounded. With Vth = 1 V, K = 1 mA/V², λ = 0.02 and Vgs = 3 V the
+        // device is in saturation (Vds > Vov), where Id = K·(Vgs−Vth)²·(1+λ·Vds).
+        let model = MosfetModel {
+            vth: 1.0,
+            kp: 1e-3,
+            lambda: 0.02,
+        };
+        let mut c = Circuit::new("nmos_sat");
+        let vdd = c.new_net();
+        let gate = c.new_net();
+        let drain = c.new_net();
+        c.add_part(
+            "Vdd",
+            PartKind::VoltageSource,
+            v("5", Unit::Volt),
+            vec![vdd, NetId::GROUND],
+        );
+        c.add_part(
+            "Vg",
+            PartKind::VoltageSource,
+            v("3", Unit::Volt),
+            vec![gate, NetId::GROUND],
+        );
+        c.add_part(
+            "RD",
+            PartKind::Resistor,
+            v("200", Unit::Ohm),
+            vec![vdd, drain],
+        );
+        c.add_part(
+            "M1",
+            PartKind::Mosfet(Polarity::N, model),
+            None,
+            vec![drain, gate, NetId::GROUND],
+        );
+
+        let layout = Layout::build(&c);
+        let x = solve_dc(&c, &layout).unwrap();
+        let vd = x[layout.node_of(&c, drain).unwrap()];
+
+        let (vgs, vds) = (3.0, vd); // source grounded
+        let vov = vgs - model.vth;
+        assert!(vds > vov, "Vds = {vds} not in saturation (Vov = {vov})");
+        let id = (5.0 - vd) / 200.0; // drain current through RD
+        let id_model = model.kp * vov * vov * (1.0 + model.lambda * vds);
+        assert!(
+            (id - id_model).abs() <= 1e-9 + 1e-3 * id_model,
+            "Id = {id} vs square-law {id_model}"
+        );
+    }
+
+    #[test]
+    fn nmos_diode_connected_bias() {
+        // Diode-connected NMOS (gate tied to drain) with RD = 1 kΩ to Vdd = 5 V,
+        // source grounded. Gate = drain ⇒ always saturated, so the bias solves
+        // (Vdd − Vd)/RD = K·(Vd − Vth)². With defaults (Vth = 1, K = 1 mA/V²):
+        // Vd² − Vd − 4 = 0 ⇒ Vd = (1 + √17)/2 ≈ 2.56 V.
+        let mut c = Circuit::new("nmos_diode");
+        let vdd = c.new_net();
+        let drain = c.new_net();
+        c.add_part(
+            "Vdd",
+            PartKind::VoltageSource,
+            v("5", Unit::Volt),
+            vec![vdd, NetId::GROUND],
+        );
+        c.add_part(
+            "RD",
+            PartKind::Resistor,
+            v("1k", Unit::Ohm),
+            vec![vdd, drain],
+        );
+        // Gate and drain share `drain` → diode connection.
+        c.add_part(
+            "M1",
+            PartKind::Mosfet(Polarity::N, MosfetModel::default()),
+            None,
+            vec![drain, drain, NetId::GROUND],
+        );
+
+        let layout = Layout::build(&c);
+        let x = solve_dc(&c, &layout).unwrap();
+        let vd = x[layout.node_of(&c, drain).unwrap()];
+
+        let expected = (1.0 + 17.0_f64.sqrt()) / 2.0; // ≈ 2.562 V
+        assert!(
+            (vd - expected).abs() <= 1e-3,
+            "Vd = {vd} V, expected {expected} V"
+        );
+        // KCL check: resistor current equals the square-law channel current.
+        let m = MosfetModel::default();
+        let id = (5.0 - vd) / 1e3;
+        let id_model = m.kp * (vd - m.vth).powi(2);
+        assert!(
+            (id - id_model).abs() <= 1e-9 + 1e-3 * id_model,
+            "Id = {id} vs square-law {id_model}"
+        );
+    }
+
+    #[test]
+    fn nmos_cutoff_is_off() {
+        // Gate below threshold (Vgs = 0.5 V < Vth = 1 V): the channel is cut off,
+        // so Id ≈ 0 and the drain is pulled to the rail through RD.
+        let mut c = Circuit::new("nmos_cutoff");
+        let vdd = c.new_net();
+        let gate = c.new_net();
+        let drain = c.new_net();
+        c.add_part(
+            "Vdd",
+            PartKind::VoltageSource,
+            v("5", Unit::Volt),
+            vec![vdd, NetId::GROUND],
+        );
+        c.add_part(
+            "Vg",
+            PartKind::VoltageSource,
+            v("0.5", Unit::Volt),
+            vec![gate, NetId::GROUND],
+        );
+        c.add_part(
+            "RD",
+            PartKind::Resistor,
+            v("1k", Unit::Ohm),
+            vec![vdd, drain],
+        );
+        c.add_part(
+            "M1",
+            PartKind::Mosfet(Polarity::N, MosfetModel::default()),
+            None,
+            vec![drain, gate, NetId::GROUND],
+        );
+
+        let layout = Layout::build(&c);
+        let x = solve_dc(&c, &layout).unwrap();
+        let vd = x[layout.node_of(&c, drain).unwrap()];
+        let id = (5.0 - vd) / 1e3;
+        assert!(id.abs() < 1e-9, "cutoff current {id} A not ~0");
+        assert!(
+            (vd - 5.0).abs() < 1e-6,
+            "drain {vd} V not pulled to the rail"
+        );
+    }
+
+    #[test]
+    fn pmos_saturation_square_law() {
+        // PMOS validates the polarity fold: source at +5 V, gate at 2 V, drain
+        // through RD = 200 Ω to ground. Vsg = 3 V, Vov = 2 V, saturated. The
+        // sourced current obeys Id = K·(Vsg−|Vth|)²·(1+λ·Vsd).
+        let model = MosfetModel {
+            vth: 1.0,
+            kp: 1e-3,
+            lambda: 0.02,
+        };
+        let mut c = Circuit::new("pmos_sat");
+        let vdd = c.new_net();
+        let gate = c.new_net();
+        let drain = c.new_net();
+        c.add_part(
+            "Vdd",
+            PartKind::VoltageSource,
+            v("5", Unit::Volt),
+            vec![vdd, NetId::GROUND],
+        );
+        c.add_part(
+            "Vg",
+            PartKind::VoltageSource,
+            v("2", Unit::Volt),
+            vec![gate, NetId::GROUND],
+        );
+        c.add_part(
+            "RD",
+            PartKind::Resistor,
+            v("200", Unit::Ohm),
+            vec![drain, NetId::GROUND],
+        );
+        c.add_part(
+            "M1",
+            PartKind::Mosfet(Polarity::P, model),
+            None,
+            vec![drain, gate, vdd],
+        );
+
+        let layout = Layout::build(&c);
+        let x = solve_dc(&c, &layout).unwrap();
+        let vd = x[layout.node_of(&c, drain).unwrap()];
+
+        let (vsg, vsd) = (5.0 - 2.0, 5.0 - vd);
+        let vov = vsg - model.vth;
+        assert!(vsd > vov, "Vsd = {vsd} not in saturation (Vov = {vov})");
+        let id = vd / 200.0; // sourced into the drain node, out through RD
+        let id_model = model.kp * vov * vov * (1.0 + model.lambda * vsd);
+        assert!(
+            (id - id_model).abs() <= 1e-9 + 1e-3 * id_model,
+            "Id = {id} vs square-law {id_model}"
+        );
+    }
+
+    #[test]
+    fn bjt_ce_small_signal_gain() {
+        // AC validates the multiport small-signal stamp: a CE amp biased by a
+        // base source (offset 0.65 V, 1∠0 AC), RC = 4.7 kΩ to Vcc, emitter
+        // grounded. With no Early effect the midband gain is Av = −gm·RC, where
+        // gm = Is·exp(Vbe/Vt)/Vt at the DC bias — the transconductance entry the
+        // Jacobian contributes to the complex system.
+        let mut c = Circuit::new("ce_ac");
+        let vcc = c.new_net();
+        let base = c.new_net();
+        let coll = c.new_net();
+        c.add_part(
+            "Vcc",
+            PartKind::VoltageSource,
+            v("10", Unit::Volt),
+            vec![vcc, NetId::GROUND],
+        );
+        c.add_part(
+            "RC",
+            PartKind::Resistor,
+            v("4.7k", Unit::Ohm),
+            vec![vcc, coll],
+        );
+        c.add_part(
+            "Vin",
+            PartKind::VoltageSource,
+            None,
+            vec![base, NetId::GROUND],
+        );
+        c.add_part(
+            "Q1",
+            PartKind::Bjt(Polarity::N, BjtModel::default()),
+            None,
+            vec![coll, base, NetId::GROUND],
+        );
+        // Sine → 1∠0 AC drive; its offset is the DC base bias.
+        assert!(c.set_waveform(
+            "Vin",
+            Waveform::Sine {
+                amplitude: 1.0,
+                freq: 1_000.0,
+                offset: 0.65,
+                phase_deg: 0.0,
+            },
+        ));
+
+        let sigs = Engine::new()
+            .run(
+                &c,
+                &Analysis::Ac {
+                    f_start: 100.0,
+                    f_stop: 10_000.0,
+                    points_per_decade: 2,
+                },
+            )
+            .unwrap();
+
+        let m = BjtModel::default();
+        let gm = m.is * (0.65 / m.vt).exp() / m.vt;
+        let expected = gm * 4.7e3; // |Av|
+        let name = format!("v(n{})", c.resolve(coll).0);
+        let sig = sigs.iter().find(|s| s.name == name).unwrap();
+        let h = &sig.complex().unwrap()[0];
+        // Resistive load, no reactances ⇒ flat gain, 180° inverted.
+        assert!(
+            (h.magnitude() - expected).abs() / expected <= 0.03,
+            "|Av| = {} vs −gm·RC = {expected}",
+            h.magnitude()
+        );
+        assert!(
+            (h.phase_deg().abs() - 180.0).abs() <= 1.0,
+            "phase {}° not inverting",
+            h.phase_deg()
+        );
     }
 }
