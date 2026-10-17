@@ -17,6 +17,7 @@
 
 pub mod avr;
 pub mod boundary;
+pub mod cortexm;
 pub mod pin;
 
 pub use boundary::{InputThresholds, OutputDrive, Thevenin};
