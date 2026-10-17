@@ -31,6 +31,10 @@
 //! assert!(frame.contains('\u{2524}')); // a braille scope frame
 //! ```
 
+pub mod script;
+
+pub use script::{Recording, ScriptError, ScriptRun};
+
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
@@ -344,6 +348,23 @@ impl Shell {
             .find(|(_, &id)| id == net)
             .map(|(n, _)| n.clone())
             .unwrap_or_else(|| format!("n{}", net.0))
+    }
+}
+
+/// Drive the live TUI with the shell as its command backend.
+///
+/// This is the one seam between `ee-shell` and `ee-tui`'s interactive app
+/// (`CP-UX-M1.4`): the TUI calls [`execute`](Shell::execute) for each line the
+/// user runs and reads [`circuit`](Shell::circuit) to draw the schematic, while
+/// the dependency arrow stays `ee-shell → ee-tui`. The binary wires the live app
+/// with `ee_tui::run(Shell::new())`.
+impl ee_tui::Backend for Shell {
+    fn execute(&mut self, line: &str) -> Result<String, String> {
+        Shell::execute(self, line).map_err(|e| e.to_string())
+    }
+
+    fn circuit(&self) -> &Circuit {
+        Shell::circuit(self)
     }
 }
 

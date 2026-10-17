@@ -13,4 +13,6 @@ workspace = true
 ee-core = { workspace = true }
 ee-instruments = { workspace = true }
 # ratatui   = { workspace = true }   # uncomment at M0 render work
-# crossterm = { workspace = true }
+# Terminal input + raw-mode I/O for the live app (CP-UX-M1.4). Kept to the thin
+# `run` wrapper; the event logic is a pure, tty-free state machine in `app`.
+crossterm = { version = "0.28", default-features = false, features = ["events"] }
