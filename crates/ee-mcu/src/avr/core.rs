@@ -32,6 +32,7 @@ use crate::{FirmwareError, McuCore};
 
 use super::decode::decode;
 use super::isa::{Instr, Ptr, PtrMode};
+use super::periph::{Peripherals, Port};
 use super::sreg::Sreg;
 
 /// Flash size in 16-bit words (ATmega328P: 32 KiB).
@@ -75,6 +76,8 @@ pub struct Avr {
     cycles: u64,
     /// Clock frequency in Hz, used to map cycles onto simulated seconds.
     f_cpu: f64,
+    /// Memory-mapped peripherals (GPIO, timers/PWM, ADC, USART).
+    periph: Peripherals,
 }
 
 impl Default for Avr {
@@ -97,6 +100,7 @@ impl Avr {
             pending: 0,
             cycles: 0,
             f_cpu: DEFAULT_F_CPU,
+            periph: Peripherals::new(),
         };
         avr.reset();
         avr
@@ -113,6 +117,7 @@ impl Avr {
         self.pc = 0;
         self.pending = 0;
         self.cycles = 0;
+        self.periph = Peripherals::new();
     }
 
     /// Set the CPU clock in Hz (affects only the cycles-to-seconds mapping).
@@ -157,28 +162,56 @@ impl Avr {
         self.regs[i as usize] = v;
     }
     /// Read a data-space byte (registers / I/O / SRAM).
+    ///
+    /// Addresses claimed by a peripheral route to [`Peripherals::read`]; the rest
+    /// of the I/O window is plain storage.
     pub fn read_data(&self, addr: u16) -> u8 {
         match addr {
             0x00..=0x1F => self.regs[addr as usize],
             SPL_ADDR => self.sp as u8,
             SPH_ADDR => (self.sp >> 8) as u8,
             SREG_ADDR => self.sreg.to_u8(),
-            IO_START..=0xFF => self.io[(addr - IO_START) as usize],
+            IO_START..=0xFF => self
+                .periph
+                .read(addr)
+                .unwrap_or_else(|| self.io[(addr - IO_START) as usize]),
             SRAM_START..=RAMEND => self.sram[(addr - SRAM_START) as usize],
             _ => 0, // outside the modelled data space
         }
     }
     /// Write a data-space byte (registers / I/O / SRAM).
+    ///
+    /// Addresses claimed by a peripheral route to [`Peripherals::write`]; the
+    /// rest of the I/O window is plain storage.
     pub fn write_data(&mut self, addr: u16, val: u8) {
         match addr {
             0x00..=0x1F => self.regs[addr as usize] = val,
             SPL_ADDR => self.sp = (self.sp & 0xFF00) | val as u16,
             SPH_ADDR => self.sp = (self.sp & 0x00FF) | (val as u16) << 8,
             SREG_ADDR => self.sreg = Sreg::from_u8(val),
-            IO_START..=0xFF => self.io[(addr - IO_START) as usize] = val,
+            IO_START..=0xFF => {
+                if !self.periph.write(addr, val) {
+                    self.io[(addr - IO_START) as usize] = val;
+                }
+            }
             SRAM_START..=RAMEND => self.sram[(addr - SRAM_START) as usize] = val,
             _ => {}
         }
+    }
+
+    // --- Peripheral access (GPIO / timers / ADC / USART) ---
+
+    /// Shared read access to the memory-mapped peripherals.
+    pub fn peripherals(&self) -> &Peripherals {
+        &self.periph
+    }
+    /// Mutable access to the memory-mapped peripherals (set inputs, read TX…).
+    pub fn peripherals_mut(&mut self) -> &mut Peripherals {
+        &mut self.periph
+    }
+    /// The resolved logic level on `port` pin `bit`.
+    pub fn pin(&self, port: Port, bit: u8) -> bool {
+        self.periph.pin(port, bit)
     }
 
     // --- Interrupts ---
@@ -228,6 +261,17 @@ impl Avr {
         let hi = self.pop8() as u16;
         let lo = self.pop8() as u16;
         hi << 8 | lo
+    }
+
+    /// Read the register pair `Rd+1:Rd` as a little-endian 16-bit word (used by
+    /// `ADIW`/`SBIW`).
+    fn word_reg(&self, d: u8) -> u16 {
+        self.regs[d as usize] as u16 | (self.regs[d as usize + 1] as u16) << 8
+    }
+    /// Write a 16-bit word into the register pair `Rd+1:Rd`.
+    fn set_word_reg(&mut self, d: u8, v: u16) {
+        self.regs[d as usize] = v as u8;
+        self.regs[d as usize + 1] = (v >> 8) as u8;
     }
 
     // --- Pointer registers (X/Y/Z) ---
@@ -432,6 +476,30 @@ impl Avr {
             Instr::Ldi(d, k) => {
                 self.regs[d as usize] = k;
                 1
+            }
+            Instr::Adiw(d, k) => {
+                let val = self.word_reg(d);
+                let res = val.wrapping_add(k as u16);
+                let (rdh7, r15) = (val & 0x8000 != 0, res & 0x8000 != 0);
+                self.sreg.c = !r15 && rdh7;
+                self.sreg.v = !rdh7 && r15;
+                self.sreg.n = r15;
+                self.sreg.z = res == 0;
+                self.sreg.s = self.sreg.n ^ self.sreg.v;
+                self.set_word_reg(d, res);
+                2
+            }
+            Instr::Sbiw(d, k) => {
+                let val = self.word_reg(d);
+                let res = val.wrapping_sub(k as u16);
+                let (rdh7, r15) = (val & 0x8000 != 0, res & 0x8000 != 0);
+                self.sreg.c = r15 && !rdh7;
+                self.sreg.v = rdh7 && !r15;
+                self.sreg.n = r15;
+                self.sreg.z = res == 0;
+                self.sreg.s = self.sreg.n ^ self.sreg.v;
+                self.set_word_reg(d, res);
+                2
             }
 
             // Single register.
@@ -693,6 +761,7 @@ impl McuCore for Avr {
         if self.sreg.i {
             if let Some(v) = self.take_pending() {
                 self.service_interrupt(v);
+                self.periph.tick(5); // the 5 dispatch cycles drive peripherals too
                 return;
             }
         }
@@ -702,6 +771,7 @@ impl McuCore for Avr {
         self.pc = self.pc.wrapping_add(len as u16);
         let cycles = self.execute(instr);
         self.cycles += cycles;
+        self.periph.tick(cycles);
     }
 
     fn step_to(&mut self, t: f64) {
@@ -1001,6 +1071,44 @@ mod tests {
         run(&mut avr, 4 + 5 * 4); // 4 setup + 5 iterations of 4 insns
         assert_eq!(avr.reg(18), 15, "1+2+3+4+5");
         assert_eq!(avr.ptr_get(Ptr::Z), 0x0205, "Z advanced past the array");
+    }
+
+    #[test]
+    fn adiw_and_sbiw_update_a_register_pair() {
+        // LDI r24,0xFF ; LDI r25,0x00 ; ADIW r24,1 → 0x0100.
+        let mut avr = with_program(&[0xEF8F, 0xE090, 0x9601]);
+        run(&mut avr, 3);
+        assert_eq!(avr.word_reg(24), 0x0100, "0x00FF + 1");
+        assert!(!avr.sreg().z);
+        // LDI r24,0x01 ; LDI r25,0x00 ; SBIW r24,1 → 0x0000, Z set.
+        let mut avr = with_program(&[0xE081, 0xE090, 0x9701]);
+        run(&mut avr, 3);
+        assert_eq!(avr.word_reg(24), 0, "1 - 1");
+        assert!(avr.sreg().z, "SBIW to zero sets Z");
+    }
+
+    #[test]
+    fn sbiw_delay_loop_consumes_the_expected_cycles() {
+        // LDI r24,0x10 ; LDI r25,0x00 ; loop: SBIW r24,1 ; BRNE loop.
+        // Word 2 is SBIW, word 3 is BRNE .-1 (back to 2): BRBC 1, k=-1 → 0xF7F1.
+        let mut avr = with_program(&[0xE180, 0xE090, 0x9701, 0xF7F1]);
+        avr.set_clock_hz(1_000_000.0);
+        // 0x10 = 16 iterations: SBIW (2 cyc) + BRNE (2 taken / 1 not) each.
+        run(&mut avr, 2 + 16 * 2);
+        assert_eq!(avr.word_reg(24), 0, "loop counted down to zero");
+    }
+
+    #[test]
+    fn firmware_toggles_a_gpio_pin() {
+        use super::Port;
+        // SBI DDRB,5 (PB5 output) ; LDI r16,0x20 ; OUT PINB,r16 (toggle PB5).
+        // DDRB I/O addr = 0x04, PINB I/O addr = 0x03.
+        let mut avr = with_program(&[0x9A25, 0xE200, 0xB903]);
+        avr.step(); // SBI DDRB,5
+        assert!(!avr.pin(Port::B, 5), "starts low");
+        avr.step(); // LDI r16,0x20
+        avr.step(); // OUT PINB,r16 → toggles PB5 high
+        assert!(avr.pin(Port::B, 5), "PB5 toggled high");
     }
 
     #[test]

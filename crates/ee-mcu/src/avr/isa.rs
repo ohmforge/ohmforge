@@ -88,6 +88,10 @@ pub enum Instr {
     Cpi(u8, u8),
     /// `Rd ← K`.
     Ldi(u8, u8),
+    /// `Rd+1:Rd ← Rd+1:Rd + K` (add immediate to word; `d` is the low register).
+    Adiw(u8, u8),
+    /// `Rd+1:Rd ← Rd+1:Rd - K` (subtract immediate from word; `d` is low reg).
+    Sbiw(u8, u8),
 
     // --- Single register ---
     /// `Rd ← $FF - Rd` (one's complement).

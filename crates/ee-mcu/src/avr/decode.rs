@@ -8,7 +8,8 @@
 //! # Coverage
 //!
 //! Implemented: `NOP`; the register ALU ops `ADD ADC SUB SBC AND OR EOR CP CPC
-//! CPSE MOV MOVW`; the immediate ops `SUBI SBCI ANDI ORI CPI LDI`; the unary ops
+//! CPSE MOV MOVW`; the immediate ops `SUBI SBCI ANDI ORI CPI LDI`; the word-
+//! immediate ops `ADIW SBIW`; the unary ops
 //! `COM NEG INC DEC SWAP LSR ASR ROR`; data transfer `LDS STS LD/ST (X/Y/Z with
 //! post-increment / pre-decrement) LDD/STD (Y/Z + q) IN OUT PUSH POP`; bit ops
 //! `SBI CBI SBIC SBIS SBRC SBRS BSET BCLR BLD BST`; and control flow `RJMP RCALL
@@ -17,7 +18,7 @@
 //!
 //! Not yet implemented (decode to [`Instr::Unknown`], a documented TODO): the
 //! multiply family (`MUL`/`MULS`/`FMUL`…), program-memory access (`LPM`/`SPM`),
-//! `ADIW`/`SBIW`, `SLEEP`/`WDR`/`BREAK`, and `EIJMP`/`EICALL`.
+//! `SLEEP`/`WDR`/`BREAK`, and `EIJMP`/`EICALL`.
 
 use super::isa::{Instr, Ptr, PtrMode};
 
@@ -159,6 +160,14 @@ fn decode_9_misc(w0: u16, w1: u16) -> (Instr, u8) {
         0x9509 => return (Instr::Icall, 1),
         _ => {}
     }
+    // ADIW = 1001 0110 KKdd KKKK ; SBIW = 1001 0111 KKdd KKKK. The register pair
+    // is one of r24/r26/r28/r30 and K is a 6-bit immediate.
+    if w0 & 0xFF00 == 0x9600 {
+        return (Instr::Adiw(adiw_reg(w0), adiw_k(w0)), 1);
+    }
+    if w0 & 0xFF00 == 0x9700 {
+        return (Instr::Sbiw(adiw_reg(w0), adiw_k(w0)), 1);
+    }
     // BSET s = 1001 0100 0sss 1000 ; BCLR s = 1001 0100 1sss 1000.
     if w0 & 0xFF8F == 0x9408 {
         return (Instr::Bset((w0 >> 4 & 7) as u8), 1);
@@ -261,6 +270,16 @@ fn rd_imm(w: u16) -> u8 {
     16 + (w >> 4 & 0xF) as u8
 }
 
+/// The low register of an `ADIW`/`SBIW` pair: `dd` selects r24/r26/r28/r30.
+fn adiw_reg(w: u16) -> u8 {
+    24 + ((w >> 4) & 3) as u8 * 2
+}
+
+/// The 6-bit immediate of an `ADIW`/`SBIW`: bits 7:6 are the high two bits.
+fn adiw_k(w: u16) -> u8 {
+    (((w >> 6) & 3) << 4 | (w & 0xF)) as u8
+}
+
 /// The 8-bit immediate of a register/immediate op: high nibble in bits 11:8,
 /// low nibble in bits 3:0.
 fn k8(w: u16) -> u8 {
@@ -313,6 +332,12 @@ mod tests {
         // SEI = 0x9478 = Bset(7) ; CLI = 0x94F8 = Bclr(7).
         assert_eq!(decode(0x9478, 0).0, Instr::Bset(7));
         assert_eq!(decode(0x94F8, 0).0, Instr::Bclr(7));
+        // ADIW r24, 1 = 1001 0110 0000 0001 → 0x9601 (pair dd=00 → r24, K=1).
+        assert_eq!(decode(0x9601, 0).0, Instr::Adiw(24, 1));
+        // SBIW r24, 1 = 1001 0111 0000 0001 → 0x9701.
+        assert_eq!(decode(0x9701, 0).0, Instr::Sbiw(24, 1));
+        // ADIW r30, 63 = pair dd=11 → r30, K=63 (0x3F) → 0x96FF.
+        assert_eq!(decode(0x96FF, 0).0, Instr::Adiw(30, 63));
         // RET / RETI.
         assert_eq!(decode(0x9508, 0).0, Instr::Ret);
         assert_eq!(decode(0x9518, 0).0, Instr::Reti);
