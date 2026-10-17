@@ -25,6 +25,12 @@ pub enum AiError {
     /// No `ANTHROPIC_API_KEY` is present in the environment. Only the real HTTP
     /// transport needs one; the mock never does.
     MissingApiKey,
+    /// A staged patch could not be scratch-applied or measured during the
+    /// verification loop — a command the shell rejected, or a spec that named a
+    /// node/part the patched circuit does not have. Carries a human-readable
+    /// reason. The loop surfaces this instead of silently presenting a bogus
+    /// verdict; the live circuit is never touched.
+    Patch(String),
 }
 
 impl fmt::Display for AiError {
@@ -41,6 +47,7 @@ impl fmt::Display for AiError {
                     "no API key found — set ANTHROPIC_API_KEY in the environment"
                 )
             }
+            AiError::Patch(why) => write!(f, "could not verify the staged patch: {why}"),
         }
     }
 }

@@ -23,6 +23,11 @@ ee-core = { workspace = true }
 # the model can only do what a user could (docs/AI.md § trust model). No new
 # third-party crates: the shell already re-exports the sim engine it needs.
 ee-shell = { workspace = true }
+# The verification loop (CP-AF-M2.1) MEASURES spec quantities (e.g. a load
+# current) from a real operating-point solve of the scratch circuit. `ee-shell`
+# does not re-export the engine, so the loop reaches it directly. A workspace
+# crate, not a third-party dep — in keeping with the std-only, no-network rule.
+ee-sim = { workspace = true }
 # No third-party deps: the Claude client is hand-rolled std-only (matching
 # ee-fmt's hand-written parsers) so the copilot loop is network-free and the
 # crate compiles for wasm32 without a TLS stack. Tool input/result and JSON

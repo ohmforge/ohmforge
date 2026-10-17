@@ -161,7 +161,7 @@ pub fn ask<T: Transport>(
 /// if the key is absent or its value is not a string. Handles standard string
 /// escapes in the value. Deliberately minimal — enough for a tool's flat input
 /// object, not a general JSON parser.
-fn json_string_field(src: &str, key: &str) -> Option<String> {
+pub(crate) fn json_string_field(src: &str, key: &str) -> Option<String> {
     let needle = format!("\"{key}\"");
     let bytes = src.as_bytes();
     let mut from = 0;
@@ -218,8 +218,64 @@ fn parse_json_string(s: &str) -> String {
     out
 }
 
+/// Read an array-of-strings field `key` out of a JSON object `src`, returning
+/// each element in order. Returns `None` if the key is absent or its value is
+/// not an array; a `[]` yields `Some(vec![])`. Like [`json_string_field`] this
+/// is a minimal reader for a tool's flat input — enough for a patch's
+/// `commands: [...]`, not a general JSON parser.
+pub(crate) fn json_string_array_field(src: &str, key: &str) -> Option<Vec<String>> {
+    let needle = format!("\"{key}\"");
+    let bytes = src.as_bytes();
+    let rel = src.find(&needle)?;
+    let mut i = rel + needle.len();
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b':' {
+        return None;
+    }
+    i += 1;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b'[' {
+        return None; // key present but value is not an array
+    }
+    i += 1;
+    let mut out = Vec::new();
+    loop {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        match bytes.get(i) {
+            Some(b']') => return Some(out),
+            Some(b',') => {
+                i += 1;
+            }
+            Some(b'"') => {
+                let s = parse_json_string(&src[i..]);
+                // Advance past this string literal, honoring escapes.
+                let mut j = i + 1;
+                while j < bytes.len() {
+                    match bytes[j] {
+                        b'\\' => j += 2,
+                        b'"' => {
+                            j += 1;
+                            break;
+                        }
+                        _ => j += 1,
+                    }
+                }
+                i = j;
+                out.push(s);
+            }
+            _ => return None, // malformed — unterminated or a non-string element
+        }
+    }
+}
+
 /// Escape a string for embedding in JSON output.
-fn json_escape(s: &str) -> String {
+pub(crate) fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     for c in s.chars() {
         match c {
@@ -237,7 +293,7 @@ fn json_escape(s: &str) -> String {
 
 /// Pull a node's voltage out of the shell's `run op` table, whose rows read
 /// `  v(<node>) = <volts> V`.
-fn parse_node_volts(table: &str, node: &str) -> Option<f64> {
+pub(crate) fn parse_node_volts(table: &str, node: &str) -> Option<f64> {
     let needle = format!("v({node}) = ");
     for line in table.lines() {
         if let Some(idx) = line.find(&needle) {
