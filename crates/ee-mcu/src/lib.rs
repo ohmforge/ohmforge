@@ -6,9 +6,9 @@
 //! "Board & MCU emulation."
 //!
 //! Planned cores (docs/ROADMAP.md):
-//! - `avr`     — ATmega328P (Arduino Uno/Nano), ATmega2560, ATtiny  [M1/M2]
-//! - `cortexm` — RP2040 (Raspberry Pi Pico), STM32-class            [M2/M3]
-//! - `riscv`   — RV32I(MC) for ESP32-class                          [M3]
+//! - `avr`     — ATmega328P (Arduino Uno/Nano), ATmega2560, ATtiny  (M1/M2)
+//! - `cortexm` — RP2040 (Raspberry Pi Pico), STM32-class            (M2/M3)
+//! - `riscv`   — RV32I(MC) for ESP32-class                          (M3)
 
 /// A microcontroller core the emulator can run.
 pub trait McuCore {
