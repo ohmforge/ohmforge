@@ -23,7 +23,7 @@ use std::fmt;
 
 use ee_core::graph::{BjtModel, Circuit, MosfetModel, NetId, Part, PartKind, Polarity, Waveform};
 use ee_core::value::Value;
-use ee_core::{Complex, Signal, Unit};
+use ee_core::{Complex, Domain, Signal, SignalData, Unit};
 use mna::System;
 use mna_complex::ComplexSystem;
 
@@ -57,6 +57,19 @@ pub enum Analysis {
         source: String,
         values: Vec<f64>,
         inner: Box<Analysis>,
+    },
+    /// Small-signal **noise** analysis (`CP-SIM-M2.1`). Propagate every component's
+    /// noise generator to the `output` node over `[f_start, f_stop]` (log-spaced at
+    /// `points_per_decade`) and return the output-referred noise power spectral
+    /// density. At M2.1 the modeled generators are resistor thermal noise, current
+    /// PSD `4kT/R` (A²/Hz); the result is one frequency-domain [`Signal`] of the
+    /// output voltage PSD in **V²/Hz**. Reuses the complex-MNA transimpedance from
+    /// each noise source to the output, exactly as the AC path linearizes.
+    Noise {
+        output: NetId,
+        f_start: f64,
+        f_stop: f64,
+        points_per_decade: u32,
     },
 }
 
@@ -151,6 +164,19 @@ impl Engine {
                 values,
                 inner,
             } => self.parametric(circuit, source, values, inner),
+            Analysis::Noise {
+                output,
+                f_start,
+                f_stop,
+                points_per_decade,
+            } => noise(
+                circuit,
+                &layout,
+                *output,
+                *f_start,
+                *f_stop,
+                *points_per_decade,
+            ),
         }
     }
 }
@@ -1753,6 +1779,183 @@ fn ac(
             )
         })
         .collect())
+}
+
+// ---------------------------------------------------------------------------
+// Noise analysis (CP-SIM-M2.1)
+// ---------------------------------------------------------------------------
+
+/// Boltzmann constant `k` (J/K), for thermal-noise spectral density.
+const BOLTZMANN_K: f64 = 1.380_649e-23;
+/// Noise-analysis absolute temperature `T` (K) — 27 °C. The resistor thermal-noise
+/// current PSD is `4kT/R`; the output-referred floor of a lone resistor is `4kTR`.
+const NOISE_TEMP_K: f64 = 300.15;
+
+/// Small-signal noise analysis (`CP-SIM-M2.1`).
+///
+/// The output-referred noise PSD is the incoherent sum over independent noise
+/// sources of `|Z_k(f)|²·S_k`, where `S_k` is a source's intrinsic spectral
+/// density and `Z_k(f) = V(output)/I_k` is the transimpedance from that source to
+/// the output. At M2.1 the only generator is resistor thermal noise: resistor `R`
+/// carries a noise **current** source of PSD `S = 4kT/R` (A²/Hz) across its own
+/// terminals, so its output contribution is `|Z|²·4kT/R` (V²/Hz).
+///
+/// Each transimpedance reuses the complex-MNA network the AC path builds —
+/// resistors as `G`, capacitors as `jωC`, inductors as `1/(jωL)`, nonlinear
+/// devices as their small-signal conductance at the DC bias, and controlled
+/// sources in their complex form — but with **every independent source quiet** (a
+/// voltage source is a short, a current source an open). A unit current injected
+/// across a resistor's nodes then reads the transimpedance straight off the output
+/// node. (The direct per-source solve is O(resistors) solves per frequency; an
+/// adjoint single-solve is future work, as the sparse solver is.)
+fn noise(
+    circuit: &Circuit,
+    layout: &Layout,
+    output: NetId,
+    f_start: f64,
+    f_stop: f64,
+    points_per_decade: u32,
+) -> Result<Vec<Signal>, SimError> {
+    if !f_start.is_finite()
+        || !f_stop.is_finite()
+        || f_start <= 0.0
+        || f_stop <= f_start
+        || points_per_decade == 0
+    {
+        return Err(SimError::BadValue("noise sweep range/points".into()));
+    }
+
+    // DC bias, to linearize any nonlinear device (and verify the topology).
+    let x_dc = solve_dc(circuit, layout)?;
+
+    let n = layout.n_nodes();
+    let m = layout.vsources.len();
+    // Inductors are admittances here (no branch rows), as in AC; voltage sources
+    // keep their shorting branch rows, controlled sources their branches.
+    let size = n + m + layout.n_controlled_branches();
+    let out_node = layout.node_of(circuit, output);
+
+    // Frequency-independent passive data, collected once.
+    let mut conductances: Vec<(Option<usize>, Option<usize>, f64)> = Vec::new();
+    let mut caps: Vec<(Option<usize>, Option<usize>, f64)> = Vec::new();
+    let mut inds: Vec<(Option<usize>, Option<usize>, f64)> = Vec::new();
+    // Resistor thermal-noise sources: (nodes, current PSD `4kT/R`).
+    let mut noise_sources: Vec<(Option<usize>, Option<usize>, f64)> = Vec::new();
+    for part in circuit.parts() {
+        match part.kind {
+            PartKind::Resistor => {
+                let r = magnitude(part)?;
+                if r <= 0.0 {
+                    return Err(SimError::BadValue(part.reference.clone()));
+                }
+                let (a, b) = terminals2(part)?;
+                let (na, nb) = (layout.node_of(circuit, a), layout.node_of(circuit, b));
+                conductances.push((na, nb, 1.0 / r));
+                noise_sources.push((na, nb, 4.0 * BOLTZMANN_K * NOISE_TEMP_K / r));
+            }
+            PartKind::Capacitor => {
+                let (a, b) = terminals2(part)?;
+                caps.push((
+                    layout.node_of(circuit, a),
+                    layout.node_of(circuit, b),
+                    magnitude(part)?,
+                ));
+            }
+            PartKind::Inductor => {
+                let l = magnitude(part)?;
+                if l <= 0.0 {
+                    return Err(SimError::BadValue(part.reference.clone()));
+                }
+                let (a, b) = terminals2(part)?;
+                inds.push((layout.node_of(circuit, a), layout.node_of(circuit, b), l));
+            }
+            _ => {}
+        }
+    }
+
+    // Nonlinear devices → small-signal Jacobian at the DC bias (purely real), as AC.
+    let devices = collect_nonlinear(circuit)?;
+    let mut device_g: Vec<(Option<usize>, Option<usize>, f64)> = Vec::new();
+    for dev in &devices {
+        let nodes: Vec<Option<usize>> = dev
+            .terminals()
+            .iter()
+            .map(|&t| layout.node_of(circuit, t))
+            .collect();
+        let v: Vec<f64> = nodes
+            .iter()
+            .map(|&nd| nd.map_or(0.0, |i| x_dc[i]))
+            .collect();
+        let comp = dev.linearize(&v, &mut vec![0.0; dev.state_len()], false);
+        for (a, &na) in nodes.iter().enumerate() {
+            for (b, &nb) in nodes.iter().enumerate() {
+                device_g.push((na, nb, comp.g[a][b]));
+            }
+        }
+    }
+
+    // Voltage sources shorting branch rows (0 V drive — every independent source is
+    // quiet in a noise analysis, so no part carries a 1∠0 stimulus).
+    let vsource_shorts: Vec<(Option<usize>, Option<usize>, usize)> = layout
+        .vsources
+        .iter()
+        .enumerate()
+        .map(|(branch, &pi)| {
+            let (plus, minus) = terminals2(&circuit.parts()[pi])?;
+            Ok::<_, SimError>((
+                layout.node_of(circuit, plus),
+                layout.node_of(circuit, minus),
+                n + branch,
+            ))
+        })
+        .collect::<Result<_, _>>()?;
+
+    // Stamp the whole quiet network at angular frequency `w` into a fresh system.
+    let build_network = |w: f64| -> Result<ComplexSystem, SimError> {
+        let mut sys = ComplexSystem::new(size);
+        for &(a, b, g) in &conductances {
+            sys.stamp_admittance(a, b, Complex::new(g, 0.0));
+        }
+        for &(a, b, c) in &caps {
+            sys.stamp_admittance(a, b, Complex::new(0.0, w * c)); // jωC
+        }
+        for &(a, b, l) in &inds {
+            sys.stamp_admittance(a, b, Complex::new(0.0, -1.0 / (w * l))); // 1/(jωL)
+        }
+        for &(a, b, g) in &device_g {
+            sys.stamp_matrix(a, b, Complex::new(g, 0.0));
+        }
+        for &(plus, minus, k) in &vsource_shorts {
+            sys.stamp_vsource(plus, minus, k, Complex::ZERO);
+        }
+        stamp_controlled_sources_complex(&mut sys, circuit, layout)?;
+        Ok(sys)
+    };
+
+    let freqs = log_frequencies(f_start, f_stop, points_per_decade);
+    let mut psd: Vec<f64> = Vec::with_capacity(freqs.len());
+    for &f in &freqs {
+        let w = TAU * f;
+        let mut total = 0.0;
+        // Each noise source: inject a 1 A probe across its nodes, solve, and read
+        // the transimpedance off the output; accumulate |Z|²·S incoherently.
+        for &(na, nb, s_k) in &noise_sources {
+            let mut sys = build_network(w)?;
+            sys.stamp_current(na, nb, Complex::ONE);
+            let x = sys.solve().ok_or(SimError::Singular)?;
+            let z = out_node.map_or(Complex::ZERO, |i| x[i]);
+            total += z.magnitude().powi(2) * s_k;
+        }
+        psd.push(total);
+    }
+
+    Ok(vec![Signal {
+        name: format!("onoise(n{})", circuit.resolve(output).0),
+        unit: Unit::Volt, // output-referred PSD, in V²/Hz (see `Analysis::Noise`)
+        domain: Domain::Freq,
+        x: freqs,
+        y: SignalData::Real(psd),
+    }])
 }
 
 /// Operating-point node voltages as single-sample signals.
@@ -3856,5 +4059,126 @@ mod tests {
             matches!(err, SimError::BadControl(ref r) if r == "Vmissing"),
             "expected BadControl, got {err:?}"
         );
+    }
+
+    // --- Noise analysis — CP-SIM-M2.1 --------------------------------------
+
+    #[test]
+    fn resistor_thermal_noise() {
+        // The acceptance gate: a lone resistor to ground has an output-referred
+        // thermal-noise PSD equal to 4kTR (V²/Hz), flat over frequency. Its own
+        // conductance is the only admittance at the node, so the transimpedance
+        // from its noise current source (PSD 4kT/R) to the node is exactly R, and
+        // R²·(4kT/R) = 4kTR.
+        let r = 1_000.0_f64;
+        let mut c = Circuit::new("one_r");
+        let out = c.new_net();
+        c.add_part(
+            "R1",
+            PartKind::Resistor,
+            v("1k", Unit::Ohm),
+            vec![out, NetId::GROUND],
+        );
+
+        let sigs = Engine::new()
+            .run(
+                &c,
+                &Analysis::Noise {
+                    output: out,
+                    f_start: 1.0,
+                    f_stop: 1e6,
+                    points_per_decade: 5,
+                },
+            )
+            .unwrap();
+        let name = format!("onoise(n{})", c.resolve(out).0);
+        let sig = sigs
+            .iter()
+            .find(|s| s.name == name)
+            .expect("onoise present");
+        assert_eq!(sig.domain, Domain::Freq);
+
+        let expected = 4.0 * BOLTZMANN_K * NOISE_TEMP_K * r; // 4kTR
+        let psd = sig.real().unwrap();
+        assert!(!psd.is_empty());
+        for &s in psd {
+            // Flat thermal floor across the whole sweep, to a tight relative tol.
+            assert!(
+                (s - expected).abs() <= 1e-6 * expected,
+                "noise PSD {s} V²/Hz != 4kTR {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn resistor_divider_output_noise_combines_both() {
+        // A resistor divider's output noise is the thermal noise of the parallel
+        // combination: each resistor's noise current (PSD 4kT/R_i) sees R1∥R2 to the
+        // output, so S_out = (R1∥R2)²·4kT·(1/R1 + 1/R2) = 4kT·(R1∥R2). The quiet V1
+        // is a short, so the two resistors share the output node's R1∥R2.
+        let (r1, r2) = (1_000.0_f64, 3_000.0_f64);
+        let mut c = Circuit::new("divider_noise");
+        let vin = c.new_net();
+        let mid = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("10", Unit::Volt),
+            vec![vin, NetId::GROUND],
+        );
+        c.add_part("R1", PartKind::Resistor, v("1k", Unit::Ohm), vec![vin, mid]);
+        c.add_part(
+            "R2",
+            PartKind::Resistor,
+            v("3k", Unit::Ohm),
+            vec![mid, NetId::GROUND],
+        );
+
+        let sigs = Engine::new()
+            .run(
+                &c,
+                &Analysis::Noise {
+                    output: mid,
+                    f_start: 10.0,
+                    f_stop: 1e5,
+                    points_per_decade: 3,
+                },
+            )
+            .unwrap();
+        let name = format!("onoise(n{})", c.resolve(mid).0);
+        let sig = sigs.iter().find(|s| s.name == name).unwrap();
+
+        let rpar = r1 * r2 / (r1 + r2);
+        let expected = 4.0 * BOLTZMANN_K * NOISE_TEMP_K * rpar; // 4kT·(R1∥R2)
+        for &s in sig.real().unwrap() {
+            assert!(
+                (s - expected).abs() <= 1e-6 * expected,
+                "divider output noise {s} != 4kT·(R1∥R2) {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn noise_rejects_a_bad_sweep_range() {
+        let mut c = Circuit::new("one_r");
+        let out = c.new_net();
+        c.add_part(
+            "R1",
+            PartKind::Resistor,
+            v("1k", Unit::Ohm),
+            vec![out, NetId::GROUND],
+        );
+        let err = Engine::new()
+            .run(
+                &c,
+                &Analysis::Noise {
+                    output: out,
+                    f_start: 0.0, // non-positive start is rejected
+                    f_stop: 1e3,
+                    points_per_decade: 10,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, SimError::BadValue(_)), "got {err:?}");
     }
 }
