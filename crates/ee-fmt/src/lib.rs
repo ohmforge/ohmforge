@@ -7,6 +7,8 @@
 
 pub mod netlist;
 pub mod project;
+pub mod spice;
 
 pub use netlist::{parse as parse_netlist, NetlistError};
 pub use project::{load as load_project, save as save_project, ProjectError};
+pub use spice::{export as export_spice, import as import_spice, SpiceError};
