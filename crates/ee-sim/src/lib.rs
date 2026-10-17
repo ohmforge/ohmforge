@@ -71,6 +71,20 @@ pub enum Analysis {
         f_stop: f64,
         points_per_decade: u32,
     },
+    /// **Monte-Carlo** tolerance analysis (`CP-SIM-M2.2`). Run `inner` `runs` times,
+    /// each time perturbing every part that carries a [`Circuit::tolerance`] within
+    /// its ±tolerance band using a seeded in-crate PRNG, and record the measured
+    /// `output`-node value at sample index `sample` from each run. Returns one
+    /// [`Signal`] of the per-run samples (the x axis is the run index), from which
+    /// a spread (std-dev, min/max) follows. A fixed `seed` reproduces the samples
+    /// bit-for-bit; a different seed gives a different-but-deterministic draw.
+    MonteCarlo {
+        seed: u64,
+        runs: usize,
+        output: NetId,
+        sample: usize,
+        inner: Box<Analysis>,
+    },
 }
 
 /// What can go wrong assembling or solving a circuit.
@@ -177,6 +191,13 @@ impl Engine {
                 *f_stop,
                 *points_per_decade,
             ),
+            Analysis::MonteCarlo {
+                seed,
+                runs,
+                output,
+                sample,
+                inner,
+            } => self.monte_carlo(circuit, *seed, *runs, *output, *sample, inner),
         }
     }
 }
@@ -1956,6 +1977,117 @@ fn noise(
         x: freqs,
         y: SignalData::Real(psd),
     }])
+}
+
+// ---------------------------------------------------------------------------
+// Monte-Carlo + component tolerances (CP-SIM-M2.2)
+// ---------------------------------------------------------------------------
+
+/// A tiny seeded PRNG — SplitMix64. Deterministic and self-contained (no external
+/// dependency, no OS entropy), so a given seed yields exactly the same stream on
+/// every platform and every run, which is the whole point of the Monte-Carlo gate.
+/// SplitMix64 is the standard seeding generator: one `wrapping_add` of the golden-
+/// ratio constant per draw, then an avalanche mix.
+struct SplitMix64 {
+    state: u64,
+}
+
+impl SplitMix64 {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    /// The next 64 raw bits.
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// A uniform `f64` in `[0, 1)`, built from the top 53 bits (the mantissa width),
+    /// so every representable value is equally likely and the result is exact.
+    fn next_f64(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    /// A uniform `f64` in `[-1, 1)` — the symmetric tolerance draw.
+    fn next_signed(&mut self) -> f64 {
+        2.0 * self.next_f64() - 1.0
+    }
+}
+
+impl Engine {
+    /// `Analysis::MonteCarlo`: run `inner` `runs` times, each on a copy of the
+    /// circuit whose toleranced parts are perturbed within their ±band, and record
+    /// the `output` node's value at `sample` from every run.
+    ///
+    /// **Determinism.** One [`SplitMix64`] is seeded from `seed` and advanced once
+    /// per toleranced part, in part-index order, across the whole run sequence. The
+    /// set of toleranced parts, their order, and the draw count are all fixed by the
+    /// circuit, so the same seed replays the identical stream of perturbations and
+    /// therefore the identical samples — bit for bit. Each run perturbs from the
+    /// original nominal values (it clones the untouched circuit), so draws never
+    /// compound. A part with tolerance `t` and nominal value `v` becomes
+    /// `v·(1 + t·u)`, `u` uniform in `[-1, 1)`.
+    fn monte_carlo(
+        &self,
+        circuit: &Circuit,
+        seed: u64,
+        runs: usize,
+        output: NetId,
+        sample: usize,
+        inner: &Analysis,
+    ) -> Result<Vec<Signal>, SimError> {
+        if runs == 0 {
+            return Err(SimError::BadValue("monte-carlo run count".into()));
+        }
+        // The toleranced parts, captured once in part-index order with their nominal
+        // magnitude/unit — the fixed draw schedule that makes the stream reproducible.
+        let toleranced: Vec<(usize, f64, f64, Unit)> = circuit
+            .parts()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| {
+                let tol = circuit.tolerance(&p.reference)?;
+                let value = p.value?;
+                Some((i, tol, value.magnitude, value.unit))
+            })
+            .collect();
+
+        let out_name = format!("v(n{})", circuit.resolve(output).0);
+        let mut rng = SplitMix64::new(seed);
+        let mut samples: Vec<f64> = Vec::with_capacity(runs);
+        let mut unit = Unit::Volt;
+        for _ in 0..runs {
+            let mut work = circuit.clone();
+            for &(pi, tol, nominal, part_unit) in &toleranced {
+                let factor = 1.0 + tol * rng.next_signed();
+                let reference = work.parts()[pi].reference.clone();
+                work.set_value(&reference, Value::new(nominal * factor, part_unit));
+            }
+            let sigs = self.run(&work, inner)?;
+            let sig = sigs
+                .iter()
+                .find(|s| s.name == out_name)
+                .ok_or_else(|| SimError::UnknownPart(out_name.clone()))?;
+            unit = sig.unit;
+            let value = match &sig.y {
+                SignalData::Real(v) => v.get(sample).copied(),
+                SignalData::Complex(v) => v.get(sample).map(|z| z.magnitude()),
+            }
+            .ok_or_else(|| SimError::BadValue("monte-carlo sample index".into()))?;
+            samples.push(value);
+        }
+
+        Ok(vec![Signal::time(
+            format!("mc(n{})", circuit.resolve(output).0),
+            unit,
+            (0..runs).map(|i| i as f64).collect(),
+            samples,
+        )])
+    }
 }
 
 /// Operating-point node voltages as single-sample signals.
@@ -4156,6 +4288,134 @@ mod tests {
                 "divider output noise {s} != 4kT·(R1∥R2) {expected}"
             );
         }
+    }
+
+    // --- Monte-Carlo + tolerances — CP-SIM-M2.2 ----------------------------
+
+    /// A 1k/1k divider off a 10 V rail, both resistors toleranced ±5 %.
+    fn mc_divider() -> (Circuit, NetId) {
+        let mut c = Circuit::new("mc_divider");
+        let vin = c.new_net();
+        let mid = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("10", Unit::Volt),
+            vec![vin, NetId::GROUND],
+        );
+        c.add_part("R1", PartKind::Resistor, v("1k", Unit::Ohm), vec![vin, mid]);
+        c.add_part(
+            "R2",
+            PartKind::Resistor,
+            v("1k", Unit::Ohm),
+            vec![mid, NetId::GROUND],
+        );
+        assert!(c.set_tolerance("R1", 0.05));
+        assert!(c.set_tolerance("R2", 0.05));
+        (c, mid)
+    }
+
+    #[test]
+    fn monte_carlo_is_deterministic_under_a_fixed_seed() {
+        let (c, mid) = mc_divider();
+        let mc = |seed| Analysis::MonteCarlo {
+            seed,
+            runs: 400,
+            output: mid,
+            sample: 0,
+            inner: Box::new(Analysis::OperatingPoint),
+        };
+        let run = |a| {
+            Engine::new().run(&c, &a).unwrap()[0]
+                .real()
+                .unwrap()
+                .to_vec()
+        };
+
+        // Same seed → bit-for-bit identical samples, twice.
+        let a = run(mc(42));
+        let b = run(mc(42));
+        assert_eq!(a, b, "a fixed seed must reproduce the samples exactly");
+        assert_eq!(a.len(), 400);
+
+        // A different seed → a different draw (deterministic, but not the same).
+        let d = run(mc(7));
+        assert_ne!(a, d, "a different seed must give a different draw");
+
+        // The spread is consistent with ±5 % resistors. mid = 10·R2/(R1+R2) with
+        // R1,R2 ∈ [950, 1050] Ω ⇒ mid ∈ (4.63, 5.39) V, centered on 5 V, and the
+        // family actually spreads (not a single repeated value).
+        let (mut lo, mut hi, mut sum) = (f64::INFINITY, f64::NEG_INFINITY, 0.0);
+        for &s in &a {
+            assert!(
+                (4.5..5.5).contains(&s),
+                "sample {s} V outside the ±5 % divider window"
+            );
+            lo = lo.min(s);
+            hi = hi.max(s);
+            sum += s;
+        }
+        let mean = sum / a.len() as f64;
+        assert!(
+            (mean - 5.0).abs() < 0.05,
+            "mean {mean} V not centered on 5 V"
+        );
+        assert!(hi - lo > 0.1, "samples barely spread (range {})", hi - lo);
+    }
+
+    #[test]
+    fn monte_carlo_without_tolerances_is_a_constant() {
+        // No toleranced parts ⇒ no PRNG draws ⇒ every run is the nominal circuit,
+        // so the samples are the exact nominal output repeated (5 V for the divider).
+        let mut c = Circuit::new("nominal");
+        let vin = c.new_net();
+        let mid = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("10", Unit::Volt),
+            vec![vin, NetId::GROUND],
+        );
+        c.add_part("R1", PartKind::Resistor, v("1k", Unit::Ohm), vec![vin, mid]);
+        c.add_part(
+            "R2",
+            PartKind::Resistor,
+            v("1k", Unit::Ohm),
+            vec![mid, NetId::GROUND],
+        );
+        let sigs = Engine::new()
+            .run(
+                &c,
+                &Analysis::MonteCarlo {
+                    seed: 1,
+                    runs: 8,
+                    output: mid,
+                    sample: 0,
+                    inner: Box::new(Analysis::OperatingPoint),
+                },
+            )
+            .unwrap();
+        for &s in sigs[0].real().unwrap() {
+            assert!((s - 5.0).abs() < 1e-9, "nominal divider sample {s} != 5 V");
+        }
+    }
+
+    #[test]
+    fn monte_carlo_rejects_zero_runs() {
+        let (c, mid) = mc_divider();
+        let err = Engine::new()
+            .run(
+                &c,
+                &Analysis::MonteCarlo {
+                    seed: 0,
+                    runs: 0,
+                    output: mid,
+                    sample: 0,
+                    inner: Box::new(Analysis::OperatingPoint),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, SimError::BadValue(_)), "got {err:?}");
     }
 
     #[test]
