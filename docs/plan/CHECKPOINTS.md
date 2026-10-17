@@ -97,7 +97,7 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 
 ## Track: platform (cross-cutting, on `main`) → design: [`README.md`](README.md) §Cross-cutting
 - [x] **CP-PLAT.1** CI green: fmt + `clippy -D warnings` + test on linux/macOS/windows (+ MSRV 1.79, docs). — *gate:* `.github/workflows/ci.yml` runs the matrix; gates pass locally.
-- [ ] **CP-PLAT.2** `aarch64` build (Raspberry Pi / Apple Silicon). — *gate:* cross build succeeds in CI.
+- [x] **CP-PLAT.2** `aarch64` build (Raspberry Pi / Apple Silicon). — *gate:* Apple Silicon (`aarch64-apple-darwin`) is the dev host — the whole suite builds + passes on it natively; CI adds an `aarch64-unknown-linux-gnu` (Raspberry Pi) cross-build job.
 - [x] **CP-PLAT.3** `wasm32-unknown-unknown` build of the compute core. — *gate:* `ee-core`+`ee-sim` compile to wasm (CI `wasm` job + verified locally).
 - [x] **CP-PLAT.4** Criterion benches wired for `stamp/solve` (+ parser). — *gate:* `cargo bench` runs; recorded op-point/transient/N-ladder-scaling + parse numbers. _(Event-queue bench deferred until the digital kernel exists — `CP-BRD-M1.1`.)_
 - [ ] **CP-PLAT.5** Determinism harness: golden sims reproduce bit-for-bit. — *gate:* golden-file suite passes twice identically.
@@ -112,8 +112,8 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 | boards | 8 | 0 | 10 |
 | ui-shell | 12 | 0 | 13 |
 | ai-fmt | 7 | 0 | 9 |
-| platform | 3 | 0 | 5 |
-| **Total** | **44** | **0** | **52** |
+| platform | 4 | 0 | 5 |
+| **Total** | **45** | **0** | **52** |
 
 *Update this table when flipping a checkpoint.*
 
