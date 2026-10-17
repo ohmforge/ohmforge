@@ -4,6 +4,10 @@
 //! human-readable and diff-friendly so circuits live happily in git. Also:
 //! SPICE netlist import/export, KiCad netlist read, and waveform export to
 //! CSV/VCD. See docs/FEATURES.md §9. (Roadmap M0 native; M1 SPICE; M2 KiCad/VCD.)
+//!
+//! A format-by-format guide with runnable examples (incl. the SPICE `m`-vs-`meg`
+//! gotcha) lives in `docs/guide/formats.md`, and real files in
+//! `examples/formats/` are checked by `cargo test -p ee-fmt --test examples`.
 
 pub mod netlist;
 pub mod project;
