@@ -29,7 +29,7 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 - [x] **CP-SIM-M2.1** Noise analysis (output spectral density). — *gate:* `resistor_thermal_noise` — a 1 kΩ output floor = 4kTR within 1e-6, flat over frequency; a divider gives 4kT·(R1∥R2). `Analysis::Noise`; transimpedance via the complex-MNA network. (`4kT` at 300.15 K.)
 - [x] **CP-SIM-M2.2** Monte-Carlo + component tolerances (seeded, deterministic). — *gate:* `monte_carlo_is_deterministic_under_a_fixed_seed` — seed 42 twice → bit-identical 400-sample vectors; ±5% divider mean ≈ 5 V. In-crate SplitMix64 (no dep), `Circuit::set_tolerance`, `Analysis::MonteCarlo`.
 - [x] **CP-SIM-M2.3** Controlled sources (VCVS/VCCS/CCVS/CCCS). — *gate:* gain-10 VCVS exact at op-point and flat in AC; VCCS `Vout=G·Vin·R`; an ideal op-amp (huge-gain VCVS) non-inverting config → 1+Rf/Rg=10; CCVS/CCCS current-sense. Stamped in real + complex MNA. `PartKind::{Vcvs,Vccs,Ccvs,Cccs}` (native format round-trips the gain/ref; SPICE export defers).
-- [ ] **CP-SIM-M2.4** Sparse solver path for large nets. — *gate:* criterion bench shows target scaling on a 1k-node ladder.
+- [x] **CP-SIM-M2.4** Sparse solver path for large nets. — *gate:* row-sparse LU with partial pivoting, auto-routed above N=64; `sparse_matches_dense_bit_for_bit`; bench `sparse_vs_dense` shows 2.6×/4.5×/8.1× at N=250/500/1000 (sparse near-linear vs dense quadratic, diverging with N).
 
 ---
 
@@ -100,7 +100,7 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 - [x] **CP-PLAT.2** `aarch64` build (Raspberry Pi / Apple Silicon). — *gate:* Apple Silicon (`aarch64-apple-darwin`) is the dev host — the whole suite builds + passes on it natively; CI adds an `aarch64-unknown-linux-gnu` (Raspberry Pi) cross-build job.
 - [x] **CP-PLAT.3** `wasm32-unknown-unknown` build of the compute core. — *gate:* `ee-core`+`ee-sim` compile to wasm (CI `wasm` job + verified locally).
 - [x] **CP-PLAT.4** Criterion benches wired for `stamp/solve` (+ parser). — *gate:* `cargo bench` runs; recorded op-point/transient/N-ladder-scaling + parse numbers. _(Event-queue bench deferred until the digital kernel exists — `CP-BRD-M1.1`.)_
-- [ ] **CP-PLAT.5** Determinism harness: golden sims reproduce bit-for-bit. — *gate:* golden-file suite passes twice identically.
+- [x] **CP-PLAT.5** Determinism harness: golden sims reproduce bit-for-bit. — *gate:* `full_golden_suite_runs_twice_identically` — op/transient(fixed+adaptive)/AC/noise/seeded-MC run twice are bit-identical, with committed golden values (exact where representable, incl. the leading MC samples) and a seed-divergence check.
 
 ---
 
@@ -108,13 +108,21 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 
 | Track | Done | In progress | Total |
 |---|---|---|---|
-| sim-core | 14 | 0 | 15 |
+| sim-core | 15 | 0 | 15 |
 | boards | 10 | 0 | 10 |
 | ui-shell | 13 | 0 | 13 |
 | ai-fmt | 9 | 0 | 9 |
-| platform | 4 | 0 | 5 |
-| **Total** | **50** | **0** | **52** |
+| platform | 5 | 0 | 5 |
+| **Total** | **52** | **0** | **52** ✅ |
 
 *Update this table when flipping a checkpoint.*
 
-**🎉 M0 and M1 are complete.** M0 proved the loop (type → simulate → see). **M1** makes it a real simulator: nonlinear devices (diode/BJT/MOSFET) with Newton–Raphson + gmin/source-stepping convergence aids, AC/Bode, DC/parametric sweeps, adaptive timestep; an event-driven digital kernel + an instruction-accurate **AVR (ATmega328P)** core with peripherals running `blink.hex`; oscilloscope/DMM/funcgen/PSU instruments + a live op-point overlay + a dockable interactive TUI + eesh scripting; SPICE import/export; and a Claude client whose tools drive a real sim (grounded "ask"). 242 workspace tests green. Next: **M2** — co-simulation, mixed-signal, statistical analyses, the AI verification loop, WASM front end. Sequencing + fan-out: [`M2-PLAN.md`](M2-PLAN.md).
+**🎉 Every checkpoint is complete — M0, M1, M2, and the two M3 interop items — 52/52.**
+
+- **M0** proved the loop: type a circuit → simulate → see a wave.
+- **M1** made it a real simulator: nonlinear devices (diode/BJT/MOSFET) with Newton–Raphson + convergence aids, AC/Bode, DC/parametric sweeps, adaptive timestep; an event-driven digital kernel + an instruction-accurate **AVR (ATmega328P)** core running `blink.hex`; oscilloscope/DMM/funcgen/PSU + a live overlay + a dockable TUI + eesh scripting; SPICE I/O; and a grounded Claude copilot.
+- **M2** made it co-simulate and analyze: the **lockstep co-sim bridge** (AVR *and* RP2040/Pico drive real circuit nodes — `ee cosim`), mixed-signal boundary, controlled sources, **noise** + seeded **Monte-Carlo**, a **sparse solver** (near-linear on large nets), the logic analyzer with **UART/SPI/I²C decode**, Bode/spectrum/FFT, breadboard view, **VCD/CSV** export, the AI **verification loop** + Design/Debug/Firmware modes, AVR variants + gated toolchain compile, KiCad import + BOM, an offline (no-key) mode, aarch64 CI, and a bit-for-bit **determinism harness**.
+
+**427 workspace tests green**; `clippy -D warnings`, `rustfmt`, `wasm32` core, and `-D warnings` docs all clean; an audit pass fixed 6 latent bugs and shipped user guides + run-verified examples.
+
+The one roadmap item intentionally left beyond the ledger: a **WASM browser front end** (the compute core is already wasm-clean — `CP-PLAT.3`). M3+ breadth (dataflow patcher, custom-board manifests, HDL-lite, guided lessons) is the next horizon.
