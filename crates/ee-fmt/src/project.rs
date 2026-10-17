@@ -529,6 +529,109 @@ mod tests {
         assert_eq!(save(&back), text);
     }
 
+    /// The controlled-source and transistor encodings round-trip: kind
+    /// discriminant, gain/transresistance (exact `f64`), the case-sensitive
+    /// control reference, and transistor polarity all survive save→load, and a
+    /// second save is byte-identical. (Transistor *model params* default on load
+    /// by documented design, so this checks the discriminant + polarity, not the
+    /// Ebers–Moll/level-1 coefficients.)
+    #[test]
+    fn round_trip_preserves_controlled_sources_and_transistors() {
+        let mut c = Circuit::new("controlled + active");
+        let a = c.new_net();
+        let b = c.new_net();
+        let ctrlp = c.new_net();
+        let ctrln = c.new_net();
+        // Awkward gains to prove exact f64 round-trip (not just round numbers).
+        c.add_part(
+            "E1",
+            PartKind::Vcvs(1.0 / 3.0),
+            None,
+            vec![a, b, ctrlp, ctrln],
+        );
+        c.add_part("G1", PartKind::Vccs(-2.5), None, vec![a, b, ctrlp, ctrln]);
+        c.add_part(
+            "H1",
+            PartKind::Ccvs(2000.0, "Vsense".into()),
+            None,
+            vec![a, b],
+        );
+        c.add_part(
+            "F1",
+            PartKind::Cccs(0.75, "Vsense".into()),
+            None,
+            vec![a, b],
+        );
+        c.add_part(
+            "Q1",
+            PartKind::Bjt(Polarity::N, BjtModel::default()),
+            None,
+            vec![a, b, ctrln],
+        );
+        c.add_part(
+            "Q2",
+            PartKind::Bjt(Polarity::P, BjtModel::default()),
+            None,
+            vec![a, b, ctrln],
+        );
+        c.add_part(
+            "M1",
+            PartKind::Mosfet(Polarity::N, MosfetModel::default()),
+            None,
+            vec![a, b, ctrln],
+        );
+        c.add_part(
+            "M2",
+            PartKind::Mosfet(Polarity::P, MosfetModel::default()),
+            None,
+            vec![a, b, ctrln],
+        );
+
+        let text = save(&c);
+        let back = load(&text).unwrap();
+        assert_eq!(back.parts().len(), c.parts().len());
+
+        // Exact kind reconstruction, including gains and control references.
+        let e1 = &back.part_by_ref("E1").unwrap().kind;
+        assert!(matches!(e1, PartKind::Vcvs(g) if *g == 1.0 / 3.0), "{e1:?}");
+        let g1 = &back.part_by_ref("G1").unwrap().kind;
+        assert!(matches!(g1, PartKind::Vccs(g) if *g == -2.5), "{g1:?}");
+        let h1 = &back.part_by_ref("H1").unwrap().kind;
+        assert!(
+            matches!(h1, PartKind::Ccvs(r, ctrl) if *r == 2000.0 && ctrl == "Vsense"),
+            "{h1:?}"
+        );
+        let f1 = &back.part_by_ref("F1").unwrap().kind;
+        assert!(
+            matches!(f1, PartKind::Cccs(f, ctrl) if *f == 0.75 && ctrl == "Vsense"),
+            "{f1:?}"
+        );
+        // Transistor discriminant + polarity survive.
+        assert!(matches!(
+            back.part_by_ref("Q1").unwrap().kind,
+            PartKind::Bjt(Polarity::N, _)
+        ));
+        assert!(matches!(
+            back.part_by_ref("Q2").unwrap().kind,
+            PartKind::Bjt(Polarity::P, _)
+        ));
+        assert!(matches!(
+            back.part_by_ref("M1").unwrap().kind,
+            PartKind::Mosfet(Polarity::N, _)
+        ));
+        assert!(matches!(
+            back.part_by_ref("M2").unwrap().kind,
+            PartKind::Mosfet(Polarity::P, _)
+        ));
+
+        // The VCVS's four terminals and control nets survive as distinct nets.
+        let e1p = back.part_by_ref("E1").unwrap();
+        assert_eq!(e1p.terminals.len(), 4, "VCVS keeps its 4 terminals");
+
+        // Idempotent: re-saving the reloaded circuit is byte-identical.
+        assert_eq!(save(&back), text);
+    }
+
     #[test]
     fn exact_float_round_trip_for_awkward_magnitudes() {
         // Values that are not round decimals must come back bit-for-bit.

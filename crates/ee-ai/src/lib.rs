@@ -6,7 +6,9 @@
 //! before presenting them. Nothing is applied without user approval. Offline
 //! mode falls back to deterministic heuristics + a local parts index.
 //!
-//! See docs/AI.md for the full design (tools, verification loop, guardrails).
+//! See docs/AI.md for the full design (tools, verification loop, guardrails),
+//! and `docs/guide/ai-copilot.md` for a usage guide with worked, stub-model
+//! walkthroughs of each mode (Ask, Design, Debug, Firmware).
 //!
 //! ## This checkpoint (CP-AF-M1.2): the Claude client
 //!

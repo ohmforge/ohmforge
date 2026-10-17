@@ -1,0 +1,5 @@
+!ee-project v1
+.name rc-lowpass
+V1 V 5V n1 gnd
+R1 R 1000Ω n1 n2
+C1 C 0.000001F n2 gnd
