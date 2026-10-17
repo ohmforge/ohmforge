@@ -20,6 +20,13 @@ pub mod boundary;
 pub mod cortexm;
 pub mod pin;
 
+/// External-toolchain compile orchestration (`.ino`/`.c` → HEX → emulator).
+///
+/// Opt-in behind the `toolchain` cargo feature and excluded on `wasm32`, so the
+/// default build and tests need no external compiler. See the module docs.
+#[cfg(all(feature = "toolchain", not(target_arch = "wasm32")))]
+pub mod toolchain;
+
 pub use boundary::{InputThresholds, OutputDrive, Thevenin};
 pub use pin::{PinDrive, PinId, PinIo};
 
