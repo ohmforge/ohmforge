@@ -16,8 +16,11 @@
 //! [`McuCore`] trait and an instruction-stepping [`avr`] core.
 
 pub mod avr;
+pub mod boundary;
+pub mod cortexm;
 pub mod pin;
 
+pub use boundary::{InputThresholds, OutputDrive, Thevenin};
 pub use pin::{PinDrive, PinId, PinIo};
 
 /// A microcontroller core the emulator can run.

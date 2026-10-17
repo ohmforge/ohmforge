@@ -42,6 +42,25 @@ impl BoardDef {
             pins,
         }
     }
+
+    /// The Raspberry Pi Pico (RP2040 / Cortex-M0+) manifest: GP0..GP28 mapped to
+    /// the SIO GPIO bits (the GP number is the GPIO number), plus the on-board
+    /// LED on GP25. The runnable core + pin resolution lives in `ee-mcu`'s
+    /// `cortexm::board::Pico`; this manifest is the catalog entry.
+    pub fn pico() -> Self {
+        let mut pins = Vec::new();
+        // GP0..GP28 → GPIO0..GPIO28 (the GP number is the GPIO number).
+        for gp in 0u8..=28 {
+            pins.push(format!("GP{gp}=GPIO{gp}"));
+        }
+        // The on-board LED (GP25) under its friendly name, too.
+        pins.push("LED=GPIO25".to_string());
+        Self {
+            model: "pico".to_string(),
+            mcu: "rp2040".to_string(),
+            pins,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -55,5 +74,15 @@ mod tests {
         assert!(uno.pins.contains(&"D13=PB5".to_string()));
         assert!(uno.pins.contains(&"A0=PC0".to_string()));
         assert_eq!(uno.pins.len(), 14 + 6);
+    }
+
+    #[test]
+    fn pico_manifest_maps_the_led_pin() {
+        let pico = BoardDef::pico();
+        assert_eq!(pico.mcu, "rp2040");
+        assert!(pico.pins.contains(&"GP25=GPIO25".to_string()));
+        assert!(pico.pins.contains(&"LED=GPIO25".to_string()));
+        assert!(pico.pins.contains(&"GP0=GPIO0".to_string()));
+        assert_eq!(pico.pins.len(), 29 + 1);
     }
 }

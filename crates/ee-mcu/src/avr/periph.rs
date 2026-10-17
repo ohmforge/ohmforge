@@ -35,7 +35,9 @@
 //!   the configured baud (frame time derived from `UBRR0`, `U2X0`, data/stop/
 //!   parity bits) and captured for inspection. RX is a minimal stub.
 
+use crate::boundary::{InputThresholds, OutputDrive, Thevenin};
 use crate::pin::{PinDrive, PinId, PinIo};
+use ee_digital::Logic;
 
 /// A general-purpose I/O port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,12 +55,6 @@ const PORTS: [Port; 3] = [Port::B, Port::C, Port::D];
 
 /// Number of pins in the ATmega328P [`PinIo`] exchange: three 8-bit ports.
 pub const PIN_COUNT: usize = PORTS.len() * 8;
-
-/// Digital-input logic threshold, in volts: an input voltage at or above this
-/// reads as a logic high. A fixed mid-supply (Vcc/2) threshold for now;
-/// configurable per-pin thresholds arrive with the mixed-signal boundary
-/// (`CP-BRD-M2.2`).
-const LOGIC_THRESHOLD_V: f64 = 2.5;
 
 /// The flat [`PinId`] index for `port` pin `bit`: `port * 8 + bit`.
 pub fn pin_id(port: Port, bit: u8) -> PinId {
@@ -682,6 +678,10 @@ pub struct Peripherals {
     timer1: Timer16,
     adc: Adc,
     usart: Usart,
+    /// Digital-input boundary: how a sampled node voltage becomes a logic level.
+    thresholds: InputThresholds,
+    /// Digital-output boundary: how a driven pin becomes a Thévenin source.
+    drive: OutputDrive,
 }
 
 impl Peripherals {
@@ -690,6 +690,8 @@ impl Peripherals {
         Self {
             usart: Usart::default(),
             adc: Adc::default(),
+            thresholds: InputThresholds::default(),
+            drive: OutputDrive::default(),
             ..Default::default()
         }
     }
@@ -743,19 +745,61 @@ impl Peripherals {
     }
 
     /// Sample the co-sim exchange's input voltages into the peripherals: each
-    /// pin's voltage feeds the digital-input level (via `LOGIC_THRESHOLD_V`),
-    /// and each Port C pin additionally feeds its ADC channel. Called at the top
-    /// of a co-sim step.
+    /// pin's voltage resolves to a digital-input level through the configurable
+    /// [`InputThresholds`] (with hysteresis — the pin's current level is the
+    /// held state for a voltage inside the band), and each Port C pin
+    /// additionally feeds its ADC channel. Called at the top of a co-sim step.
     pub fn sample_inputs(&mut self, io: &PinIo) {
         for &port in &PORTS {
             for bit in 0..8u8 {
                 let v = io.input(pin_id(port, bit));
-                self.set_pin_input(port, bit, v >= LOGIC_THRESHOLD_V);
+                // The input's last settled level is the hysteresis memory: a
+                // voltage inside the band holds it rather than chattering.
+                let previous = if self.port(port).pin_ext & (1 << bit) != 0 {
+                    Logic::High
+                } else {
+                    Logic::Low
+                };
+                match self.thresholds.resolve(v, previous) {
+                    Logic::High => self.set_pin_input(port, bit, true),
+                    Logic::Low => self.set_pin_input(port, bit, false),
+                    // Unknown/floating in the band with no history: leave the
+                    // externally driven level untouched.
+                    _ => {}
+                }
                 if port == Port::C {
                     self.set_adc_input(bit, v);
                 }
             }
         }
+    }
+
+    /// The digital-input thresholds this core samples node voltages through.
+    pub fn input_thresholds(&self) -> InputThresholds {
+        self.thresholds
+    }
+
+    /// Configure the digital-input thresholds (logic-low/high + hysteresis band).
+    pub fn set_input_thresholds(&mut self, thresholds: InputThresholds) {
+        self.thresholds = thresholds;
+    }
+
+    /// The output-drive characteristics driven pins present to the circuit.
+    pub fn output_drive(&self) -> OutputDrive {
+        self.drive
+    }
+
+    /// Configure the output-drive characteristics (rail, source/sink R, slew).
+    pub fn set_output_drive(&mut self, drive: OutputDrive) {
+        self.drive = drive;
+    }
+
+    /// The Thévenin source `port` pin `bit` presents to its node this step
+    /// (open-circuit voltage + series resistance), or `None` for a
+    /// high-impedance pin. The co-sim loop stamps this onto the node instead of
+    /// the ideal rail the M2.1 bridge used.
+    pub fn pin_thevenin(&self, port: Port, bit: u8) -> Option<Thevenin> {
+        self.drive.thevenin(self.pin_drive(port, bit))
     }
 
     /// Publish each pin's drive into the co-sim exchange's *out* half. Called at
@@ -1131,6 +1175,47 @@ mod tests {
         io.set_input(pin_id(Port::C, 0), 1.0);
         p.sample_inputs(&io);
         assert!(!p.pin(Port::C, 0), "1.0 V reads as logic low");
+    }
+
+    #[test]
+    fn configurable_thresholds_with_hysteresis_sample_via_pin_io() {
+        use crate::boundary::InputThresholds;
+        let mut p = Peripherals::new();
+        p.set_input_thresholds(InputThresholds::with_hysteresis(2.0, 3.0));
+        let mut io = PinIo::new(PIN_COUNT);
+        let c0 = pin_id(Port::C, 0);
+
+        // Start low, raise into the band: must hold low until it clears V_IH.
+        io.set_input(c0, 2.5);
+        p.sample_inputs(&io);
+        assert!(!p.pin(Port::C, 0), "in-band from low holds low");
+        io.set_input(c0, 3.0);
+        p.sample_inputs(&io);
+        assert!(p.pin(Port::C, 0), "clears V_IH → high");
+        // Fall back into the band: holds high until it drops under V_IL.
+        io.set_input(c0, 2.5);
+        p.sample_inputs(&io);
+        assert!(p.pin(Port::C, 0), "in-band from high holds high");
+        io.set_input(c0, 1.9);
+        p.sample_inputs(&io);
+        assert!(!p.pin(Port::C, 0), "drops under V_IL → low");
+    }
+
+    #[test]
+    fn pin_thevenin_sags_under_load() {
+        use crate::boundary::OutputDrive;
+        let mut p = Peripherals::new();
+        p.set_output_drive(OutputDrive::push_pull(5.0, 100.0));
+        // Drive PB5 high.
+        p.write(DDRB, 1 << 5);
+        p.write(PORTB, 1 << 5);
+        let th = p.pin_thevenin(Port::B, 5).expect("driven pin has a source");
+        assert_eq!(th.v_oc, 5.0);
+        assert_eq!(th.r, 100.0);
+        // Into a 100 Ω load the delivered voltage sags to 2.5 V.
+        assert!((th.delivered_into(100.0) - 2.5).abs() < 1e-9);
+        // An input pin presents no source.
+        assert_eq!(p.pin_thevenin(Port::C, 0), None);
     }
 
     #[test]
