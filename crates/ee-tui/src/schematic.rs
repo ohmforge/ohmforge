@@ -115,6 +115,7 @@ fn kind_label(kind: &PartKind) -> &str {
         PartKind::Inductor => "Inductor",
         PartKind::VoltageSource => "V-source",
         PartKind::CurrentSource => "I-source",
+        PartKind::Diode => "Diode",
         PartKind::Other(name) => name,
     }
 }

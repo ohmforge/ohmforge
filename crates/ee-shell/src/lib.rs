@@ -357,6 +357,7 @@ fn classify(reference: &str) -> Result<(PartKind, Unit), ShellError> {
         'L' => (PartKind::Inductor, Unit::Henry),
         'V' => (PartKind::VoltageSource, Unit::Volt),
         'I' => (PartKind::CurrentSource, Unit::Ampere),
+        'D' => (PartKind::Diode, Unit::Ampere), // value (if given) = saturation current Is
         other => return Err(ShellError::UnknownPartKind(other)),
     })
 }
@@ -374,6 +375,7 @@ fn kind_label(kind: &PartKind) -> &str {
         PartKind::Inductor => "inductor",
         PartKind::VoltageSource => "source",
         PartKind::CurrentSource => "current source",
+        PartKind::Diode => "diode",
         PartKind::Other(name) => name,
     }
 }

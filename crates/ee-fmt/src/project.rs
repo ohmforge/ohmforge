@@ -297,6 +297,7 @@ fn take_kind(rest: &str) -> Result<(PartKind, &str), ErrorKind> {
         "L" => PartKind::Inductor,
         "V" => PartKind::VoltageSource,
         "I" => PartKind::CurrentSource,
+        "D" => PartKind::Diode,
         _ => return Err(ErrorKind::UnknownKind(tok.to_string())),
     };
     Ok((kind, remainder))
@@ -350,6 +351,7 @@ fn write_kind(kind: &PartKind) -> String {
         PartKind::Inductor => "L".to_string(),
         PartKind::VoltageSource => "V".to_string(),
         PartKind::CurrentSource => "I".to_string(),
+        PartKind::Diode => "D".to_string(),
         PartKind::Other(name) => format!("other({name})"),
     }
 }
@@ -581,6 +583,7 @@ R3 R 1k a ground
             PartKind::Inductor => "L".into(),
             PartKind::VoltageSource => "V".into(),
             PartKind::CurrentSource => "I".into(),
+            PartKind::Diode => "D".into(),
             PartKind::Other(n) => format!("other:{n}"),
         }
     }

@@ -333,9 +333,11 @@ pub fn export(circuit: &Circuit) -> String {
     out
 }
 
-/// Whether a part kind maps onto the R/C/L/V/I SPICE subset.
+/// Whether a part kind maps onto the R/C/L/V/I SPICE subset. Diodes need a
+/// `.model` card (CP-SIM-M1.2+), so they're skipped here rather than emitted as
+/// an unparseable line.
 fn is_exportable(kind: &PartKind) -> bool {
-    !matches!(kind, PartKind::Other(_))
+    !matches!(kind, PartKind::Other(_) | PartKind::Diode)
 }
 
 /// The node name for a resolved net: `0` for ground, else `n<id>`.
@@ -606,6 +608,7 @@ R2 mid 0   1k
             PartKind::Inductor => "L".into(),
             PartKind::VoltageSource => "V".into(),
             PartKind::CurrentSource => "I".into(),
+            PartKind::Diode => "D".into(),
             PartKind::Other(n) => format!("other:{n}"),
         }
     }
