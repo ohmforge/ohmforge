@@ -220,13 +220,35 @@ fn classify(samples: &[f64]) -> VarKind {
     }
 }
 
-/// A VCD variable: its dump kind, its one-character identifier code, and the
-/// real samples backing it (VCD only dumps real time-series).
+/// A VCD variable: its dump kind, its identifier code, and the real samples
+/// backing it (VCD only dumps real time-series).
 struct VcdVar<'a> {
     kind: VarKind,
-    id: char,
+    id: String,
     name: &'a str,
     samples: &'a [f64],
+}
+
+/// The VCD identifier code for the var at 0-based `index`. VCD identifiers are
+/// one or more characters from the printable-ASCII range `!`(0x21)..=`~`(0x7e);
+/// this is a little-endian base-94 encoding of `index`, so **any** number of
+/// vars gets a distinct, printable id. The first 94 vars are single characters
+/// (`!`, `"`, `#`, …), so small dumps are unchanged; var 94 is the first
+/// two-character id. (A plain `b'!'..` counter would emit non-printable bytes
+/// past 94 vars and overflow its `u8` past 223 — neither is a valid VCD.)
+fn vcd_id(index: usize) -> String {
+    const FIRST: u8 = b'!'; // 0x21
+    const BASE: usize = (b'~' - b'!' + 1) as usize; // 94 printable codes
+    let mut n = index;
+    let mut id = String::new();
+    loop {
+        id.push((FIRST + (n % BASE) as u8) as char);
+        n /= BASE;
+        if n == 0 {
+            break;
+        }
+    }
+    id
 }
 
 /// Export `signals` to a well-formed VCD. See the module docs; complex signals
@@ -240,10 +262,10 @@ struct VcdVar<'a> {
 pub fn to_vcd(signals: &[Signal]) -> Result<String, WaveformError> {
     let axis = common_axis(signals)?;
 
-    // Collect real-backed vars, rejecting complex (AC) signals. VCD identifier
-    // codes start at the printable byte 0x21 (`!`) and run one per var.
+    // Collect real-backed vars, rejecting complex (AC) signals. Each var gets a
+    // distinct printable-ASCII identifier code via [`vcd_id`].
     let mut vars: Vec<VcdVar> = Vec::with_capacity(signals.len());
-    for (id, s) in (b'!'..).zip(signals.iter()) {
+    for (index, s) in signals.iter().enumerate() {
         let samples = match &s.y {
             SignalData::Real(v) => v.as_slice(),
             SignalData::Complex(_) => {
@@ -254,7 +276,7 @@ pub fn to_vcd(signals: &[Signal]) -> Result<String, WaveformError> {
         };
         vars.push(VcdVar {
             kind: classify(samples),
-            id: id as char,
+            id: vcd_id(index),
             name: &s.name,
             samples,
         });
@@ -299,7 +321,7 @@ pub fn to_vcd(signals: &[Signal]) -> Result<String, WaveformError> {
             let val = v.samples[i];
             let changed = i == 0 || v.samples[i - 1] != val;
             if changed {
-                changes.push_str(&dump_value(v.kind, val, v.id));
+                changes.push_str(&dump_value(v.kind, val, &v.id));
                 changes.push('\n');
             }
         }
@@ -314,7 +336,7 @@ pub fn to_vcd(signals: &[Signal]) -> Result<String, WaveformError> {
 
 /// Format one value-change record for a var: `r<value> <id>` for analog, or the
 /// bit glued to the id (`1<id>`/`0<id>`) for digital.
-fn dump_value(kind: VarKind, value: f64, id: char) -> String {
+fn dump_value(kind: VarKind, value: f64, id: &str) -> String {
     match kind {
         VarKind::Analog => format!("r{value} {id}"),
         VarKind::Digital => format!("{}{id}", if value != 0.0 { '1' } else { '0' }),
@@ -562,6 +584,58 @@ time_s,v(out),i(R1)
             WaveformError::ComplexInVcd {
                 signal: "v(out)".into()
             }
+        );
+    }
+
+    /// Regression: many signals must still produce a well-formed VCD. A plain
+    /// `b'!'..` id counter emitted non-printable bytes past 94 vars and panicked
+    /// (`u8` overflow) past 223; [`vcd_id`] encodes base-94 so every identifier
+    /// stays printable ASCII and unique, for any count.
+    #[test]
+    fn vcd_identifiers_stay_printable_and_unique_for_many_signals() {
+        let x = vec![0.0, 1e-3];
+        let signals: Vec<Signal> = (0..300)
+            .map(|i| Signal::time(format!("s{i}"), Unit::Volt, x.clone(), vec![0.0, 1.0]))
+            .collect();
+
+        // No panic, and a structurally well-formed dump.
+        let vcd = to_vcd(&signals).expect("300 signals export without panicking");
+        let _ = assert_well_formed_vcd(&vcd);
+
+        // Every declared identifier is non-empty, printable ASCII (0x21..=0x7e),
+        // and distinct across all 300 vars.
+        let mut ids = std::collections::HashSet::new();
+        let mut var_lines = 0;
+        for line in vcd.lines() {
+            if let Some(rest) = line.strip_prefix("$var ") {
+                var_lines += 1;
+                let id = rest.split_whitespace().nth(2).expect("$var has an id");
+                assert!(!id.is_empty(), "identifier is non-empty");
+                assert!(
+                    id.chars().all(|c| ('!'..='~').contains(&c)),
+                    "identifier {id:?} is printable ASCII"
+                );
+                assert!(ids.insert(id.to_string()), "identifier {id:?} is unique");
+            }
+        }
+        assert_eq!(var_lines, 300, "every signal declared a var");
+    }
+
+    /// The base-94 identifier encoding: the first 94 vars are single printable
+    /// characters (back-compatible with the old counter) and var 94 rolls over
+    /// to the first two-character id — all distinct.
+    #[test]
+    fn vcd_id_is_backward_compatible_base94() {
+        assert_eq!(vcd_id(0), "!");
+        assert_eq!(vcd_id(1), "\"");
+        assert_eq!(vcd_id(93), "~");
+        // 94 distinct single chars, then two-char ids with no collision.
+        let all: std::collections::HashSet<String> = (0..1000).map(vcd_id).collect();
+        assert_eq!(all.len(), 1000, "every index maps to a distinct id");
+        assert_eq!(
+            vcd_id(94).chars().count(),
+            2,
+            "var 94 is the first 2-char id"
         );
     }
 

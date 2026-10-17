@@ -470,6 +470,55 @@ R2 mid 0   1k
         assert!(spice_magnitude("").is_none());
     }
 
+    /// The `m`-vs-`meg` gotcha, both directions. On import `m` is milli and `meg`
+    /// is mega (case-insensitively), a 1e9 apart. On export we sidestep the trap
+    /// entirely by writing a plain base-SI decimal (never a suffix), so a
+    /// milliohm and a megohm both survive the round-trip unambiguously.
+    #[test]
+    fn milli_versus_mega_round_trips_without_suffix_ambiguity() {
+        // Import: `m` and `meg` are a billion apart.
+        let c = import("t\nR1 a 0 1m\nR2 a 0 1meg\n.end").unwrap();
+        assert_eq!(
+            c.part_by_ref("R1")
+                .unwrap()
+                .value
+                .as_ref()
+                .unwrap()
+                .magnitude,
+            1e-3
+        );
+        assert_eq!(
+            c.part_by_ref("R2")
+                .unwrap()
+                .value
+                .as_ref()
+                .unwrap()
+                .magnitude,
+            1e6
+        );
+
+        // Export writes plain decimals (no `m`/`meg`), so re-import is exact.
+        let deck = export(&c);
+        assert!(
+            deck.contains("R1 a 0 0.001\n") || deck.contains(" 0.001\n"),
+            "{deck}"
+        );
+        assert!(deck.contains(" 1000000\n"), "{deck}");
+        assert!(
+            !deck.to_lowercase().contains("meg"),
+            "export avoids suffixes: {deck}"
+        );
+        let back = import(&deck).unwrap();
+        assert_eq!(
+            back.part_by_ref("R1").unwrap().value,
+            c.part_by_ref("R1").unwrap().value
+        );
+        assert_eq!(
+            back.part_by_ref("R2").unwrap().value,
+            c.part_by_ref("R2").unwrap().value
+        );
+    }
+
     /// Build a circuit exercising every exportable kind plus a shared node and a
     /// `wire()`-merged net, to prove topology survives the round-trip.
     fn sample() -> Circuit {
