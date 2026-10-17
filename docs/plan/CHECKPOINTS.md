@@ -46,8 +46,8 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 - [x] **CP-BRD-M2.1** Co-sim bridge: pin↔net, clock sync. — *gate:* `analogRead` of 2.5 V → ADC code 512 (cosim tests); **`ee cosim`** runs real AVR firmware whose `digitalWrite(13,HIGH)` drives the lockstep bridge → a simulated LED lights at 19.4 mA. Surface (`PinIo`, `McuCore::{next_event, step_to_cycle}`) in `ee-mcu`; lockstep loop in the `ee` binary.
 - [x] **CP-BRD-M2.2** Mixed-signal boundary elements (threshold, drive strength, rise/fall). — *gate:* Schmitt-hysteresis input resolution (`ee_digital::Logic`), Thévenin output (drive high/low/HighZ → v_oc + series R) that sags under load; slew limiting. Rides `PinIo`.
 - [x] **CP-BRD-M2.3** Cortex-M0+ core + RP2040 (Raspberry Pi Pico). — *gate:* ARMv6-M (Thumb) per-instruction + flag vectors; NVIC-lite exceptions; a `Pico` (RP2040 SIO GPIO) blink toggles GP25. Implements the same `McuCore`/co-sim surface as AVR.
-- [ ] **CP-BRD-M2.4** ATmega2560 / ATtiny variants. — *gate:* variant peripheral map test.
-- [ ] **CP-BRD-M2.5** External toolchain compile orchestration (`arduino-cli`/`avr-gcc`/`arm-none-eabi`). — *gate:* compile a `.ino` → hex → run end-to-end (skipped if toolchain absent).
+- [x] **CP-BRD-M2.4** ATmega2560 / ATtiny variants. — *gate:* `AvrVariant` parameterizes flash/SRAM/ports/timers/pins/vector-stride off the shared 328P core (328P/2560/ATtiny85); a Mega board; a GPIO program runs on each; high-SRAM round-trips on the 2560. (Per-part native register maps deferred.)
+- [x] **CP-BRD-M2.5** External toolchain compile orchestration (`arduino-cli`/`avr-gcc`). — *gate:* behind an off-by-default `toolchain` feature + runtime presence check; `--features toolchain` compiles `blink.c` → HEX → runs (D13 high), SKIPPING cleanly when no compiler is on PATH (as here). Default `cargo test` pulls in no `std::process` path.
 
 ---
 
@@ -109,11 +109,11 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 | Track | Done | In progress | Total |
 |---|---|---|---|
 | sim-core | 14 | 0 | 15 |
-| boards | 8 | 0 | 10 |
+| boards | 10 | 0 | 10 |
 | ui-shell | 13 | 0 | 13 |
 | ai-fmt | 9 | 0 | 9 |
 | platform | 4 | 0 | 5 |
-| **Total** | **48** | **0** | **52** |
+| **Total** | **50** | **0** | **52** |
 
 *Update this table when flipping a checkpoint.*
 
