@@ -43,6 +43,25 @@ pub enum PartKind {
     /// (`N`) or PMOS (`P`). Carries its own [`MosfetModel`] parameters.
     /// (`CP-SIM-M1.2`.)
     Mosfet(Polarity, MosfetModel),
+    /// Voltage-controlled voltage source (VCVS), gain `E` (V/V). Terminals are
+    /// `[out+, out−, ctrl+, ctrl−]`; it drives `V(out+) − V(out−) = E·(V(ctrl+)
+    /// − V(ctrl−))`. The building block for an ideal op-amp. (`CP-SIM-M2.3`.)
+    Vcvs(f64),
+    /// Voltage-controlled current source (VCCS), transconductance `G` (A/V).
+    /// Terminals are `[out+, out−, ctrl+, ctrl−]`; it pushes a current `G·(V(ctrl+)
+    /// − V(ctrl−))` through the output, flowing `out+ → out−` inside the source.
+    /// (`CP-SIM-M2.3`.)
+    Vccs(f64),
+    /// Current-controlled voltage source (CCVS), transresistance `R` (V/A).
+    /// Terminals are `[out+, out−]`; the controlling current is sensed through the
+    /// named voltage source's branch (a 0 V sense source is the usual idiom),
+    /// driving `V(out+) − V(out−) = R·I(ctrl)`. (`CP-SIM-M2.3`.)
+    Ccvs(f64, String),
+    /// Current-controlled current source (CCCS), current gain `F` (A/A). Terminals
+    /// are `[out+, out−]`; the controlling current is sensed through the named
+    /// voltage source's branch, and `F·I(ctrl)` flows `out+ → out−` inside the
+    /// source. (`CP-SIM-M2.3`.)
+    Cccs(f64, String),
     /// Anything not yet modeled natively, identified by name.
     Other(String),
 }

@@ -78,6 +78,10 @@ pub enum SimError {
     NonConvergence(usize),
     /// A sweep names a part reference that is not in the circuit.
     UnknownPart(String),
+    /// A current-controlled source (CCVS/CCCS) names a controlling element that is
+    /// absent, or is not a branch-carrying voltage source whose current we can
+    /// sense. Carries the offending reference.
+    BadControl(String),
 }
 
 impl fmt::Display for SimError {
@@ -102,6 +106,10 @@ impl fmt::Display for SimError {
                 )
             }
             SimError::UnknownPart(r) => write!(f, "no part named {r} to sweep"),
+            SimError::BadControl(r) => write!(
+                f,
+                "controlled source references {r}, which is not a current-sensing voltage source"
+            ),
         }
     }
 }
@@ -158,7 +166,11 @@ fn validate(circuit: &Circuit) -> Result<(), SimError> {
             | PartKind::CurrentSource
             | PartKind::Diode
             | PartKind::Bjt(..)
-            | PartKind::Mosfet(..) => {}
+            | PartKind::Mosfet(..)
+            | PartKind::Vcvs(..)
+            | PartKind::Vccs(..)
+            | PartKind::Ccvs(..)
+            | PartKind::Cccs(..) => {}
             PartKind::Other(_) => {
                 return Err(SimError::Unsupported("nonlinear/unknown device (M1)"))
             }
@@ -175,8 +187,16 @@ struct Layout {
     inv: Vec<u32>,
     /// Part indices of the voltage sources (each adds a branch-current row).
     vsources: Vec<usize>,
+    /// Part indices of the VCVS parts. Each, like a voltage source, adds a
+    /// branch-current row — placed right after the voltage-source branches so the
+    /// row layout is identical in the DC, transient, and AC systems.
+    vcvs: Vec<usize>,
+    /// Part indices of the CCVS parts. Each adds a branch-current row, after the
+    /// VCVS branches.
+    ccvs: Vec<usize>,
     /// Part indices of the inductors. At the DC operating point each is a short
-    /// (a 0 V source) and so adds its own branch-current row, after the vsources.
+    /// (a 0 V source) and so adds its own branch-current row, after the
+    /// controlled-source branches.
     inductors: Vec<usize>,
 }
 
@@ -203,17 +223,46 @@ impl Layout {
                 .collect::<Vec<_>>()
         };
         let vsources = kind_indices(|k| matches!(k, PartKind::VoltageSource));
+        let vcvs = kind_indices(|k| matches!(k, PartKind::Vcvs(_)));
+        let ccvs = kind_indices(|k| matches!(k, PartKind::Ccvs(..)));
         let inductors = kind_indices(|k| matches!(k, PartKind::Inductor));
         Self {
             index,
             inv,
             vsources,
+            vcvs,
+            ccvs,
             inductors,
         }
     }
 
     fn n_nodes(&self) -> usize {
         self.inv.len()
+    }
+
+    /// Absolute row index of the first controlled-source branch — right after the
+    /// node block and the voltage-source branches. VCVS branch `e` sits at
+    /// `controlled_base() + e`; CCVS branch `c` at `controlled_base() +
+    /// vcvs.len() + c`. This offset is the same in the DC, transient-step, and AC
+    /// systems, so a controlled source stamps identically in all three.
+    fn controlled_base(&self) -> usize {
+        self.n_nodes() + self.vsources.len()
+    }
+
+    /// Number of branch rows the controlled sources add (one per VCVS and CCVS;
+    /// VCCS/CCCS introduce no new unknown).
+    fn n_controlled_branches(&self) -> usize {
+        self.vcvs.len() + self.ccvs.len()
+    }
+
+    /// Absolute branch-row index of the voltage source named `reference`, used as
+    /// the current-sense branch by a CCVS/CCCS. `None` if no voltage source in the
+    /// circuit carries that reference.
+    fn sense_branch(&self, circuit: &Circuit, reference: &str) -> Option<usize> {
+        self.vsources
+            .iter()
+            .position(|&pi| circuit.parts()[pi].reference == reference)
+            .map(|b| self.n_nodes() + b)
     }
 
     /// Dense index of a net, or `None` for ground (the reference).
@@ -309,6 +358,15 @@ fn terminals3(part: &Part) -> Result<[NetId; 3], SimError> {
     }
 }
 
+/// The four nets a voltage/current-controlled source connects —
+/// `[out+, out−, ctrl+, ctrl−]` — or an error if it is not wired with exactly four.
+fn terminals4(part: &Part) -> Result<[NetId; 4], SimError> {
+    match part.terminals.as_slice() {
+        [a, b, c, d] => Ok([*a, *b, *c, *d]),
+        _ => Err(SimError::WrongTerminals(part.reference.clone())),
+    }
+}
+
 /// Stamp every resistor as a conductance between its nodes.
 fn stamp_resistors(sys: &mut System, circuit: &Circuit, layout: &Layout) -> Result<(), SimError> {
     for part in circuit.parts() {
@@ -386,7 +444,7 @@ fn stamp_inductor_shorts(
     circuit: &Circuit,
     layout: &Layout,
 ) -> Result<(), SimError> {
-    let base = layout.n_nodes() + layout.vsources.len();
+    let base = layout.controlled_base() + layout.n_controlled_branches();
     for (branch, &pi) in layout.inductors.iter().enumerate() {
         let part = &circuit.parts()[pi];
         let (a, b) = terminals2(part)?;
@@ -396,6 +454,146 @@ fn stamp_inductor_shorts(
             base + branch,
             0.0,
         );
+    }
+    Ok(())
+}
+
+/// Stamp every linear controlled (dependent) source into the real system
+/// (`CP-SIM-M2.3`). These are frequency-independent and carry no state, so the
+/// same stamp serves the operating point and each transient step; the AC path has
+/// its complex twin, [`stamp_controlled_sources_complex`].
+///
+/// * **VCVS** (gain `E`): a voltage source on its own branch row `k` constrained
+///   to `V(out+) − V(out−) = E·(V(ctrl+) − V(ctrl−))`. The branch row couples the
+///   control-node columns with `∓E`, on top of the ordinary voltage-source output
+///   coupling.
+/// * **VCCS** (transconductance `G`): four Jacobian entries, no new unknown —
+///   `I = G·(V(ctrl+) − V(ctrl−))` flowing `out+ → out−`.
+/// * **CCVS** (transresistance `R`): like a VCVS, but the branch row couples the
+///   sensed voltage source's branch-current column with `−R`.
+/// * **CCCS** (gain `F`): couples the sensed branch-current column into the output
+///   node rows with `±F`; no new unknown.
+fn stamp_controlled_sources(
+    sys: &mut System,
+    circuit: &Circuit,
+    layout: &Layout,
+) -> Result<(), SimError> {
+    let base = layout.controlled_base();
+    let node = |net| layout.node_of(circuit, net);
+
+    // VCVS: output branch like a voltage source, plus the control coupling.
+    for (e, &pi) in layout.vcvs.iter().enumerate() {
+        let part = &circuit.parts()[pi];
+        let PartKind::Vcvs(gain) = part.kind else {
+            unreachable!("layout.vcvs holds only VCVS parts")
+        };
+        let [outp, outm, cp, cm] = terminals4(part)?;
+        let k = base + e;
+        sys.stamp_vsource(node(outp), node(outm), k, 0.0);
+        sys.stamp_matrix(Some(k), node(cp), -gain);
+        sys.stamp_matrix(Some(k), node(cm), gain);
+    }
+
+    // CCVS: output branch, control coupling onto the sensed branch-current column.
+    for (c, &pi) in layout.ccvs.iter().enumerate() {
+        let part = &circuit.parts()[pi];
+        let PartKind::Ccvs(gain, ctrl) = &part.kind else {
+            unreachable!("layout.ccvs holds only CCVS parts")
+        };
+        let (outp, outm) = terminals2(part)?;
+        let k = base + layout.vcvs.len() + c;
+        let kc = layout
+            .sense_branch(circuit, ctrl)
+            .ok_or_else(|| SimError::BadControl(ctrl.clone()))?;
+        sys.stamp_vsource(node(outp), node(outm), k, 0.0);
+        sys.stamp_matrix(Some(k), Some(kc), -gain);
+    }
+
+    // VCCS and CCCS add no branch row — pure (trans)conductance / coupling entries.
+    for part in circuit.parts() {
+        match &part.kind {
+            PartKind::Vccs(g) => {
+                let [outp, outm, cp, cm] = terminals4(part)?;
+                sys.stamp_matrix(node(outp), node(cp), *g);
+                sys.stamp_matrix(node(outp), node(cm), -*g);
+                sys.stamp_matrix(node(outm), node(cp), -*g);
+                sys.stamp_matrix(node(outm), node(cm), *g);
+            }
+            PartKind::Cccs(f, ctrl) => {
+                let (outp, outm) = terminals2(part)?;
+                let kc = layout
+                    .sense_branch(circuit, ctrl)
+                    .ok_or_else(|| SimError::BadControl(ctrl.clone()))?;
+                sys.stamp_matrix(node(outp), Some(kc), *f);
+                sys.stamp_matrix(node(outm), Some(kc), -*f);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Stamp every controlled source into the complex AC system — the frequency-
+/// independent twin of [`stamp_controlled_sources`]. Each real (trans)conductance
+/// or gain enters as a purely real admittance `g + 0j`, so the dependent sources
+/// are flat with frequency. The branch-row layout matches the real system: in AC
+/// there are no inductor branches, but the controlled branches still sit right
+/// after the voltage-source branches, so [`Layout::controlled_base`] and
+/// [`Layout::sense_branch`] give the same indices here.
+fn stamp_controlled_sources_complex(
+    sys: &mut ComplexSystem,
+    circuit: &Circuit,
+    layout: &Layout,
+) -> Result<(), SimError> {
+    let base = layout.controlled_base();
+    let node = |net| layout.node_of(circuit, net);
+    let re = |x: f64| Complex::new(x, 0.0);
+
+    for (e, &pi) in layout.vcvs.iter().enumerate() {
+        let part = &circuit.parts()[pi];
+        let PartKind::Vcvs(gain) = part.kind else {
+            unreachable!("layout.vcvs holds only VCVS parts")
+        };
+        let [outp, outm, cp, cm] = terminals4(part)?;
+        let k = base + e;
+        sys.stamp_vsource(node(outp), node(outm), k, Complex::ZERO);
+        sys.stamp_matrix(Some(k), node(cp), re(-gain));
+        sys.stamp_matrix(Some(k), node(cm), re(gain));
+    }
+
+    for (c, &pi) in layout.ccvs.iter().enumerate() {
+        let part = &circuit.parts()[pi];
+        let PartKind::Ccvs(gain, ctrl) = &part.kind else {
+            unreachable!("layout.ccvs holds only CCVS parts")
+        };
+        let (outp, outm) = terminals2(part)?;
+        let k = base + layout.vcvs.len() + c;
+        let kc = layout
+            .sense_branch(circuit, ctrl)
+            .ok_or_else(|| SimError::BadControl(ctrl.clone()))?;
+        sys.stamp_vsource(node(outp), node(outm), k, Complex::ZERO);
+        sys.stamp_matrix(Some(k), Some(kc), re(-gain));
+    }
+
+    for part in circuit.parts() {
+        match &part.kind {
+            PartKind::Vccs(g) => {
+                let [outp, outm, cp, cm] = terminals4(part)?;
+                sys.stamp_matrix(node(outp), node(cp), re(*g));
+                sys.stamp_matrix(node(outp), node(cm), re(-*g));
+                sys.stamp_matrix(node(outm), node(cp), re(-*g));
+                sys.stamp_matrix(node(outm), node(cm), re(*g));
+            }
+            PartKind::Cccs(f, ctrl) => {
+                let (outp, outm) = terminals2(part)?;
+                let kc = layout
+                    .sense_branch(circuit, ctrl)
+                    .ok_or_else(|| SimError::BadControl(ctrl.clone()))?;
+                sys.stamp_matrix(node(outp), Some(kc), re(*f));
+                sys.stamp_matrix(node(outm), Some(kc), re(-*f));
+            }
+            _ => {}
+        }
     }
     Ok(())
 }
@@ -885,7 +1083,10 @@ const GMIN_FLOOR: f64 = 1e-12;
 /// gmin = 0) still surfaces as [`SimError::Singular`], and only a genuinely
 /// hopeless nonlinear solve surfaces as [`SimError::NonConvergence`].
 fn solve_dc(circuit: &Circuit, layout: &Layout) -> Result<Vec<f64>, SimError> {
-    let size = layout.n_nodes() + layout.vsources.len() + layout.inductors.len();
+    let size = layout.n_nodes()
+        + layout.vsources.len()
+        + layout.n_controlled_branches()
+        + layout.inductors.len();
     let devices = collect_nonlinear(circuit)?;
     // The linear stamp at source scale `alpha` (1.0 = the real circuit).
     let stamp_at = |sys: &mut System, alpha: f64| -> Result<(), SimError> {
@@ -893,6 +1094,7 @@ fn solve_dc(circuit: &Circuit, layout: &Layout) -> Result<Vec<f64>, SimError> {
         // Operating point: sources at their bias (`None`), scaled for source stepping.
         stamp_vsources(sys, circuit, layout, None, alpha)?;
         stamp_current_sources(sys, circuit, layout, None, alpha)?;
+        stamp_controlled_sources(sys, circuit, layout)?;
         stamp_inductor_shorts(sys, circuit, layout)?;
         Ok(())
     };
@@ -1045,9 +1247,11 @@ struct TransientModel<'a> {
     inds: Vec<(NetId, NetId, f64)>,
     /// Nonlinear devices, re-linearized inside each step's Newton loop.
     devices: Vec<Box<dyn NonlinearDevice>>,
-    /// Node count and voltage-source branch count (the step system is `n + m`).
+    /// Node count and voltage-source branch count. The step system is
+    /// `n + m + cb`, with `cb` the controlled-source (VCVS/CCVS) branch rows.
     n: usize,
     m: usize,
+    cb: usize,
 }
 
 impl<'a> TransientModel<'a> {
@@ -1086,6 +1290,7 @@ impl<'a> TransientModel<'a> {
             devices,
             n: layout.n_nodes(),
             m: layout.vsources.len(),
+            cb: layout.n_controlled_branches(),
         })
     }
 
@@ -1093,14 +1298,16 @@ impl<'a> TransientModel<'a> {
     /// each a 0 V source), inductors open. Returns the node solution and the
     /// initial capacitor voltages (the inductor currents start at 0 A).
     fn initial(&self) -> Result<(Vec<f64>, Vec<f64>), SimError> {
-        let (circuit, layout, n, m) = (self.circuit, self.layout, self.n, self.m);
+        let (circuit, layout, n, m, cb) = (self.circuit, self.layout, self.n, self.m, self.cb);
         let stamp = |sys: &mut System| -> Result<(), SimError> {
             stamp_resistors(sys, circuit, layout)?;
             // t = 0 uses the waveform bias (sine → offset, pulse → v1).
             stamp_vsources(sys, circuit, layout, None, 1.0)?;
             stamp_current_sources(sys, circuit, layout, None, 1.0)?;
+            stamp_controlled_sources(sys, circuit, layout)?;
+            // Capacitor 0 V sources sit on branches past the controlled-source rows.
             for (ci, (a, b, _)) in self.caps.iter().enumerate() {
-                let k = n + m + ci;
+                let k = n + m + cb + ci;
                 sys.stamp_vsource(
                     layout.node_of(circuit, *a),
                     layout.node_of(circuit, *b),
@@ -1113,7 +1320,7 @@ impl<'a> TransientModel<'a> {
         let x0 = solve_nr(
             circuit,
             layout,
-            n + m + self.caps.len(),
+            n + m + cb + self.caps.len(),
             &self.devices,
             &stamp,
             None,
@@ -1149,6 +1356,7 @@ impl<'a> TransientModel<'a> {
             // Sources evaluated at the step's end time.
             stamp_vsources(sys, circuit, layout, Some(t_end), 1.0)?;
             stamp_current_sources(sys, circuit, layout, Some(t_end), 1.0)?;
+            stamp_controlled_sources(sys, circuit, layout)?;
             for (ci, (a, b, c)) in self.caps.iter().enumerate() {
                 let g_eq = c / h;
                 let (ia, ib) = (layout.node_of(circuit, *a), layout.node_of(circuit, *b));
@@ -1167,7 +1375,7 @@ impl<'a> TransientModel<'a> {
         let x = solve_nr(
             circuit,
             layout,
-            self.n + self.m,
+            self.n + self.m + self.cb,
             &self.devices,
             &stamp,
             None,
@@ -1400,7 +1608,9 @@ fn ac(
 
     let n = layout.n_nodes();
     let m = layout.vsources.len();
-    let size = n + m; // inductors are admittances in AC — no branch rows.
+    // Inductors are admittances in AC — no branch rows. Controlled sources keep
+    // their branch rows (VCVS/CCVS), right after the voltage-source branches.
+    let size = n + m + layout.n_controlled_branches();
 
     // Precompute every frequency-independent stamp once.
     // Resistors → real conductance G.
@@ -1519,6 +1729,7 @@ fn ac(
         for &(plus, minus, k, drive) in &vsource_stamps {
             sys.stamp_vsource(plus, minus, k, drive);
         }
+        stamp_controlled_sources_complex(&mut sys, circuit, layout)?;
         for &(a, b) in &csource_drives {
             // 1∠0 from a into b — same direction convention as the DC stamp.
             sys.stamp_current(b, a, Complex::ONE);
@@ -3347,5 +3558,303 @@ mod tests {
             .unwrap_err(),
             SimError::UnknownPart(_)
         ));
+    }
+
+    // --- Controlled (dependent) sources — CP-SIM-M2.3 ----------------------
+
+    #[test]
+    fn vcvs_gain_is_exact_at_the_op_point() {
+        // The acceptance gate: a VCVS with gain 10 reproduces exactly 10× the
+        // sensed input at the operating point. Vin = 1 V on the control port;
+        // E1 drives `out` from `vin` with E = 10 into a 1 kΩ load.
+        let mut c = Circuit::new("vcvs");
+        let vin = c.new_net();
+        let out = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("1", Unit::Volt),
+            vec![vin, NetId::GROUND],
+        );
+        // E1 = [out+, out−, ctrl+, ctrl−]; out = 10·(vin − gnd).
+        c.add_part(
+            "E1",
+            PartKind::Vcvs(10.0),
+            None,
+            vec![out, NetId::GROUND, vin, NetId::GROUND],
+        );
+        c.add_part(
+            "RL",
+            PartKind::Resistor,
+            v("1k", Unit::Ohm),
+            vec![out, NetId::GROUND],
+        );
+
+        let layout = Layout::build(&c);
+        let x = solve_dc(&c, &layout).unwrap();
+        let vo = x[layout.node_of(&c, out).unwrap()];
+        assert!(
+            (vo - 10.0).abs() <= 1e-9,
+            "VCVS output {vo} V, expected 10 V"
+        );
+    }
+
+    #[test]
+    fn vcvs_gain_is_flat_in_ac() {
+        // The same gain-10 stage in AC: a frequency-independent gain, so |H| = 10
+        // (+20 dB) at 0° everywhere in the sweep — the controlled source stamps in
+        // the complex system too.
+        let mut c = Circuit::new("vcvs_ac");
+        let vin = c.new_net();
+        let out = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            None,
+            vec![vin, NetId::GROUND],
+        );
+        c.add_part(
+            "E1",
+            PartKind::Vcvs(10.0),
+            None,
+            vec![out, NetId::GROUND, vin, NetId::GROUND],
+        );
+        c.add_part(
+            "RL",
+            PartKind::Resistor,
+            v("1k", Unit::Ohm),
+            vec![out, NetId::GROUND],
+        );
+        assert!(c.set_waveform(
+            "V1",
+            Waveform::Sine {
+                amplitude: 1.0,
+                freq: 1_000.0,
+                offset: 0.0,
+                phase_deg: 0.0,
+            },
+        ));
+
+        let sigs = Engine::new()
+            .run(
+                &c,
+                &Analysis::Ac {
+                    f_start: 10.0,
+                    f_stop: 1e6,
+                    points_per_decade: 5,
+                },
+            )
+            .unwrap();
+        let name = format!("v(n{})", c.resolve(out).0);
+        let sig = sigs.iter().find(|s| s.name == name).unwrap();
+        for h in sig.complex().unwrap() {
+            assert!(
+                (h.magnitude() - 10.0).abs() <= 1e-6,
+                "|H| = {} not flat at 10",
+                h.magnitude()
+            );
+            assert!(
+                h.phase_deg().abs() <= 1e-6,
+                "phase {}° not 0",
+                h.phase_deg()
+            );
+        }
+    }
+
+    #[test]
+    fn vccs_transconductance_into_a_load() {
+        // A VCCS of G = 10 mA/V driving a 1 kΩ load: Vout = G·Vin·R. With Vin = 2 V
+        // that is 0.010·2·1000 = 20 V. The source pushes its current out+ → out−
+        // inside, so `[gnd, load]` sinks the current into the load node.
+        let mut c = Circuit::new("vccs");
+        let vin = c.new_net();
+        let load = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("2", Unit::Volt),
+            vec![vin, NetId::GROUND],
+        );
+        // G1 = [out+, out−, ctrl+, ctrl−] = [gnd, load, vin, gnd].
+        c.add_part(
+            "G1",
+            PartKind::Vccs(10e-3),
+            None,
+            vec![NetId::GROUND, load, vin, NetId::GROUND],
+        );
+        c.add_part(
+            "RL",
+            PartKind::Resistor,
+            v("1k", Unit::Ohm),
+            vec![load, NetId::GROUND],
+        );
+
+        let layout = Layout::build(&c);
+        let x = solve_dc(&c, &layout).unwrap();
+        let vo = x[layout.node_of(&c, load).unwrap()];
+        let expected = 10e-3 * 2.0 * 1000.0;
+        assert!(
+            (vo - expected).abs() <= 1e-9,
+            "VCCS load {vo} V, expected {expected} V"
+        );
+    }
+
+    #[test]
+    fn ideal_opamp_noninverting_gain() {
+        // The behavioral-modeling payoff: an ideal op-amp is a VCVS with a huge
+        // open-loop gain. In a non-inverting config (Rf from out to the inverting
+        // node, Rg from there to ground) the closed-loop gain is 1 + Rf/Rg.
+        // Rf = 9k, Rg = 1k ⇒ gain 10, so Vin = 1 V → Vout ≈ 10 V.
+        let mut c = Circuit::new("opamp");
+        let vin = c.new_net(); // non-inverting input (V+)
+        let vfb = c.new_net(); // inverting input / feedback node (V−)
+        let vout = c.new_net();
+        c.add_part(
+            "Vin",
+            PartKind::VoltageSource,
+            v("1", Unit::Volt),
+            vec![vin, NetId::GROUND],
+        );
+        // Op-amp: out = A·(V+ − V−), A huge. [out+, out−, ctrl+, ctrl−].
+        c.add_part(
+            "EOP",
+            PartKind::Vcvs(1e6),
+            None,
+            vec![vout, NetId::GROUND, vin, vfb],
+        );
+        c.add_part(
+            "Rf",
+            PartKind::Resistor,
+            v("9k", Unit::Ohm),
+            vec![vout, vfb],
+        );
+        c.add_part(
+            "Rg",
+            PartKind::Resistor,
+            v("1k", Unit::Ohm),
+            vec![vfb, NetId::GROUND],
+        );
+
+        let layout = Layout::build(&c);
+        let x = solve_dc(&c, &layout).unwrap();
+        let vo = x[layout.node_of(&c, vout).unwrap()];
+        // Closed-loop gain 1 + 9k/1k = 10; the finite open-loop gain leaves a
+        // ~1/A·β residual, far inside this tolerance.
+        assert!(
+            (vo - 10.0).abs() <= 1e-2,
+            "non-inverting gain output {vo} V, expected ≈ 10 V"
+        );
+    }
+
+    #[test]
+    fn cccs_mirrors_a_sensed_current() {
+        // Current-controlled current source. A 0 V sense source reads the 1 mA
+        // flowing through R1 (1 V across 1 kΩ); F1 reproduces F·I = 5 mA into a
+        // 1 kΩ load, so Vload = 5 mA·1 kΩ = 5 V.
+        let mut c = Circuit::new("cccs");
+        let a = c.new_net();
+        let b = c.new_net();
+        let load = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("1", Unit::Volt),
+            vec![a, NetId::GROUND],
+        );
+        c.add_part("R1", PartKind::Resistor, v("1k", Unit::Ohm), vec![a, b]);
+        // 0 V sense source: its branch current is the controlling current.
+        c.add_part(
+            "Vsense",
+            PartKind::VoltageSource,
+            v("0", Unit::Volt),
+            vec![b, NetId::GROUND],
+        );
+        // F1 = [out+, out−] = [gnd, load]; current F·I(Vsense) flows into the load.
+        c.add_part(
+            "F1",
+            PartKind::Cccs(5.0, "Vsense".into()),
+            None,
+            vec![NetId::GROUND, load],
+        );
+        c.add_part(
+            "RL",
+            PartKind::Resistor,
+            v("1k", Unit::Ohm),
+            vec![load, NetId::GROUND],
+        );
+
+        let layout = Layout::build(&c);
+        let x = solve_dc(&c, &layout).unwrap();
+        let vo = x[layout.node_of(&c, load).unwrap()];
+        assert!((vo - 5.0).abs() <= 1e-9, "CCCS load {vo} V, expected 5 V");
+    }
+
+    #[test]
+    fn ccvs_transresistance_from_a_sensed_current() {
+        // Current-controlled voltage source. The same 1 mA sensed current drives
+        // H1 with R = 2 kΩ transresistance, so Vout = R·I = 2 kΩ·1 mA = 2 V,
+        // independent of the output load.
+        let mut c = Circuit::new("ccvs");
+        let a = c.new_net();
+        let b = c.new_net();
+        let out = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("1", Unit::Volt),
+            vec![a, NetId::GROUND],
+        );
+        c.add_part("R1", PartKind::Resistor, v("1k", Unit::Ohm), vec![a, b]);
+        c.add_part(
+            "Vsense",
+            PartKind::VoltageSource,
+            v("0", Unit::Volt),
+            vec![b, NetId::GROUND],
+        );
+        // H1 = [out+, out−] = [out, gnd]; V(out) = 2000·I(Vsense).
+        c.add_part(
+            "H1",
+            PartKind::Ccvs(2000.0, "Vsense".into()),
+            None,
+            vec![out, NetId::GROUND],
+        );
+        c.add_part(
+            "RL",
+            PartKind::Resistor,
+            v("1k", Unit::Ohm),
+            vec![out, NetId::GROUND],
+        );
+
+        let layout = Layout::build(&c);
+        let x = solve_dc(&c, &layout).unwrap();
+        let vo = x[layout.node_of(&c, out).unwrap()];
+        assert!((vo - 2.0).abs() <= 1e-9, "CCVS output {vo} V, expected 2 V");
+    }
+
+    #[test]
+    fn controlled_source_with_unknown_control_is_reported() {
+        // A CCCS naming a controlling element that is not a sensing voltage source
+        // surfaces as a clear error, not a panic or a silent drop.
+        let mut c = Circuit::new("bad_ctrl");
+        let out = c.new_net();
+        c.add_part(
+            "F1",
+            PartKind::Cccs(2.0, "Vmissing".into()),
+            None,
+            vec![out, NetId::GROUND],
+        );
+        c.add_part(
+            "RL",
+            PartKind::Resistor,
+            v("1k", Unit::Ohm),
+            vec![out, NetId::GROUND],
+        );
+        let err = Engine::new()
+            .run(&c, &Analysis::OperatingPoint)
+            .unwrap_err();
+        assert!(
+            matches!(err, SimError::BadControl(ref r) if r == "Vmissing"),
+            "expected BadControl, got {err:?}"
+        );
     }
 }
