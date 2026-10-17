@@ -36,7 +36,7 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 ## Track: boards (`ee-digital`, `ee-mcu`, `ee-devices`) → design: [`track-boards.md`](track-boards.md)
 
 ### M1 — digital kernel + AVR
-- [ ] **CP-BRD-M1.1** Event-driven digital kernel (event heap, delays, 0/1/X/Z). — *gate:* a ring oscillator produces the expected period from gate delays.
+- [x] **CP-BRD-M1.1** Event-driven digital kernel (event heap, delays, 0/1/X/Z). — *gate:* a 3-inverter ring oscillates at exactly 2·N·d (60 fs); integer-femtosecond queue with FIFO tie-break (deterministic). Dependency-free + wasm-clean.
 - [ ] **CP-BRD-M1.2** Logic primitives (gates, D/JK flip-flops, counters, mux). — *gate:* truth tables + a counter sequence test.
 - [ ] **CP-BRD-M1.3** AVR core (ATmega328P): decode + execute + interrupts. — *gate:* AVR instruction test-vectors pass.
 - [ ] **CP-BRD-M1.4** AVR peripherals (GPIO, timers/PWM, ADC, UART). — *gate:* measured PWM duty on a pin; UART TX bytes decode correctly.
@@ -109,11 +109,11 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 | Track | Done | In progress | Total |
 |---|---|---|---|
 | sim-core | 5 | 0 | 15 |
-| boards | 0 | 0 | 10 |
+| boards | 1 | 0 | 10 |
 | ui-shell | 5 | 0 | 13 |
 | ai-fmt | 2 | 0 | 9 |
 | platform | 3 | 0 | 5 |
-| **Total** | **15** | **0** | **52** |
+| **Total** | **16** | **0** | **52** |
 
 *Update this table when flipping a checkpoint.*
 
