@@ -45,6 +45,11 @@ fn main() {
         Some("demo") => run_script(&mut Shell::new(), DEMO.lines()),
         Some("bode") => demo_bode(),
         Some("amp") => demo_amp(),
+        Some("tui") => {
+            if let Err(e) = ee_tui::run(Shell::new()) {
+                eprintln!("{RED}tui error:{RESET} {e}");
+            }
+        }
         _ => {
             let mut shell = Shell::new();
             let stdin = io::stdin();
@@ -241,7 +246,7 @@ fn repl(shell: &mut Shell) -> rustyline::Result<()> {
     let _ = rl.load_history(&history);
 
     println!("{DIM}ee-assist — eesh (M1). Tab completes, ↑/↓ history, Ctrl-R search, Ctrl-D quits.{RESET}");
-    println!("{DIM}Try: add R1 in out 1k · probe out · run tran 5m · show · help  (or: ee demo|bode|amp){RESET}\n");
+    println!("{DIM}Try: add R1 in out 1k · probe out · run tran 5m · show · help  (or: ee demo|bode|amp|tui){RESET}\n");
 
     loop {
         match rl.readline(PROMPT) {

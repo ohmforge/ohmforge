@@ -63,8 +63,8 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 - [x] **CP-UX-M1.1** Oscilloscope (multi-channel, edge/level trigger, cursors). — *gate:* `trigger_locks_a_periodic_signal_regardless_of_phase` (3 capture phases → byte-identical golden frame); cursors read Δt/Δv/frequency. Self-contained in `ee-instruments` (no `ee-tui` dep — that cycle is forbidden).
 - [x] **CP-UX-M1.2** Multimeter + function generator + bench PSU panels. — *gate:* DMM reads a node voltage (DC/RMS/Vpp/freq); funcgen's generated sine renders on the scope as a stable frame; PSU CV↔CC crossover. Self-contained in `ee-instruments`. _(Wiring the funcgen into a live circuit source pairs with sim-core's time-varying source — a later integration.)_
 - [x] **CP-UX-M1.3** Live overlay (per-net voltage + color ramp). — *gate:* `nets_are_annotated_with_their_voltage_and_ground_reads_zero` — a divider renders n1=5V, n2=2.5V, gnd=0V on the right rows; 5-band ANSI color ramp with visible-width-correct layout + plain golden snapshot; composes into `Screen`. _(current-flow animation: later.)_
-- [ ] **CP-UX-M1.4** Dockable panels + mouse placement + command palette. — *gate:* interaction/event tests.
-- [ ] **CP-UX-M1.5** Scripting engine (`.eesh`, loops/params) + deterministic replay. — *gate:* a param-sweep script runs and replays identically.
+- [x] **CP-UX-M1.4** Dockable panels + mouse placement + command palette. — *gate:* pure `handle_event` state machine (focus cycle, resize geometry, palette fuzzy-filter, mouse hit-test) — 16 app + 7 crossterm-translation tests, no tty. `ee_tui::run<B: Backend>` thin wrapper; wired to `ee tui`.
+- [x] **CP-UX-M1.5** Scripting engine (`.eesh`, loops/params) + deterministic replay. — *gate:* `param_sweep_runs_and_replays_identically` — `repeat N as win { run tran ${win}m }` runs and `Recording::replay()` reproduces a byte-identical transcript. `Shell::run_script`.
 
 ### M2 — analysis views
 - [ ] **CP-UX-M2.1** Logic analyzer + protocol-decode view (UART/SPI/I²C). — *gate:* decode a known UART capture.
@@ -110,10 +110,10 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 |---|---|---|---|
 | sim-core | 8 | 0 | 15 |
 | boards | 5 | 0 | 10 |
-| ui-shell | 7 | 0 | 13 |
+| ui-shell | 9 | 0 | 13 |
 | ai-fmt | 4 | 0 | 9 |
 | platform | 3 | 0 | 5 |
-| **Total** | **27** | **0** | **52** |
+| **Total** | **29** | **0** | **52** |
 
 *Update this table when flipping a checkpoint.*
 
