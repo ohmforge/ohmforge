@@ -35,6 +35,8 @@
 //!   the configured baud (frame time derived from `UBRR0`, `U2X0`, data/stop/
 //!   parity bits) and captured for inspection. RX is a minimal stub.
 
+use crate::pin::{PinDrive, PinId, PinIo};
+
 /// A general-purpose I/O port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Port {
@@ -44,6 +46,38 @@ pub enum Port {
     C,
     /// Port D (`PIND`/`DDRD`/`PORTD`): Arduino D0..D7.
     D,
+}
+
+/// The three GPIO ports, in [`PinId`] index order (`B`, `C`, `D`).
+const PORTS: [Port; 3] = [Port::B, Port::C, Port::D];
+
+/// Number of pins in the ATmega328P [`PinIo`] exchange: three 8-bit ports.
+pub const PIN_COUNT: usize = PORTS.len() * 8;
+
+/// Digital-input logic threshold, in volts: an input voltage at or above this
+/// reads as a logic high. A fixed mid-supply (Vcc/2) threshold for now;
+/// configurable per-pin thresholds arrive with the mixed-signal boundary
+/// (`CP-BRD-M2.2`).
+const LOGIC_THRESHOLD_V: f64 = 2.5;
+
+/// The flat [`PinId`] index for `port` pin `bit`: `port * 8 + bit`.
+pub fn pin_id(port: Port, bit: u8) -> PinId {
+    PinId::new((port as u16) * 8 + bit as u16)
+}
+
+/// The `(port, bit)` a [`PinId`] addresses, or `None` if it is outside the
+/// ATmega328P's modelled pins.
+pub fn pin_location(id: PinId) -> Option<(Port, u8)> {
+    let idx = id.index() as usize;
+    let port = *PORTS.get(idx / 8)?;
+    Some((port, (idx % 8) as u8))
+}
+
+/// Which timer channel drives an output-compare (PWM) pin.
+#[derive(Debug, Clone, Copy)]
+enum Chan {
+    A,
+    B,
 }
 
 // --- Data-space register addresses (I/O address + 0x20) ---
@@ -233,6 +267,29 @@ impl Timer8 {
         self.oc_a_level = pwm_level(fast_pwm, (self.tccr_a >> 6) & 3, self.tcnt, self.ocr_a);
         self.oc_b_level = pwm_level(fast_pwm, (self.tccr_a >> 4) & 3, self.tcnt, self.ocr_b);
     }
+
+    /// The Fast-PWM duty on `chan` (fraction of the period the pin is high).
+    fn duty(&self, chan: Chan) -> f64 {
+        let (com, compare) = match chan {
+            Chan::A => ((self.tccr_a >> 6) & 3, self.ocr_a),
+            Chan::B => ((self.tccr_a >> 4) & 3, self.ocr_b),
+        };
+        duty_fraction(com, compare as u16, self.top() as u16)
+    }
+
+    /// Cycles until this timer's next modelled event (compare match or
+    /// overflow/wrap), or `None` if it is stopped.
+    fn next_event_in(&self) -> Option<u64> {
+        let div = CS_DIV[(self.tccr_b & 0x07) as usize];
+        if div == 0 {
+            return None;
+        }
+        let top = self.top();
+        let counts = counts_to_wrap(self.tcnt, top)
+            .min(counts_to_match(self.tcnt, self.ocr_a, top))
+            .min(counts_to_match(self.tcnt, self.ocr_b, top));
+        Some(counts as u64 * div as u64 - self.prescale_acc as u64)
+    }
 }
 
 /// The 16-bit Timer/Counter1.
@@ -314,6 +371,28 @@ impl Timer16 {
         self.oc_a_level = pwm_level16(fast_pwm, (self.tccr_a >> 6) & 3, self.tcnt, self.ocr_a, top);
         self.oc_b_level = pwm_level16(fast_pwm, (self.tccr_a >> 4) & 3, self.tcnt, self.ocr_b, top);
     }
+
+    /// The Fast-PWM duty on `chan` (fraction of the period the pin is high).
+    fn duty(&self, chan: Chan) -> f64 {
+        let (com, compare) = match chan {
+            Chan::A => ((self.tccr_a >> 6) & 3, self.ocr_a),
+            Chan::B => ((self.tccr_a >> 4) & 3, self.ocr_b),
+        };
+        duty_fraction(com, compare, self.top())
+    }
+
+    /// Cycles until this timer's next modelled event, or `None` if stopped.
+    fn next_event_in(&self) -> Option<u64> {
+        let div = CS_DIV[(self.tccr_b & 0x07) as usize];
+        if div == 0 {
+            return None;
+        }
+        let top = self.top();
+        let counts = counts_to_wrap16(self.tcnt, top)
+            .min(counts_to_match16(self.tcnt, self.ocr_a, top))
+            .min(counts_to_match16(self.tcnt, self.ocr_b, top));
+        Some(counts * div as u64 - self.prescale_acc as u64)
+    }
 }
 
 /// Fast-PWM output level for an 8-bit timer, given the two `COM` bits.
@@ -343,6 +422,73 @@ fn pwm_level16(fast_pwm: bool, com: u8, count: u16, compare: u16, top: u16) -> O
         2 => Some(high),
         3 => Some(!high),
         _ => None,
+    }
+}
+
+/// Fast-PWM duty (fraction of the period the pin is high) for the given `COM`
+/// bits, compare value and TOP. Non-inverting (`COM == 2`, and any value with an
+/// active output) is `compare / (TOP + 1)`; inverting (`COM == 3`) is the
+/// complement.
+fn duty_fraction(com: u8, compare: u16, top: u16) -> f64 {
+    if top == 0 {
+        return 0.0;
+    }
+    let d = (compare as f64 / (top as f64 + 1.0)).clamp(0.0, 1.0);
+    match com {
+        3 => 1.0 - d,
+        _ => d,
+    }
+}
+
+/// Counts until an 8-bit up-counter at `cnt` (TOP `top`) next wraps through zero.
+fn counts_to_wrap(cnt: u8, top: u8) -> u32 {
+    if cnt >= top {
+        1
+    } else {
+        (top - cnt) as u32 + 1
+    }
+}
+
+/// Counts until an 8-bit up-counter at `cnt` (TOP `top`) next becomes `tgt`, or a
+/// large sentinel if `tgt` lies above TOP and is never reached.
+fn counts_to_match(cnt: u8, tgt: u8, top: u8) -> u32 {
+    if tgt > top {
+        return u32::MAX;
+    }
+    if cnt < top {
+        if tgt > cnt {
+            (tgt - cnt) as u32
+        } else {
+            (top - cnt) as u32 + 1 + tgt as u32
+        }
+    } else {
+        // At or past TOP the next count resets to zero.
+        1 + tgt as u32
+    }
+}
+
+/// [`counts_to_wrap`] for the 16-bit timer.
+fn counts_to_wrap16(cnt: u16, top: u16) -> u64 {
+    if cnt >= top {
+        1
+    } else {
+        (top - cnt) as u64 + 1
+    }
+}
+
+/// [`counts_to_match`] for the 16-bit timer.
+fn counts_to_match16(cnt: u16, tgt: u16, top: u16) -> u64 {
+    if tgt > top {
+        return u64::MAX;
+    }
+    if cnt < top {
+        if tgt > cnt {
+            (tgt - cnt) as u64
+        } else {
+            (top - cnt) as u64 + 1 + tgt as u64
+        }
+    } else {
+        1 + tgt as u64
     }
 }
 
@@ -560,6 +706,87 @@ impl Peripherals {
     /// The resolved logic level on `port` pin `bit`.
     pub fn pin(&self, port: Port, bit: u8) -> bool {
         self.port(port).pin_level(bit)
+    }
+
+    /// What `port` pin `bit` drives out to the circuit (the co-sim exchange's
+    /// *out* half).
+    ///
+    /// A pin configured as an output drives its PORT latch (or, if a timer owns
+    /// it, a PWM waveform). A pin configured as an input drives nothing
+    /// ([`PinDrive::HighZ`]) — it only reads its input voltage. (Input pull-ups
+    /// are left to the mixed-signal boundary at `CP-BRD-M2.2`.)
+    pub fn pin_drive(&self, port: Port, bit: u8) -> PinDrive {
+        let p = self.port(port);
+        if p.ddr & (1 << bit) == 0 {
+            return PinDrive::HighZ;
+        }
+        if let Some(level) = p.oc[bit as usize] {
+            // A timer owns this pin: report its PWM duty alongside the level.
+            let duty = self
+                .oc_duty(port, bit)
+                .unwrap_or(if level { 1.0 } else { 0.0 });
+            return PinDrive::Pwm { duty, level };
+        }
+        PinDrive::Digital(p.port & (1 << bit) != 0)
+    }
+
+    /// The PWM duty on an output-compare pin, mapping the Uno's OC pins to their
+    /// timer channels: OC0A→PD6, OC0B→PD5, OC1A→PB1, OC1B→PB2.
+    fn oc_duty(&self, port: Port, bit: u8) -> Option<f64> {
+        match (port, bit) {
+            (Port::D, 6) => Some(self.timer0.duty(Chan::A)),
+            (Port::D, 5) => Some(self.timer0.duty(Chan::B)),
+            (Port::B, 1) => Some(self.timer1.duty(Chan::A)),
+            (Port::B, 2) => Some(self.timer1.duty(Chan::B)),
+            _ => None,
+        }
+    }
+
+    /// Sample the co-sim exchange's input voltages into the peripherals: each
+    /// pin's voltage feeds the digital-input level (via [`LOGIC_THRESHOLD_V`]),
+    /// and each Port C pin additionally feeds its ADC channel. Called at the top
+    /// of a co-sim step.
+    pub fn sample_inputs(&mut self, io: &PinIo) {
+        for &port in &PORTS {
+            for bit in 0..8u8 {
+                let v = io.input(pin_id(port, bit));
+                self.set_pin_input(port, bit, v >= LOGIC_THRESHOLD_V);
+                if port == Port::C {
+                    self.set_adc_input(bit, v);
+                }
+            }
+        }
+    }
+
+    /// Publish each pin's drive into the co-sim exchange's *out* half. Called at
+    /// the end of a co-sim step.
+    pub fn publish_drives(&self, io: &mut PinIo) {
+        for &port in &PORTS {
+            for bit in 0..8u8 {
+                io.set_drive(pin_id(port, bit), self.pin_drive(port, bit));
+            }
+        }
+    }
+
+    /// Cycles from now until the soonest modelled peripheral event (a timer
+    /// compare/overflow, the USART finishing its current frame, or an ADC
+    /// conversion completing), or `None` if nothing is scheduled.
+    pub fn next_event_in(&self) -> Option<u64> {
+        let mut best: Option<u64> = None;
+        let mut consider = |d: Option<u64>| {
+            if let Some(d) = d {
+                best = Some(best.map_or(d, |b| b.min(d)));
+            }
+        };
+        consider(self.timer0.next_event_in());
+        consider(self.timer1.next_event_in());
+        if self.adc.countdown > 0 {
+            consider(Some(self.adc.countdown as u64));
+        }
+        if self.usart.tx_remaining > 0 {
+            consider(Some(self.usart.tx_remaining as u64));
+        }
+        best
     }
 
     /// Drive an external input level onto `port` pin `bit` (for pins the
@@ -845,6 +1072,65 @@ mod tests {
         assert_eq!(code, 512, "half reference → mid code");
         assert_eq!(p.read(ADCSRA).unwrap() & ADSC, 0, "ADSC cleared");
         assert_eq!(p.read(ADCSRA).unwrap() & ADIF, ADIF, "ADIF set");
+    }
+
+    #[test]
+    fn pin_drive_reports_input_output_and_pwm() {
+        let mut p = Peripherals::new();
+        // An un-configured pin is an input: high-impedance.
+        assert_eq!(p.pin_drive(Port::B, 0), PinDrive::HighZ);
+
+        // DDRB5 output, PORTB5 high → driving high.
+        p.write(DDRB, 1 << 5);
+        p.write(PORTB, 1 << 5);
+        assert_eq!(p.pin_drive(Port::B, 5), PinDrive::Digital(true));
+        p.write(PORTB, 0);
+        assert_eq!(p.pin_drive(Port::B, 5), PinDrive::Digital(false));
+
+        // Fast-PWM on OC0A (PD6) at 25 % duty (OCR0A = 64, TOP = 255).
+        p.write(DDRD, 1 << 6);
+        p.write(OCR0A, 64);
+        p.write(TCCR0A, (2 << 6) | 0x03); // COM0A = 2 (non-inverting), WGM = 3
+        p.write(TCCR0B, 0x01); // CS = /1
+        p.tick(1); // propagate the OC override onto the pin
+        match p.pin_drive(Port::D, 6) {
+            PinDrive::Pwm { duty, .. } => assert!((duty - 0.25).abs() < 1e-9, "duty {duty}"),
+            other => panic!("expected PWM drive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn next_event_in_picks_the_nearest_timer_compare() {
+        let mut p = Peripherals::new();
+        // Nothing running yet.
+        assert_eq!(p.next_event_in(), None);
+
+        // Timer0 Normal mode, /1, compare A at 100: next event is the compare
+        // match (100 counts) ahead of the 256-count overflow.
+        p.write(OCR0A, 100);
+        p.write(TCCR0B, 0x01);
+        assert_eq!(p.next_event_in(), Some(100));
+    }
+
+    #[test]
+    fn sample_inputs_and_publish_drives_round_trip() {
+        let mut p = Peripherals::new();
+        let mut io = PinIo::new(PIN_COUNT);
+
+        // Drive an output pin and publish it.
+        p.write(DDRB, 1 << 5);
+        p.write(PORTB, 1 << 5);
+        p.publish_drives(&mut io);
+        assert_eq!(io.drive(pin_id(Port::B, 5)), PinDrive::Digital(true));
+        assert_eq!(io.drive(pin_id(Port::D, 0)), PinDrive::HighZ);
+
+        // Feed an above-threshold voltage into an input pin and sample it.
+        io.set_input(pin_id(Port::C, 0), 3.3);
+        p.sample_inputs(&io);
+        assert!(p.pin(Port::C, 0), "3.3 V reads as logic high");
+        io.set_input(pin_id(Port::C, 0), 1.0);
+        p.sample_inputs(&io);
+        assert!(!p.pin(Port::C, 0), "1.0 V reads as logic low");
     }
 
     #[test]

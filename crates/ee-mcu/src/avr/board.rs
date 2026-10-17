@@ -14,10 +14,10 @@
 //! the existing Intel-HEX / raw loader, and resolves digital-pin reads to the
 //! underlying GPIO pin.
 
-use crate::{FirmwareError, McuCore};
+use crate::{FirmwareError, McuCore, PinId, PinIo};
 
 use super::core::Avr;
-use super::periph::Port;
+use super::periph::{pin_id, Port};
 
 /// The Uno's CPU clock (16 MHz).
 pub const UNO_F_CPU: f64 = 16_000_000.0;
@@ -67,6 +67,41 @@ impl Uno {
     /// Run until the simulated clock reaches `t` seconds.
     pub fn step_to(&mut self, t: f64) {
         self.mcu.step_to(t);
+    }
+
+    // --- Co-simulation bridge (forwards to the core; see [`McuCore`]) ---
+
+    /// A [`PinIo`] exchange sized for this board's pins.
+    pub fn pin_io(&self) -> PinIo {
+        PinIo::new(self.mcu.pin_count())
+    }
+
+    /// The absolute cycle count at which the core next wants to run (see
+    /// [`McuCore::next_event`]).
+    pub fn next_event(&self) -> Option<u64> {
+        self.mcu.next_event()
+    }
+
+    /// Advance to the cycle bound `until_cycle` while exchanging pin state (see
+    /// [`McuCore::step_to_cycle`]).
+    pub fn step_to_cycle(&mut self, until_cycle: u64, io: &mut PinIo) -> u64 {
+        self.mcu.step_to_cycle(until_cycle, io)
+    }
+
+    /// A single co-sim step exchanging pin state (see [`Avr::step_with_io`]).
+    pub fn step_with_io(&mut self, io: &mut PinIo) {
+        self.mcu.step_with_io(io);
+    }
+
+    /// The [`PinId`] for Arduino digital pin `pin` (`0..=13`), for mapping it to
+    /// a circuit node in the co-sim loop.
+    pub fn digital_pin_id(pin: u8) -> Option<PinId> {
+        Self::digital_pin(pin).map(|(port, bit)| pin_id(port, bit))
+    }
+
+    /// The [`PinId`] for Arduino analog pin `pin` (`0..=5`).
+    pub fn analog_pin_id(pin: u8) -> Option<PinId> {
+        Self::analog_pin(pin).map(|(port, bit)| pin_id(port, bit))
     }
 
     /// Map an Arduino digital pin number (`0..=13`) to its AVR `(port, bit)`.
