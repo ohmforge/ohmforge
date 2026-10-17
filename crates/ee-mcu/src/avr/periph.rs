@@ -164,17 +164,24 @@ struct PortReg {
 }
 
 impl PortReg {
-    /// The logic level on pin `bit`: a peripheral override wins, else the output
-    /// latch for an output pin, else the externally driven input level.
+    /// The logic level on pin `bit`. An **input** pin (`DDR` bit clear) reads its
+    /// externally driven level. An **output** pin reads a peripheral override (a
+    /// timer's PWM waveform) if one is active, else its output latch.
+    ///
+    /// The OC/PWM override only reaches the pin when the pin is an output: the
+    /// ATmega328P datasheet requires the `DDR` bit for the OCnx pin to be set to
+    /// enable the output driver, so a timer waveform on a pin left as an input is
+    /// not visible on `PINx`. This keeps `pin_level` consistent with
+    /// [`Peripherals::pin_drive`](crate::avr::Peripherals::pin_drive), which
+    /// already gates on `DDR`.
     fn pin_level(&self, bit: u8) -> bool {
+        if self.ddr & (1 << bit) == 0 {
+            return self.pin_ext & (1 << bit) != 0;
+        }
         if let Some(v) = self.oc[bit as usize] {
             return v;
         }
-        if self.ddr & (1 << bit) != 0 {
-            self.port & (1 << bit) != 0
-        } else {
-            self.pin_ext & (1 << bit) != 0
-        }
+        self.port & (1 << bit) != 0
     }
 
     /// The whole `PINx` byte (every pin's resolved level).
@@ -1140,6 +1147,46 @@ mod tests {
         match p.pin_drive(Port::D, 6) {
             PinDrive::Pwm { duty, .. } => assert!((duty - 0.25).abs() < 1e-9, "duty {duty}"),
             other => panic!("expected PWM drive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pwm_override_is_invisible_on_pinx_until_ddr_selects_output() {
+        // Regression: a timer OC/PWM waveform must only reach the pin when its
+        // DDR bit selects output. With OC0A (PD6) left as an input, PINx reads
+        // the externally driven level, not the internal PWM waveform — and
+        // pin_drive agrees the pin is high-impedance.
+        let mut p = Peripherals::new();
+        // Configure Fast-PWM on OC0A (PD6), non-inverting, 100% drive region
+        // (OCR0A high) so the override level would be a definite 1 if it leaked.
+        p.write(OCR0A, 200);
+        p.write(TCCR0A, (2 << 6) | 0x03); // COM0A = 2 (non-inverting), WGM = 3
+        p.write(TCCR0B, 0x01); // CS = /1
+        p.tick(1); // compute + apply the OC override onto PD6's oc slot
+
+        // DDRD6 is still clear → PD6 is an input. Drive it low externally.
+        p.set_pin_input(Port::D, 6, false);
+        assert!(
+            !p.pin(Port::D, 6),
+            "PWM override must not drive an input pin's PINx read"
+        );
+        assert_eq!(
+            p.read(PIND).unwrap() & (1 << 6),
+            0,
+            "PINx bit reflects the (low) input, not the PWM waveform"
+        );
+        assert_eq!(
+            p.pin_drive(Port::D, 6),
+            PinDrive::HighZ,
+            "an input pin drives nothing regardless of the timer override"
+        );
+
+        // Now select output: the PWM override becomes visible on the pin.
+        p.write(DDRD, 1 << 6);
+        p.tick(1);
+        match p.pin_drive(Port::D, 6) {
+            PinDrive::Pwm { .. } => {}
+            other => panic!("expected PWM drive once DDR selects output, got {other:?}"),
         }
     }
 
