@@ -3,7 +3,8 @@
 //! Everything above [`Transport`] is pure, synchronous, and network-free, so
 //! the whole tool-use loop is unit-tested against [`MockTransport`] with no I/O
 //! and the crate still compiles for `wasm32` without a TLS stack. A real HTTP
-//! transport is a thin, feature-gated stub for now (see [`HttpTransport`]): the
+//! transport is a thin, feature-gated stub for now (see `HttpTransport`, behind
+//! the `http` feature): the
 //! point of this checkpoint is the loop logic, not live calls.
 //!
 //! The trait is deliberately **synchronous**. The design sketch showed an
