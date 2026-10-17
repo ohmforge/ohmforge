@@ -39,8 +39,8 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 - [x] **CP-BRD-M1.1** Event-driven digital kernel (event heap, delays, 0/1/X/Z). — *gate:* a 3-inverter ring oscillates at exactly 2·N·d (60 fs); integer-femtosecond queue with FIFO tie-break (deterministic). Dependency-free + wasm-clean.
 - [x] **CP-BRD-M1.2** Logic primitives (gates, D/JK flip-flops, counters, mux). — *gate:* NAND/NOR/XNOR/buf/tri-state truth tables, D & JK behavior, 2:1/4:1 mux, a 4-bit ripple counter 0→15→0 with async clear.
 - [x] **CP-BRD-M1.3** AVR core (ATmega328P): decode + execute + interrupts. — *gate:* table-driven decoder + per-instruction execute tests over a broad subset (ALU/branches/memory/bit-ops/flow), a count-down loop + array-sum program, interrupt dispatch + RETI, raw & Intel-HEX loaders. Documented TODO: MUL/LPM/ADIW/SBIW/SLEEP decode to `Instr::Unknown`.
-- [ ] **CP-BRD-M1.4** AVR peripherals (GPIO, timers/PWM, ADC, UART). — *gate:* measured PWM duty on a pin; UART TX bytes decode correctly.
-- [ ] **CP-BRD-M1.5** Uno board def + firmware load (`.hex`/`.elf`). — *gate:* load `blink.hex`; D13 toggles at ~1 Hz in the sim.
+- [x] **CP-BRD-M1.4** AVR peripherals (GPIO, timers/PWM, ADC, UART). — *gate:* Fast-PWM duty on OC0A within 0.02 of 64/256; USART TX stream decodes to the written bytes at 9600 baud; ADC half-ref → code 512. I/O window routes through `Peripherals`; added ADIW/SBIW opcodes.
+- [x] **CP-BRD-M1.5** Uno board def + firmware load (`.hex`). — *gate:* `blink.hex` (committed fixture, regenerated from a documented assembly listing) loads via Intel-HEX; D13/PB5 toggles at 1.000 s/toggle (~1 Hz). ELF still `UnsupportedFormat`.
 
 ### M2 — co-simulation + more cores
 - [ ] **CP-BRD-M2.1** Co-sim bridge: pin↔net, clock sync. — *gate:* `analogRead` returns a divider's voltage; `digitalWrite` lights a sim LED.
@@ -109,11 +109,11 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 | Track | Done | In progress | Total |
 |---|---|---|---|
 | sim-core | 8 | 0 | 15 |
-| boards | 3 | 0 | 10 |
+| boards | 5 | 0 | 10 |
 | ui-shell | 7 | 0 | 13 |
 | ai-fmt | 4 | 0 | 9 |
 | platform | 3 | 0 | 5 |
-| **Total** | **25** | **0** | **52** |
+| **Total** | **27** | **0** | **52** |
 
 *Update this table when flipping a checkpoint.*
 
