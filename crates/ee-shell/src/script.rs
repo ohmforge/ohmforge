@@ -484,6 +484,41 @@ repeat 3 as win {
         );
     }
 
+    /// The shipped tutorial sweep script (`examples/tutorial/sweep.eesh`) must
+    /// expand, run, and replay identically — this both verifies the documented
+    /// example and guards it against drift.
+    #[test]
+    fn tutorial_sweep_example_expands_and_replays() {
+        const SWEEP_EESH: &str = include_str!("../../../examples/tutorial/sweep.eesh");
+        let mut shell = Shell::new();
+        let run = shell.run_script(SWEEP_EESH).unwrap();
+        // `$r` and the `repeat … as win` loop expand to three distinct runs.
+        assert_eq!(
+            run.recording.commands(),
+            &[
+                "add V1 in gnd 5".to_string(),
+                "add R1 in out 1k".to_string(),
+                "add C1 out gnd 1u".to_string(),
+                "probe out".to_string(),
+                "run tran 1m".to_string(),
+                "run tran 2m".to_string(),
+                "run tran 3m".to_string(),
+            ],
+            "sweep.eesh expansion drifted:\n{:#?}",
+            run.recording.commands()
+        );
+        assert!(
+            run.transcript.contains('\u{2524}'),
+            "a braille scope frame rendered:\n{}",
+            run.transcript
+        );
+        assert_eq!(
+            run.transcript,
+            run.recording.replay().unwrap(),
+            "the sweep must replay to a byte-identical transcript"
+        );
+    }
+
     #[test]
     fn set_rebinds_a_variable_between_lines() {
         // A later `set` overrides the earlier binding; each `add` interpolates the

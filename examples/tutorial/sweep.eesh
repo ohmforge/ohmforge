@@ -1,0 +1,10 @@
+# Sweep the transient window: 1 ms, 2 ms, 3 ms over the same RC low-pass.
+# Loops and $vars run through the eesh scripting engine (Shell::run_script).
+set r 1k
+add V1 in gnd 5
+add R1 in out $r
+add C1 out gnd 1u
+probe out
+repeat 3 as win {
+  run tran ${win}m
+}

@@ -94,6 +94,13 @@ impl<'a> Plot<'a> {
                 let t = px as f64 / (pw - 1) as f64;
                 let xd = xmin + (xmax - xmin) * t;
                 let yd = interp(x, y, xd);
+                // A non-finite sample (an inf/NaN from a diverged solve) leaves a
+                // gap and breaks the connecting segment rather than clamping to a
+                // spurious full-height spike.
+                if !yd.is_finite() {
+                    prev_py = None;
+                    continue;
+                }
                 // Invert: larger y is nearer the top row (py = 0).
                 let frac = (ymax - yd) / (ymax - ymin);
                 let py = (frac * (ph - 1) as f64).round().clamp(0.0, (ph - 1) as f64) as usize;
@@ -283,6 +290,26 @@ mod tests {
         assert!(
             out.contains("3.5V") && out.contains("1.5V"),
             "flat signal autoscales with padding"
+        );
+    }
+
+    #[test]
+    fn non_finite_sample_leaves_a_gap_not_a_spike() {
+        // A flat signal with one inf sample. The finite part lands mid-frame, so
+        // the top braille row must stay blank — the inf must gap rather than clamp
+        // to a full-height spike that reaches the top row.
+        let n = 40;
+        let x: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let mut y = vec![2.5; n];
+        y[n / 2] = f64::INFINITY;
+        let out = Plot::new("inf").size(24, 8).render(&x, &y);
+        let top = out
+            .lines()
+            .find(|l| l.contains('\u{2524}'))
+            .expect("a braille row");
+        assert!(
+            !top.chars().any(|c| ('\u{2801}'..='\u{28FF}').contains(&c)),
+            "an inf sample spiked to the top row instead of gapping:\n{out}"
         );
     }
 

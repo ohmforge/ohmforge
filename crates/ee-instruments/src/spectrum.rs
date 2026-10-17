@@ -237,4 +237,21 @@ mod tests {
         let one = Signal::freq("h", Unit::None, vec![1.0], vec![Complex::ONE]);
         assert!(!Spectrum::new("x").size(24, 3).render(&one).is_empty());
     }
+
+    #[test]
+    fn length_mismatched_spectrum_renders_without_panicking() {
+        use ee_core::signal::{Domain, SignalData};
+        // A complex signal whose `x` is shorter than its bins. `render` takes its
+        // empty-view path (the bins guard fails) but still reads the peak bin for
+        // the readout, which must not index past the frequency axis.
+        let bad = Signal {
+            name: "h".to_string(),
+            unit: Unit::None,
+            domain: Domain::Freq,
+            x: vec![0.0],
+            y: SignalData::Complex(vec![Complex::ONE, Complex::ONE, Complex::ONE]),
+        };
+        let out = Spectrum::new("x").size(32, 4).render(&bad);
+        assert!(out.contains('\u{2524}'), "still a framed view:\n{out}");
+    }
 }
