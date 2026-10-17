@@ -4,6 +4,8 @@
 //! A [`Circuit`] is a set of **parts** connected at **nets** (electrically
 //! common nodes). Ground is always net 0.
 
+use std::collections::BTreeMap;
+
 use crate::value::Value;
 
 /// A net (electrical node). Net 0 is ground by convention.
@@ -199,6 +201,11 @@ pub struct Circuit {
     /// `net_parent[0]` is ground and always its own root.
     net_parent: Vec<u32>,
     next_part: u32,
+    /// Optional per-part fractional tolerances, keyed by reference designator —
+    /// `0.05` means ±5 %. Absent ⇒ the part is exact. Purely additive metadata the
+    /// deterministic solver ignores; only the Monte-Carlo runner reads it to
+    /// perturb component values within tolerance. (`CP-SIM-M2.2`.)
+    tolerances: BTreeMap<String, f64>,
 }
 
 // `Default` is hand-written (not derived) so net 0 is pre-seeded as ground: the
@@ -210,6 +217,7 @@ impl Default for Circuit {
             parts: Vec::new(),
             net_parent: vec![0], // net 0 = ground, its own root
             next_part: 0,
+            tolerances: BTreeMap::new(),
         }
     }
 }
@@ -307,6 +315,24 @@ impl Circuit {
         }
     }
 
+    /// Set a part's fractional tolerance by reference designator — `0.05` for
+    /// ±5 %. Returns `true` if a part with that reference exists. A non-finite or
+    /// negative tolerance is rejected (reported as `false`); a tolerance of `0`
+    /// is stored and pins the part to its nominal value. Only the Monte-Carlo
+    /// runner reads this; every other analysis is unaffected. (`CP-SIM-M2.2`.)
+    pub fn set_tolerance(&mut self, reference: &str, tolerance: f64) -> bool {
+        if !tolerance.is_finite() || tolerance < 0.0 || self.part_by_ref(reference).is_none() {
+            return false;
+        }
+        self.tolerances.insert(reference.to_string(), tolerance);
+        true
+    }
+
+    /// The fractional tolerance set for a part, or `None` if it is exact.
+    pub fn tolerance(&self, reference: &str) -> Option<f64> {
+        self.tolerances.get(reference).copied()
+    }
+
     pub fn parts(&self) -> &[Part] {
         &self.parts
     }
@@ -393,5 +419,28 @@ mod tests {
         assert_eq!(c.part_by_ref("V1").unwrap().value.unwrap().magnitude, 7.0);
         // An unknown reference is a no-op reported as false.
         assert!(!c.set_value("V9", Value::new(1.0, Unit::Volt)));
+    }
+
+    #[test]
+    fn tolerance_is_optional_additive_metadata() {
+        let mut c = Circuit::new("c");
+        let (a, b) = (c.new_net(), c.new_net());
+        c.add_part(
+            "R1",
+            PartKind::Resistor,
+            Some(Value::new(1000.0, Unit::Ohm)),
+            vec![a, b],
+        );
+        // Parts start exact (no tolerance recorded).
+        assert_eq!(c.tolerance("R1"), None);
+        // A sane tolerance is stored and read back by reference.
+        assert!(c.set_tolerance("R1", 0.05));
+        assert_eq!(c.tolerance("R1"), Some(0.05));
+        // Unknown references, and nonsensical tolerances, are rejected.
+        assert!(!c.set_tolerance("R9", 0.05));
+        assert!(!c.set_tolerance("R1", -0.1));
+        assert!(!c.set_tolerance("R1", f64::NAN));
+        // The rejected writes left the earlier value untouched.
+        assert_eq!(c.tolerance("R1"), Some(0.05));
     }
 }
