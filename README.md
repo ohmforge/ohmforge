@@ -25,7 +25,24 @@ Real EE tools are powerful but heavy, GUI-bound, and often expensive. Tinkerers 
 - learn from — *see* current flow, voltages, and waveforms, and ask "why?",
 - use to run **real Arduino sketches** against a **simulated circuit** before touching hardware.
 
-## What it feels like
+## Try it now
+
+What runs today (M0–M2): a real analog/mixed-signal simulator, AVR + RP2040 emulation with co-simulation, instruments, and an AI copilot — ~370 tests, all green.
+
+```text
+cargo run -p ee -- demo     # build an RC low-pass, run a transient, see the braille scope
+cargo run -p ee -- bode     # AC sweep → Bode plot, −3 dB at 1 kHz
+cargo run -p ee -- amp      # common-emitter BJT amplifier, op-point with a color overlay
+cargo run -p ee -- cosim    # real AVR firmware drives D13 → a simulated LED lights (19.4 mA)
+cargo run -p ee -- tui      # interactive dockable panels (schematic · scope · shell)
+cargo run -p ee             # the eesh REPL;  or:  cat examples/tutorial/rc_lowpass.eesh | cargo run -p ee
+```
+
+New here? Start with the **[getting-started tutorial](docs/tutorials/getting-started.md)**.
+
+## What it feels like (design target)
+
+The vision the shell is growing toward — not all of this grammar is wired yet (see [`docs/SHELL.md`](docs/SHELL.md) § "Implemented today"):
 
 ```text
 eesh> new project blinky
@@ -54,16 +71,16 @@ eesh> ask "why is the LED dimmer than I expected?"
 
 ## Documentation
 
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — how it's built: crates, the simulation core, co-simulation, TUI.
-- [`docs/FEATURES.md`](docs/FEATURES.md) — the full feature catalog (simulation, boards, instruments, AI, education).
-- [`docs/SHELL.md`](docs/SHELL.md) — the `eesh` command language and scripting.
-- [`docs/AI.md`](docs/AI.md) — the AI copilot design (tools, prompts, guardrails, offline mode).
-- [`docs/ROADMAP.md`](docs/ROADMAP.md) — phased milestones from MVP to v1 and beyond.
+**[`docs/README.md`](docs/README.md) is the documentation hub.** Highlights:
+
+- **Tutorial:** [getting started in `eesh`](docs/tutorials/getting-started.md) · runnable [`examples/`](examples/README.md) (analog circuits, MCU/co-sim, formats)
+- **Guides:** [simulation engine](docs/guide/simulation.md) · [emulation & co-sim](docs/guide/emulation.md) · [the view & instruments](docs/guide/view.md) · [AI copilot](docs/guide/ai-copilot.md) · [file formats](docs/guide/formats.md)
+- **Design:** [`ARCHITECTURE.md`](docs/ARCHITECTURE.md) · [`FEATURES.md`](docs/FEATURES.md) · [`SHELL.md`](docs/SHELL.md) · [`AI.md`](docs/AI.md) · [`ROADMAP.md`](docs/ROADMAP.md) · progress ledger [`docs/plan/CHECKPOINTS.md`](docs/plan/CHECKPOINTS.md)
 
 ## Status
 
-🚧 **Planning / scaffold.** The workspace layout and design are in place; implementation follows the roadmap. See [`docs/ROADMAP.md`](docs/ROADMAP.md).
+**M0 + M1 complete; M2 nearly complete** (see [`docs/plan/CHECKPOINTS.md`](docs/plan/CHECKPOINTS.md)). Working today: linear + nonlinear analog (diode/BJT/MOSFET, Newton–Raphson), AC/Bode, noise, Monte-Carlo, transient with adaptive timestep; an event-driven digital kernel; instruction-accurate **AVR (ATmega328P)** and **RP2040 (Cortex-M0+)** cores with peripherals and **lockstep co-simulation**; oscilloscope/DMM/funcgen/PSU + logic analyzer with UART/SPI/I²C decode; a dockable TUI; SPICE/VCD/CSV formats; and an AI copilot whose tools drive a real sim (grounded, with a verification loop). Whole workspace stays green — tests, `clippy -D warnings`, `wasm32` core, docs.
 
 ## License
 
-TBD (leaning MIT/Apache-2.0 dual, standard for the Rust ecosystem).
+Dual-licensed under **MIT OR Apache-2.0**.
