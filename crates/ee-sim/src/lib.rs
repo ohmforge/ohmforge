@@ -1117,8 +1117,13 @@ const GMIN_START: f64 = 1e-3;
 /// Smallest non-zero gmin before the final gmin = 0 solve on the real circuit.
 const GMIN_FLOOR: f64 = 1e-12;
 
-/// Solve the DC operating point: resistors + sources, capacitors open, inductors
-/// shorted, and any nonlinear device driven to steady state by Newton–Raphson.
+/// Solve a (possibly nonlinear) DC-like system with the full convergence-aid
+/// ladder, shared by the DC operating point and the transient's `t = 0` initial
+/// solve so both are equally robust.
+///
+/// `stamp_at(sys, alpha)` stamps every linear contribution with the independent
+/// sources scaled by `alpha` (`1.0` = the real circuit); source stepping ramps
+/// `alpha` 0 → 1.
 ///
 /// Tries plain NR first (the fast path — a plain-convergent or purely linear
 /// circuit takes exactly this and nothing more). Only if NR fails — hitting its
@@ -1129,6 +1134,44 @@ const GMIN_FLOOR: f64 = 1e-12;
 /// resolves; a node that stays floating at the real circuit (gmin's final step at
 /// gmin = 0) still surfaces as [`SimError::Singular`], and only a genuinely
 /// hopeless nonlinear solve surfaces as [`SimError::NonConvergence`].
+fn solve_aided(
+    circuit: &Circuit,
+    layout: &Layout,
+    size: usize,
+    devices: &[Box<dyn NonlinearDevice>],
+    stamp_at: &dyn Fn(&mut System, f64) -> Result<(), SimError>,
+) -> Result<Vec<f64>, SimError> {
+    // 1. Plain Newton–Raphson, full sources, no gmin, cold start.
+    match solve_nr(
+        circuit,
+        layout,
+        size,
+        devices,
+        &|sys| stamp_at(sys, 1.0),
+        None,
+        0.0,
+    ) {
+        Ok(x) => return Ok(x),
+        // Hit the iteration cap or a singular guess — the aids may still get there.
+        Err(SimError::NonConvergence(_)) | Err(SimError::Singular) => {}
+        Err(e) => return Err(e), // Bad*/Missing* are data faults no aid can cure
+    }
+
+    // 2. gmin stepping, then 3. source stepping. Each returns `Ok(None)` when a
+    // continuation step fails to converge; a real fault (still singular at the
+    // final gmin = 0 — a truly floating node) propagates straight out.
+    if let Some(x) = gmin_stepping(circuit, layout, size, devices, stamp_at)? {
+        return Ok(x);
+    }
+    if let Some(x) = source_stepping(circuit, layout, size, devices, stamp_at)? {
+        return Ok(x);
+    }
+    Err(SimError::NonConvergence(NR_MAX_ITERS))
+}
+
+/// Solve the DC operating point: resistors + sources, capacitors open, inductors
+/// shorted, and any nonlinear device driven to steady state by Newton–Raphson
+/// with the shared convergence-aid ladder ([`solve_aided`]).
 fn solve_dc(circuit: &Circuit, layout: &Layout) -> Result<Vec<f64>, SimError> {
     let size = layout.n_nodes()
         + layout.vsources.len()
@@ -1145,33 +1188,7 @@ fn solve_dc(circuit: &Circuit, layout: &Layout) -> Result<Vec<f64>, SimError> {
         stamp_inductor_shorts(sys, circuit, layout)?;
         Ok(())
     };
-
-    // 1. Plain Newton–Raphson, full sources, no gmin, cold start.
-    match solve_nr(
-        circuit,
-        layout,
-        size,
-        &devices,
-        &|sys| stamp_at(sys, 1.0),
-        None,
-        0.0,
-    ) {
-        Ok(x) => return Ok(x),
-        // Hit the iteration cap or a singular guess — the aids may still get there.
-        Err(SimError::NonConvergence(_)) | Err(SimError::Singular) => {}
-        Err(e) => return Err(e), // Bad*/Missing* are data faults no aid can cure
-    }
-
-    // 2. gmin stepping, then 3. source stepping. Each returns `Ok(None)` when a
-    // continuation step fails to converge; a real fault (still singular at the
-    // final gmin = 0 — a truly floating node) propagates straight out.
-    if let Some(x) = gmin_stepping(circuit, layout, size, &devices, &stamp_at)? {
-        return Ok(x);
-    }
-    if let Some(x) = source_stepping(circuit, layout, size, &devices, &stamp_at)? {
-        return Ok(x);
-    }
-    Err(SimError::NonConvergence(NR_MAX_ITERS))
+    solve_aided(circuit, layout, size, &devices, &stamp_at)
 }
 
 /// gmin stepping: solve with a large node-to-ground conductance first (which
@@ -1309,7 +1326,14 @@ impl<'a> TransientModel<'a> {
             .filter(|p| matches!(p.kind, PartKind::Capacitor))
             .map(|p| {
                 let (a, b) = terminals2(p)?;
-                Ok::<_, SimError>((a, b, magnitude(p)?))
+                // A non-positive capacitance gives a negative/zero companion
+                // conductance `C/h`, which silently poisons the solve — reject it
+                // as a bad value, exactly as a non-positive resistance/inductance is.
+                let c = magnitude(p)?;
+                if c <= 0.0 {
+                    return Err(SimError::BadValue(p.reference.clone()));
+                }
+                Ok::<_, SimError>((a, b, c))
             })
             .collect::<Result<_, _>>()?;
 
@@ -1346,11 +1370,13 @@ impl<'a> TransientModel<'a> {
     /// initial capacitor voltages (the inductor currents start at 0 A).
     fn initial(&self) -> Result<(Vec<f64>, Vec<f64>), SimError> {
         let (circuit, layout, n, m, cb) = (self.circuit, self.layout, self.n, self.m, self.cb);
-        let stamp = |sys: &mut System| -> Result<(), SimError> {
+        // Alpha-scaled stamp (for source stepping): independent sources ramp with
+        // `alpha`; the capacitor 0 V initial-condition sources stay at 0 V regardless.
+        let stamp_at = |sys: &mut System, alpha: f64| -> Result<(), SimError> {
             stamp_resistors(sys, circuit, layout)?;
             // t = 0 uses the waveform bias (sine → offset, pulse → v1).
-            stamp_vsources(sys, circuit, layout, None, 1.0)?;
-            stamp_current_sources(sys, circuit, layout, None, 1.0)?;
+            stamp_vsources(sys, circuit, layout, None, alpha)?;
+            stamp_current_sources(sys, circuit, layout, None, alpha)?;
             stamp_controlled_sources(sys, circuit, layout)?;
             // Capacitor 0 V sources sit on branches past the controlled-source rows.
             for (ci, (a, b, _)) in self.caps.iter().enumerate() {
@@ -1364,14 +1390,15 @@ impl<'a> TransientModel<'a> {
             }
             Ok(())
         };
-        let x0 = solve_nr(
+        // The t = 0 solve gets the same convergence-aid ladder as the DC operating
+        // point: a stiff nonlinear bias the op-point can crack must not spuriously
+        // fail a transient just because it is the first sample.
+        let x0 = solve_aided(
             circuit,
             layout,
             n + m + cb + self.caps.len(),
             &self.devices,
-            &stamp,
-            None,
-            0.0,
+            &stamp_at,
         )?;
         let cap_v0 = self
             .caps
@@ -1398,11 +1425,13 @@ impl<'a> TransientModel<'a> {
         ind_prev: &[f64],
     ) -> Result<StepResult, SimError> {
         let (circuit, layout) = (self.circuit, self.layout);
-        let stamp = |sys: &mut System| -> Result<(), SimError> {
+        // `alpha` ramps the independent sources only (source stepping); the
+        // reactive companions carry state from the previous step and stay at full.
+        let stamp_at = |sys: &mut System, alpha: f64| -> Result<(), SimError> {
             stamp_resistors(sys, circuit, layout)?;
             // Sources evaluated at the step's end time.
-            stamp_vsources(sys, circuit, layout, Some(t_end), 1.0)?;
-            stamp_current_sources(sys, circuit, layout, Some(t_end), 1.0)?;
+            stamp_vsources(sys, circuit, layout, Some(t_end), alpha)?;
+            stamp_current_sources(sys, circuit, layout, Some(t_end), alpha)?;
             stamp_controlled_sources(sys, circuit, layout)?;
             for (ci, (a, b, c)) in self.caps.iter().enumerate() {
                 let g_eq = c / h;
@@ -1419,14 +1448,14 @@ impl<'a> TransientModel<'a> {
             }
             Ok(())
         };
-        let x = solve_nr(
+        // Each step gets the aided ladder too (plain NR first, so a convergent step
+        // is unchanged); this keeps a nonlinear transient as robust as its op-point.
+        let x = solve_aided(
             circuit,
             layout,
             self.n + self.m + self.cb,
             &self.devices,
-            &stamp,
-            None,
-            0.0,
+            &stamp_at,
         )?;
         let new_caps = self
             .caps
@@ -1680,12 +1709,12 @@ fn ac(
                 ));
             }
             PartKind::Capacitor => {
+                let c = magnitude(part)?;
+                if c <= 0.0 {
+                    return Err(SimError::BadValue(part.reference.clone()));
+                }
                 let (a, b) = terminals2(part)?;
-                caps.push((
-                    layout.node_of(circuit, a),
-                    layout.node_of(circuit, b),
-                    magnitude(part)?,
-                ));
+                caps.push((layout.node_of(circuit, a), layout.node_of(circuit, b), c));
             }
             PartKind::Inductor => {
                 let l = magnitude(part)?;
@@ -1875,12 +1904,12 @@ fn noise(
                 noise_sources.push((na, nb, 4.0 * BOLTZMANN_K * NOISE_TEMP_K / r));
             }
             PartKind::Capacitor => {
+                let c = magnitude(part)?;
+                if c <= 0.0 {
+                    return Err(SimError::BadValue(part.reference.clone()));
+                }
                 let (a, b) = terminals2(part)?;
-                caps.push((
-                    layout.node_of(circuit, a),
-                    layout.node_of(circuit, b),
-                    magnitude(part)?,
-                ));
+                caps.push((layout.node_of(circuit, a), layout.node_of(circuit, b), c));
             }
             PartKind::Inductor => {
                 let l = magnitude(part)?;
@@ -4440,5 +4469,140 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, SimError::BadValue(_)), "got {err:?}");
+    }
+
+    // --- Audit regressions -------------------------------------------------
+
+    /// A transient's `t = 0` solve must enjoy the same convergence aids as the DC
+    /// operating point. The stiff diode-connected-MOSFET-off-a-current-source bias
+    /// (the [`stiff_mosfet_needs_convergence_aids`] netlist) needs gmin stepping;
+    /// before the fix the transient's `initial()` used plain Newton–Raphson and so
+    /// failed with [`SimError::Singular`], even though the op point solved. The
+    /// operating point is a current-source-held DC bias, so every transient sample
+    /// must equal the op-point Vd = 2.0 V.
+    #[test]
+    fn transient_initial_point_uses_convergence_aids() {
+        let mut c = Circuit::new("isrc_mos_tran");
+        let d = c.new_net();
+        c.add_part(
+            "I1",
+            PartKind::CurrentSource,
+            v("1m", Unit::Ampere),
+            vec![NetId::GROUND, d],
+        );
+        c.add_part(
+            "M1",
+            PartKind::Mosfet(Polarity::N, MosfetModel::default()),
+            None,
+            vec![d, d, NetId::GROUND],
+        );
+
+        let sigs = Engine::new()
+            .run(
+                &c,
+                &Analysis::Transient {
+                    duration: 1e-3,
+                    step: Some(2e-4),
+                },
+            )
+            .expect("transient must solve the stiff bias via the convergence aids");
+        let name = format!("v(n{})", c.resolve(d).0);
+        let sig = sigs.iter().find(|s| s.name == name).expect("v(d) present");
+        for &vd in sig.real().unwrap() {
+            assert!(
+                (vd - 2.0).abs() <= 1e-6,
+                "transient v(d) = {vd} V, expected the op-point 2.0 V"
+            );
+        }
+    }
+
+    /// A non-positive capacitance has no physical meaning and gives a zero/negative
+    /// companion conductance `C/h` that silently poisons the transient solve
+    /// (before the fix it returned a finite but nonsensical voltage). It must be
+    /// rejected as a [`SimError::BadValue`] in every analysis that uses the value —
+    /// transient, AC, and noise — exactly as a non-positive resistance/inductance is.
+    #[test]
+    fn nonpositive_capacitor_is_rejected() {
+        let build = |cap: f64| {
+            let mut c = Circuit::new("badcap");
+            let vin = c.new_net();
+            let out = c.new_net();
+            c.add_part(
+                "V1",
+                PartKind::VoltageSource,
+                v("5", Unit::Volt),
+                vec![vin, NetId::GROUND],
+            );
+            c.add_part("R1", PartKind::Resistor, v("1k", Unit::Ohm), vec![vin, out]);
+            c.add_part(
+                "C1",
+                PartKind::Capacitor,
+                Some(Value::new(cap, Unit::Farad)),
+                vec![out, NetId::GROUND],
+            );
+            // Mark V1 as an AC drive so the AC/noise paths have a stimulus to build.
+            c.set_waveform(
+                "V1",
+                Waveform::Sine {
+                    amplitude: 1.0,
+                    freq: 1_000.0,
+                    offset: 0.0,
+                    phase_deg: 0.0,
+                },
+            );
+            (c, out)
+        };
+
+        for &bad in &[-1e-6, 0.0] {
+            let (c, out) = build(bad);
+            let tran = Engine::new().run(
+                &c,
+                &Analysis::Transient {
+                    duration: 1e-3,
+                    step: Some(1e-5),
+                },
+            );
+            assert!(
+                matches!(tran, Err(SimError::BadValue(ref r)) if r == "C1"),
+                "C = {bad} F transient should be BadValue(C1), got {tran:?}"
+            );
+            let ac = Engine::new().run(
+                &c,
+                &Analysis::Ac {
+                    f_start: 10.0,
+                    f_stop: 1e4,
+                    points_per_decade: 5,
+                },
+            );
+            assert!(
+                matches!(ac, Err(SimError::BadValue(ref r)) if r == "C1"),
+                "C = {bad} F AC should be BadValue(C1), got {ac:?}"
+            );
+            let noise = Engine::new().run(
+                &c,
+                &Analysis::Noise {
+                    output: out,
+                    f_start: 10.0,
+                    f_stop: 1e4,
+                    points_per_decade: 5,
+                },
+            );
+            assert!(
+                matches!(noise, Err(SimError::BadValue(ref r)) if r == "C1"),
+                "C = {bad} F noise should be BadValue(C1), got {noise:?}"
+            );
+        }
+
+        // A sane positive capacitor still runs (guards against over-rejection).
+        let (c, _out) = build(1e-6);
+        assert!(Engine::new()
+            .run(
+                &c,
+                &Analysis::Transient {
+                    duration: 1e-3,
+                    step: Some(1e-5),
+                },
+            )
+            .is_ok());
     }
 }
