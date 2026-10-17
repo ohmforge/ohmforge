@@ -9,12 +9,12 @@
 //! The pieces:
 //! - [`sreg`] — the status register and its eight flags.
 //! - [`isa`] — the decoded-instruction type ([`Instr`]) and operand shapes.
-//! - [`decode`] — a table-driven decoder from flash words to [`Instr`].
+//! - [`decode`](mod@decode) — a table-driven decoder from flash words to [`Instr`].
 //! - [`core`] — the register file, memory model, interrupt controller, and the
 //!   fetch/decode/execute step loop ([`Avr`]).
 //!
 //! It implements the supported-opcode **subset** correctly rather than the whole
-//! ISA; unimplemented encodings decode to [`Instr::Unknown`]. See [`decode`] for
+//! ISA; unimplemented encodings decode to [`Instr::Unknown`]. See [`decode`](mod@decode) for
 //! the exact coverage and the documented TODOs.
 
 pub mod core;

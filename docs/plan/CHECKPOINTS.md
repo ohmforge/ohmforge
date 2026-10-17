@@ -37,8 +37,8 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 
 ### M1 — digital kernel + AVR
 - [x] **CP-BRD-M1.1** Event-driven digital kernel (event heap, delays, 0/1/X/Z). — *gate:* a 3-inverter ring oscillates at exactly 2·N·d (60 fs); integer-femtosecond queue with FIFO tie-break (deterministic). Dependency-free + wasm-clean.
-- [ ] **CP-BRD-M1.2** Logic primitives (gates, D/JK flip-flops, counters, mux). — *gate:* truth tables + a counter sequence test.
-- [ ] **CP-BRD-M1.3** AVR core (ATmega328P): decode + execute + interrupts. — *gate:* AVR instruction test-vectors pass.
+- [x] **CP-BRD-M1.2** Logic primitives (gates, D/JK flip-flops, counters, mux). — *gate:* NAND/NOR/XNOR/buf/tri-state truth tables, D & JK behavior, 2:1/4:1 mux, a 4-bit ripple counter 0→15→0 with async clear.
+- [x] **CP-BRD-M1.3** AVR core (ATmega328P): decode + execute + interrupts. — *gate:* table-driven decoder + per-instruction execute tests over a broad subset (ALU/branches/memory/bit-ops/flow), a count-down loop + array-sum program, interrupt dispatch + RETI, raw & Intel-HEX loaders. Documented TODO: MUL/LPM/ADIW/SBIW/SLEEP decode to `Instr::Unknown`.
 - [ ] **CP-BRD-M1.4** AVR peripherals (GPIO, timers/PWM, ADC, UART). — *gate:* measured PWM duty on a pin; UART TX bytes decode correctly.
 - [ ] **CP-BRD-M1.5** Uno board def + firmware load (`.hex`/`.elf`). — *gate:* load `blink.hex`; D13 toggles at ~1 Hz in the sim.
 
@@ -109,11 +109,11 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 | Track | Done | In progress | Total |
 |---|---|---|---|
 | sim-core | 7 | 0 | 15 |
-| boards | 1 | 0 | 10 |
+| boards | 3 | 0 | 10 |
 | ui-shell | 6 | 0 | 13 |
 | ai-fmt | 3 | 0 | 9 |
 | platform | 3 | 0 | 5 |
-| **Total** | **20** | **0** | **52** |
+| **Total** | **22** | **0** | **52** |
 
 *Update this table when flipping a checkpoint.*
 

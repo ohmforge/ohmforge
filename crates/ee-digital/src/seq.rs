@@ -3,8 +3,8 @@
 //! Gates ([`GateKind`](crate::GateKind)) are purely combinational — their output
 //! is a function of their inputs *now*. A flip-flop is different: it carries
 //! state and only samples its data inputs on the **rising edge** of its clock.
-//! That edge detection, plus the stored bit, is what lives here; [`Sim`] owns a
-//! `Vec<SeqElement>` and feeds each one the resolved levels of the nets it reads.
+//! That edge detection, plus the stored bit, is what lives here; [`Sim`](crate::Sim)
+//! owns the elements and feeds each one the resolved levels of the nets it reads.
 //!
 //! Edge detection is a strict `0 → 1` transition on the clock net
 //! (`last_clk == Low && clk == High`). Requiring a definite low *before* the high
@@ -21,7 +21,7 @@ use crate::event::Femtos;
 use crate::sim::{DriverId, Net};
 use crate::Logic;
 
-/// Which flip-flop a [`SeqElement`] implements.
+/// Which flip-flop a sequential element implements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlipFlop {
     /// D-type: on a rising clock edge, `Q` takes the value of the `D` input.

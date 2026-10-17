@@ -1,6 +1,6 @@
 //! Reusable logic building blocks assembled from the kernel's primitives.
 //!
-//! Where [`GateKind`](crate::GateKind) and the flip-flop constructors on [`Sim`]
+//! Where [`GateKind`] and the flip-flop constructors on [`Sim`]
 //! are the primitive cells, this module composes them into the small structural
 //! blocks a board actually uses: multiplexers (built from gates) and a ripple
 //! counter (built from toggle flip-flops). Each builder wires nets and cells into
