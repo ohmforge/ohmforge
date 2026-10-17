@@ -99,7 +99,7 @@ impl<'a> Schematic<'a> {
 }
 
 /// The canonical display name for a resolved net: ground is `gnd`, else `n<id>`.
-fn net_name(net: NetId) -> String {
+pub(crate) fn net_name(net: NetId) -> String {
     if net == NetId::GROUND {
         "gnd".to_string()
     } else {
@@ -108,7 +108,7 @@ fn net_name(net: NetId) -> String {
 }
 
 /// A short, stable label for each part kind. Exhaustive over [`PartKind`].
-fn kind_label(kind: &PartKind) -> &str {
+pub(crate) fn kind_label(kind: &PartKind) -> &str {
     match kind {
         PartKind::Resistor => "Resistor",
         PartKind::Capacitor => "Capacitor",
@@ -121,7 +121,7 @@ fn kind_label(kind: &PartKind) -> &str {
 }
 
 /// Format an optional value; a part with no value renders a blank value column.
-fn fmt_opt_value(value: &Option<Value>) -> String {
+pub(crate) fn fmt_opt_value(value: &Option<Value>) -> String {
     match value {
         Some(v) => fmt_value(v),
         None => String::new(),
@@ -130,7 +130,7 @@ fn fmt_opt_value(value: &Option<Value>) -> String {
 
 /// Format a value in engineering notation with its SI prefix and unit symbol,
 /// e.g. `4700 Ω` → `4.7kΩ`, `1e-6 F` → `1µF`, `5 V` → `5V`.
-fn fmt_value(value: &Value) -> String {
+pub(crate) fn fmt_value(value: &Value) -> String {
     let sym = value.unit.symbol();
     let m = value.magnitude;
     if m == 0.0 {

@@ -98,6 +98,50 @@ impl Screen {
         self
     }
 
+    /// Lay out the three panes with the schematic pane replaced by the live
+    /// operating-point [`Overlay`](crate::Overlay).
+    ///
+    /// Identical geometry to [`render`](Screen::render); the schematic pane shows
+    /// each net's node voltage, colour-coded when `color` is set. The voltages are
+    /// data the caller supplies (see [`NodeVoltages`](crate::overlay::NodeVoltages)),
+    /// keeping `ee-tui` decoupled from the solver.
+    pub fn render_overlay(
+        &self,
+        circuit: &Circuit,
+        volts: &crate::overlay::NodeVoltages,
+        scope: &str,
+        shell: &[&str],
+        color: bool,
+    ) -> String {
+        let w = self.width.max(20);
+        let h = self.height.max(6);
+
+        let left_w = w / 2;
+        let right_w = w - left_w;
+        let bottom_h = (h / 3).clamp(3, h - 3);
+        let top_h = h - bottom_h;
+
+        let left = crate::overlay::Overlay::new("op-point")
+            .width(left_w)
+            .color(color)
+            .pane_lines(circuit, volts, top_h);
+        let right = Pane::new("scope", scope).render(right_w, top_h);
+        let shell_body = shell.join("\n");
+        let bottom = Pane::new("shell", &shell_body).render(w, bottom_h);
+
+        let mut out = String::new();
+        for (l, r) in left.iter().zip(&right) {
+            out.push_str(l);
+            out.push_str(r);
+            out.push('\n');
+        }
+        for line in &bottom {
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
+    }
+
     /// Lay out the three panes and return the composed frame.
     pub fn render(&self, circuit: &Circuit, scope: &str, shell: &[&str]) -> String {
         let w = self.width.max(20);
@@ -136,7 +180,7 @@ impl Screen {
 }
 
 /// The top border with the title inlined: `┌─ title ─────┐`, exactly `w` cells.
-fn top_border(title: &str, w: usize) -> String {
+pub(crate) fn top_border(title: &str, w: usize) -> String {
     let cap = w - 2; // room between the two corner glyphs
     let raw = format!("─ {title} ");
     let mut inner: String = raw.chars().take(cap).collect();
@@ -223,6 +267,44 @@ mod tests {
         assert!(out.contains("sim: ok"), "shell pane:\n{out}");
 
         // Exactly the requested height, and no line wider than the requested width.
+        assert_eq!(out.lines().count(), height, "line count == height");
+        for line in out.lines() {
+            assert!(
+                line.chars().count() <= width,
+                "line exceeds width {width}: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn overlay_pane_composes_with_voltages_and_fits() {
+        use crate::overlay::NodeVoltages;
+        let c = rc_circuit();
+        // Annotate the live net; ground is implicit 0 V.
+        let mut v = NodeVoltages::new();
+        v.set(c.resolve(NetId(1)), 5.0);
+
+        let width = 80;
+        let height = 20;
+        let out = Screen::new().size(width, height).render_overlay(
+            &c,
+            &v,
+            &scope(),
+            &["> op", "sim: ok"],
+            false,
+        );
+
+        // The overlay pane carries a net=voltage annotation and ground at 0 V.
+        assert!(out.contains("n1=5V"), "overlay voltage annotation:\n{out}");
+        assert!(out.contains("gnd=0V"), "ground reference:\n{out}");
+        // Scope and shell panes still compose in.
+        assert!(
+            out.chars()
+                .any(|ch| ('\u{2801}'..='\u{28FF}').contains(&ch)),
+            "scope pane braille:\n{out}"
+        );
+        assert!(out.contains("sim: ok"), "shell pane:\n{out}");
+
         assert_eq!(out.lines().count(), height, "line count == height");
         for line in out.lines() {
             assert!(

@@ -8,10 +8,12 @@
 //! Rendering is decoupled from simulation via snapshots, so a slow redraw never
 //! stalls the solver. See docs/ARCHITECTURE.md § "The TUI." (Roadmap M0+.)
 
+pub mod overlay;
 pub mod plot;
 pub mod schematic;
 pub mod screen;
 
+pub use overlay::{NodeVoltages, Overlay};
 pub use plot::Plot;
 pub use schematic::Schematic;
 pub use screen::{Pane, Screen};
