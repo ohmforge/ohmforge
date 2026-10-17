@@ -24,3 +24,7 @@ ee-fmt = { workspace = true }
 ee-tui = { workspace = true }
 ee-shell = { workspace = true }
 ee-ai = { workspace = true }
+
+# Line editing for the interactive REPL (binary only — never the compute core):
+# history, emacs keybindings, Ctrl-R search, and tab completion.
+rustyline = "14"

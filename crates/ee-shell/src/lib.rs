@@ -81,6 +81,24 @@ impl Shell {
         &self.circuit
     }
 
+    /// The command keywords — for help text and shell tab-completion.
+    pub const COMMANDS: &'static [&'static str] = &["add", "wire", "probe", "run", "show", "help"];
+
+    /// The user's named nodes so far (for tab-completion). Ground aliases are
+    /// not included — they resolve directly to the ground reference.
+    pub fn node_names(&self) -> Vec<&str> {
+        self.nets.keys().map(String::as_str).collect()
+    }
+
+    /// The placed part reference designators (for tab-completion).
+    pub fn part_refs(&self) -> Vec<&str> {
+        self.circuit
+            .parts()
+            .iter()
+            .map(|p| p.reference.as_str())
+            .collect()
+    }
+
     /// Execute one line of input, returning the text to show the user.
     ///
     /// A blank line is a no-op (empty output). Anything the grammar rejects comes
