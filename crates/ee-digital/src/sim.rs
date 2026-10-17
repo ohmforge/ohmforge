@@ -33,6 +33,7 @@
 //! ```
 
 use crate::event::{EventQueue, Femtos};
+use crate::seq::{FlipFlop, SeqElement};
 use crate::Logic;
 
 /// A signal net (an electrically common node), addressed by index.
@@ -49,18 +50,49 @@ pub struct DriverId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GateId(pub usize);
 
+/// A flip-flop (sequential element) instance, addressed by index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SeqId(pub usize);
+
+/// Something that reads a net and must be re-evaluated when that net changes: a
+/// combinational [`Gate`] or a sequential [`SeqElement`]. Stored per-net in
+/// registration order so propagation stays deterministic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sink {
+    Gate(GateId),
+    Seq(SeqId),
+}
+
 /// The built-in combinational gate kinds. Each reduces its input levels with the
 /// matching [`Logic`] truth table.
+///
+/// The reducing gates (`And`/`Nand`/`Or`/`Nor`/`Xor`/`Xnor`) fold over *all* their
+/// inputs, so a two-input NAND and a three-input NAND are the same `GateKind` with
+/// different fan-in. `Not` and `Buf` take exactly one input; `TriState` takes
+/// exactly two (data, enable).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateKind {
     /// Inverter (exactly one input).
     Not,
+    /// Non-inverting buffer (exactly one input): passes its input level, with a
+    /// floating (`Z`) input sensed as unknown (`X`).
+    Buf,
     /// AND of all inputs.
     And,
+    /// NAND — inverted AND of all inputs.
+    Nand,
     /// OR of all inputs.
     Or,
+    /// NOR — inverted OR of all inputs.
+    Nor,
     /// XOR (parity) of all inputs.
     Xor,
+    /// XNOR — inverted XOR (even-parity) of all inputs.
+    Xnor,
+    /// Tri-state buffer: inputs are `[data, enable]`. When `enable` is high the
+    /// output follows `data`; when `enable` is low the output is high-impedance
+    /// (`Z`) so other drivers on the net win; an unknown `enable` yields `X`.
+    TriState,
 }
 
 impl GateKind {
@@ -71,9 +103,24 @@ impl GateKind {
                 debug_assert_eq!(inputs.len(), 1, "a NOT gate takes exactly one input");
                 inputs[0].not()
             }
+            GateKind::Buf => {
+                debug_assert_eq!(inputs.len(), 1, "a buffer takes exactly one input");
+                inputs[0].sensed()
+            }
             GateKind::And => inputs.iter().copied().fold(Logic::High, Logic::and),
+            GateKind::Nand => inputs.iter().copied().fold(Logic::High, Logic::and).not(),
             GateKind::Or => inputs.iter().copied().fold(Logic::Low, Logic::or),
+            GateKind::Nor => inputs.iter().copied().fold(Logic::Low, Logic::or).not(),
             GateKind::Xor => inputs.iter().copied().fold(Logic::Low, Logic::xor),
+            GateKind::Xnor => inputs.iter().copied().fold(Logic::Low, Logic::xor).not(),
+            GateKind::TriState => {
+                debug_assert_eq!(inputs.len(), 2, "a tri-state buffer takes [data, enable]");
+                match inputs[1].sensed() {
+                    Logic::High => inputs[0].sensed(), // enabled: drive the data level
+                    Logic::Low => Logic::Z,            // disabled: release the net
+                    _ => Logic::X,                     // unknown enable
+                }
+            }
         }
     }
 }
@@ -102,9 +149,9 @@ struct Gate {
 struct NetState {
     value: Logic,
     drivers: Vec<DriverId>,
-    /// Gates that read this net, in the order they were added — a fixed,
-    /// deterministic propagation order.
-    fanout: Vec<GateId>,
+    /// Sinks (gates and flip-flops) that read this net, in the order they were
+    /// added — a fixed, deterministic propagation order.
+    fanout: Vec<Sink>,
 }
 
 /// The event-driven digital simulator.
@@ -113,6 +160,7 @@ pub struct Sim {
     nets: Vec<NetState>,
     drivers: Vec<Driver>,
     gates: Vec<Gate>,
+    seq: Vec<SeqElement>,
     queue: EventQueue,
     now: Femtos,
     started: bool,
@@ -160,7 +208,7 @@ impl Sim {
         let out_driver = self.new_driver(output, initial);
         let gid = GateId(self.gates.len());
         for &net in inputs {
-            self.nets[net.0].fanout.push(gid);
+            self.nets[net.0].fanout.push(Sink::Gate(gid));
         }
         self.gates.push(Gate {
             kind,
@@ -170,6 +218,130 @@ impl Sim {
             last_output: initial,
         });
         gid
+    }
+
+    /// Add an edge-triggered **D flip-flop**: on each rising edge of `clk`, `q`
+    /// takes the level of `d` (and `qbar` its complement) after `delay`
+    /// femtoseconds. `initial` is the power-on `q` level. No asynchronous
+    /// set/reset — see [`add_d_flipflop_sr`](Sim::add_d_flipflop_sr) for those.
+    pub fn add_d_flipflop(
+        &mut self,
+        clk: Net,
+        d: Net,
+        q: Net,
+        qbar: Net,
+        delay: Femtos,
+        initial: Logic,
+    ) -> SeqId {
+        self.add_d_flipflop_sr(clk, d, None, None, q, qbar, delay, initial)
+    }
+
+    /// Add a D flip-flop with optional asynchronous active-high `set` (preset)
+    /// and `reset` (clear) nets. Asserting a level-sensitive async pin forces the
+    /// output regardless of the clock; `reset` dominates `set`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_d_flipflop_sr(
+        &mut self,
+        clk: Net,
+        d: Net,
+        set: Option<Net>,
+        reset: Option<Net>,
+        q: Net,
+        qbar: Net,
+        delay: Femtos,
+        initial: Logic,
+    ) -> SeqId {
+        self.add_flipflop(FlipFlop::D, clk, &[d], set, reset, q, qbar, delay, initial)
+    }
+
+    /// Add an edge-triggered **JK flip-flop**: on each rising edge of `clk`,
+    /// `(j, k)` selects hold (`00`), clear (`01`), set (`10`), or toggle (`11`).
+    /// Tying `j` and `k` high makes a toggle (T) flip-flop — the building block of
+    /// the ripple counter. No asynchronous set/reset.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_jk_flipflop(
+        &mut self,
+        clk: Net,
+        j: Net,
+        k: Net,
+        q: Net,
+        qbar: Net,
+        delay: Femtos,
+        initial: Logic,
+    ) -> SeqId {
+        self.add_jk_flipflop_sr(clk, j, k, None, None, q, qbar, delay, initial)
+    }
+
+    /// Add a JK flip-flop with optional asynchronous active-high `set`/`reset`
+    /// nets (see [`add_d_flipflop_sr`](Sim::add_d_flipflop_sr)).
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_jk_flipflop_sr(
+        &mut self,
+        clk: Net,
+        j: Net,
+        k: Net,
+        set: Option<Net>,
+        reset: Option<Net>,
+        q: Net,
+        qbar: Net,
+        delay: Femtos,
+        initial: Logic,
+    ) -> SeqId {
+        self.add_flipflop(
+            FlipFlop::Jk,
+            clk,
+            &[j, k],
+            set,
+            reset,
+            q,
+            qbar,
+            delay,
+            initial,
+        )
+    }
+
+    /// Shared flip-flop wiring: create the `q`/`qbar` drivers, register the
+    /// element in the fan-out of every net it reads (clock, data, async pins) in
+    /// a fixed order, and store it.
+    #[allow(clippy::too_many_arguments)]
+    fn add_flipflop(
+        &mut self,
+        kind: FlipFlop,
+        clk: Net,
+        data: &[Net],
+        set: Option<Net>,
+        reset: Option<Net>,
+        q: Net,
+        qbar: Net,
+        delay: Femtos,
+        initial: Logic,
+    ) -> SeqId {
+        let q_driver = self.new_driver(q, initial);
+        let qbar_driver = self.new_driver(qbar, initial.not());
+        let sid = SeqId(self.seq.len());
+
+        // Register in the fan-out of every input net so a change on any of them
+        // re-evaluates this element. Order is fixed for determinism.
+        self.nets[clk.0].fanout.push(Sink::Seq(sid));
+        for &net in data {
+            self.nets[net.0].fanout.push(Sink::Seq(sid));
+        }
+        for net in set.iter().chain(reset.iter()) {
+            self.nets[net.0].fanout.push(Sink::Seq(sid));
+        }
+
+        self.seq.push(SeqElement::new(
+            kind,
+            clk,
+            data.to_vec(),
+            set,
+            reset,
+            q_driver,
+            qbar_driver,
+            delay,
+            initial,
+        ));
+        sid
     }
 
     /// Register a new driver on `net` and fold its initial level into the net's
@@ -226,6 +398,11 @@ impl Sim {
         for i in 0..self.gates.len() {
             self.reeval_gate(GateId(i));
         }
+        // Seed each flip-flop's clock reference and apply any asserted async
+        // pins, scheduling the output if its reset level needs correcting.
+        for i in 0..self.seq.len() {
+            self.reeval_seq(SeqId(i));
+        }
     }
 
     /// Re-evaluate one gate; if its output changed from the last value it
@@ -237,6 +414,24 @@ impl Sim {
             g.last_output = out;
             let (driver, delay) = (g.output, g.delay);
             self.queue.schedule(self.now + delay, driver, out);
+        }
+    }
+
+    /// Re-evaluate one flip-flop over its inputs' current resolved levels; if its
+    /// `q` output moved, schedule the new `q`/`qbar` pair `delay` into the future.
+    fn reeval_seq(&mut self, sid: SeqId) {
+        let e = &self.seq[sid.0];
+        let clk = self.nets[e.clk.0].value;
+        let data: Vec<Logic> = e.data.iter().map(|&n| self.nets[n.0].value).collect();
+        let set = e.set.map_or(Logic::Low, |n| self.nets[n.0].value);
+        let reset = e.reset.map_or(Logic::Low, |n| self.nets[n.0].value);
+
+        let e = &mut self.seq[sid.0];
+        if let Some((q, qbar)) = e.update(clk, &data, set, reset) {
+            let (q_driver, qbar_driver, delay) = (e.q, e.qbar, e.delay);
+            let at = self.now + delay;
+            self.queue.schedule(at, q_driver, q);
+            self.queue.schedule(at, qbar_driver, qbar);
         }
     }
 
@@ -259,8 +454,11 @@ impl Sim {
         // Fanout order is fixed (registration order), so propagation is
         // deterministic. Clone the small list to release the borrow on `nets`.
         let fanout = self.nets[net.0].fanout.clone();
-        for gid in fanout {
-            self.reeval_gate(gid);
+        for sink in fanout {
+            match sink {
+                Sink::Gate(gid) => self.reeval_gate(gid),
+                Sink::Seq(sid) => self.reeval_seq(sid),
+            }
         }
     }
 
@@ -300,6 +498,7 @@ impl Sim {
 #[cfg(test)]
 mod tests {
     use super::{GateKind, Sim};
+    use crate::event::Femtos;
     use crate::Logic;
 
     /// An odd ring of inverters oscillates with period `2 · N · d`. This is the
@@ -415,5 +614,206 @@ mod tests {
         sim.set_input(d0, Logic::Low, 10); // agree again, low
         sim.run_until(10);
         assert_eq!(sim.value(n), Logic::Low, "both drive low → low");
+    }
+
+    /// Drive a two-input gate's inputs to `(a, b)` and read its settled output.
+    fn two_input(kind: GateKind, a: Logic, b: Logic) -> Logic {
+        let mut sim = Sim::new();
+        let (na, nb, ny) = (sim.add_net(), sim.add_net(), sim.add_net());
+        sim.add_input(na, a);
+        sim.add_input(nb, b);
+        sim.add_gate(kind, &[na, nb], ny, 5, Logic::X);
+        sim.run_until(5);
+        sim.value(ny)
+    }
+
+    #[test]
+    fn nand_nor_xnor_truth_tables() {
+        use Logic::{High as H, Low as L};
+        // (a, b, NAND, NOR, XNOR)
+        let cases = [
+            (L, L, H, H, H),
+            (L, H, H, L, L),
+            (H, L, H, L, L),
+            (H, H, L, L, H),
+        ];
+        for (a, b, nand, nor, xnor) in cases {
+            assert_eq!(two_input(GateKind::Nand, a, b), nand, "NAND({a:?},{b:?})");
+            assert_eq!(two_input(GateKind::Nor, a, b), nor, "NOR({a:?},{b:?})");
+            assert_eq!(two_input(GateKind::Xnor, a, b), xnor, "XNOR({a:?},{b:?})");
+        }
+    }
+
+    #[test]
+    fn buffer_passes_its_input() {
+        let mut sim = Sim::new();
+        let (a, y) = (sim.add_net(), sim.add_net());
+        let da = sim.add_input(a, Logic::Low);
+        sim.add_gate(GateKind::Buf, &[a], y, 5, Logic::X);
+        sim.run_until(5);
+        assert_eq!(sim.value(y), Logic::Low);
+        sim.set_input(da, Logic::High, 10);
+        sim.run_until(15);
+        assert_eq!(sim.value(y), Logic::High);
+    }
+
+    #[test]
+    fn tristate_buffer_releases_the_net_when_disabled() {
+        // A tri-state buffer shares a net with a plain input. When the buffer is
+        // disabled it floats (Z) and the other driver wins; when enabled it
+        // drives, conflicting with a disagreeing driver → X.
+        let mut sim = Sim::new();
+        let (data, en, bus) = (sim.add_net(), sim.add_net(), sim.add_net());
+        sim.add_input(data, Logic::High);
+        let den = sim.add_input(en, Logic::Low);
+        let dbus = sim.add_input(bus, Logic::Low); // the other driver on the bus
+        sim.add_gate(GateKind::TriState, &[data, en], bus, 5, Logic::Z);
+
+        sim.run_until(5);
+        assert_eq!(
+            sim.value(bus),
+            Logic::Low,
+            "disabled buffer floats; input wins"
+        );
+
+        sim.set_input(den, Logic::High, 10); // enable: buffer drives High vs input Low
+        sim.run_until(15);
+        assert_eq!(
+            sim.value(bus),
+            Logic::X,
+            "enabled buffer conflicts with the input"
+        );
+
+        sim.set_input(dbus, Logic::Z, 20); // other driver releases the bus
+        sim.run_until(25);
+        assert_eq!(
+            sim.value(bus),
+            Logic::High,
+            "buffer alone now drives the bus"
+        );
+    }
+
+    #[test]
+    fn d_flipflop_latches_d_on_the_rising_edge() {
+        const DLY: Femtos = 5;
+        let mut sim = Sim::new();
+        let (clk, d, q, qbar) = (sim.add_net(), sim.add_net(), sim.add_net(), sim.add_net());
+        let dclk = sim.add_input(clk, Logic::Low);
+        let dd = sim.add_input(d, Logic::Low);
+        sim.add_d_flipflop(clk, d, q, qbar, DLY, Logic::Low);
+
+        sim.run_until(0);
+        assert_eq!(sim.value(q), Logic::Low);
+        assert_eq!(sim.value(qbar), Logic::High);
+
+        // Set D high well before the edge; the edge then latches a 1.
+        sim.set_input(dd, Logic::High, 10);
+        sim.set_input(dclk, Logic::High, 20);
+        sim.run_until(20 + DLY - 1);
+        assert_eq!(
+            sim.value(q),
+            Logic::Low,
+            "output changes only after the delay"
+        );
+        sim.run_until(20 + DLY);
+        assert_eq!(sim.value(q), Logic::High, "D=1 latched on the rising edge");
+        assert_eq!(sim.value(qbar), Logic::Low);
+
+        // Dropping D while the clock is high must not disturb Q.
+        sim.set_input(dd, Logic::Low, 30);
+        sim.run_until(40);
+        assert_eq!(sim.value(q), Logic::High, "Q holds between edges");
+
+        // Clock low (no effect), then a fresh rising edge latches the new D=0.
+        sim.set_input(dclk, Logic::Low, 50);
+        sim.set_input(dclk, Logic::High, 60);
+        sim.run_until(60 + DLY);
+        assert_eq!(sim.value(q), Logic::Low, "D=0 latched on the next edge");
+        assert_eq!(sim.value(qbar), Logic::High);
+    }
+
+    #[test]
+    fn d_flipflop_async_reset_overrides_the_clock() {
+        const DLY: Femtos = 5;
+        let mut sim = Sim::new();
+        let (clk, d, rst, q, qbar) = (
+            sim.add_net(),
+            sim.add_net(),
+            sim.add_net(),
+            sim.add_net(),
+            sim.add_net(),
+        );
+        let dclk = sim.add_input(clk, Logic::Low);
+        sim.add_input(d, Logic::High); // D is held high throughout
+        let drst = sim.add_input(rst, Logic::High); // start asserted
+        sim.add_d_flipflop_sr(clk, d, None, Some(rst), q, qbar, DLY, Logic::Low);
+
+        // Reset asserted pins Q low even across a rising edge.
+        sim.set_input(dclk, Logic::High, 10);
+        sim.run_until(10 + DLY);
+        assert_eq!(sim.value(q), Logic::Low, "async reset dominates the clock");
+
+        // Release reset, drop the clock, then clock again: now D=1 latches.
+        sim.set_input(drst, Logic::Low, 20);
+        sim.set_input(dclk, Logic::Low, 30);
+        sim.set_input(dclk, Logic::High, 40);
+        sim.run_until(40 + DLY);
+        assert_eq!(sim.value(q), Logic::High, "latches once reset is released");
+    }
+
+    #[test]
+    fn jk_flipflop_set_clear_hold_and_toggle() {
+        const DLY: Femtos = 5;
+        let mut sim = Sim::new();
+        let (clk, j, k, q, qbar) = (
+            sim.add_net(),
+            sim.add_net(),
+            sim.add_net(),
+            sim.add_net(),
+            sim.add_net(),
+        );
+        let dclk = sim.add_input(clk, Logic::Low);
+        let dj = sim.add_input(j, Logic::Low);
+        let dk = sim.add_input(k, Logic::Low);
+        sim.add_jk_flipflop(clk, j, k, q, qbar, DLY, Logic::Low);
+
+        // Pulse the clock 0→1→0 at `base`, returning the time just after the edge
+        // has propagated. Inputs must be set before `base`.
+        let mut base = 10u64;
+        let pulse = |sim: &mut Sim, base: u64| {
+            sim.set_input(dclk, Logic::High, base);
+            sim.set_input(dclk, Logic::Low, base + 20);
+            sim.run_until(base + 20 + DLY);
+        };
+
+        // J=1,K=0 → set.
+        sim.set_input(dj, Logic::High, base - 2);
+        pulse(&mut sim, base);
+        assert_eq!(sim.value(q), Logic::High, "J=1,K=0 sets Q");
+        base += 40;
+
+        // J=0,K=1 → clear.
+        sim.set_input(dj, Logic::Low, base - 2);
+        sim.set_input(dk, Logic::High, base - 2);
+        pulse(&mut sim, base);
+        assert_eq!(sim.value(q), Logic::Low, "J=0,K=1 clears Q");
+        base += 40;
+
+        // J=0,K=0 → hold (Q stays low).
+        sim.set_input(dk, Logic::Low, base - 2);
+        pulse(&mut sim, base);
+        assert_eq!(sim.value(q), Logic::Low, "J=0,K=0 holds Q");
+        base += 40;
+
+        // J=1,K=1 → toggle on each edge: Low→High→Low.
+        sim.set_input(dj, Logic::High, base - 2);
+        sim.set_input(dk, Logic::High, base - 2);
+        pulse(&mut sim, base);
+        assert_eq!(sim.value(q), Logic::High, "toggle 0→1");
+        assert_eq!(sim.value(qbar), Logic::Low);
+        base += 40;
+        pulse(&mut sim, base);
+        assert_eq!(sim.value(q), Logic::Low, "toggle 1→0");
+        assert_eq!(sim.value(qbar), Logic::High);
     }
 }

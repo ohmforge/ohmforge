@@ -20,10 +20,14 @@
 //! Roadmap: M1 = gates/flip-flops/counters + X/Z; M2 = memories/buses/tri-state
 //! + protocol decode; M3 = HDL-lite. (docs/ROADMAP.md)
 
+pub mod components;
 pub mod event;
 pub mod logic;
+pub mod seq;
 pub mod sim;
 
+pub use components::RippleCounter;
 pub use event::{Event, EventQueue, Femtos};
 pub use logic::Logic;
-pub use sim::{DriverId, GateId, GateKind, Net, Sim};
+pub use seq::FlipFlop;
+pub use sim::{DriverId, GateId, GateKind, Net, SeqId, Sim};
