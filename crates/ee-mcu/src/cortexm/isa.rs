@@ -183,7 +183,7 @@ pub enum Instr {
     /// `NOP` (and the other hint instructions, treated as no-ops).
     Nop,
     /// An encoding outside the modelled subset; executes as a no-op under debug
-    /// assertion. See [`decode`](super::decode) for the documented TODOs.
+    /// assertion. See [`decode`](mod@super::decode) for the documented TODOs.
     Unknown(u16),
 }
 

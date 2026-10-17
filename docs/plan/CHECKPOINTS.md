@@ -44,8 +44,8 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 
 ### M2 — co-simulation + more cores
 - [x] **CP-BRD-M2.1** Co-sim bridge: pin↔net, clock sync. — *gate:* `analogRead` of 2.5 V → ADC code 512 (cosim tests); **`ee cosim`** runs real AVR firmware whose `digitalWrite(13,HIGH)` drives the lockstep bridge → a simulated LED lights at 19.4 mA. Surface (`PinIo`, `McuCore::{next_event, step_to_cycle}`) in `ee-mcu`; lockstep loop in the `ee` binary.
-- [ ] **CP-BRD-M2.2** Mixed-signal boundary elements (threshold, drive strength, rise/fall). — *gate:* boundary behavior test at configured thresholds.
-- [ ] **CP-BRD-M2.3** Cortex-M0+ core + RP2040 (Raspberry Pi Pico). — *gate:* ARMv6-M (Thumb) test-vectors; Pico blink toggles a pin.
+- [x] **CP-BRD-M2.2** Mixed-signal boundary elements (threshold, drive strength, rise/fall). — *gate:* Schmitt-hysteresis input resolution (`ee_digital::Logic`), Thévenin output (drive high/low/HighZ → v_oc + series R) that sags under load; slew limiting. Rides `PinIo`.
+- [x] **CP-BRD-M2.3** Cortex-M0+ core + RP2040 (Raspberry Pi Pico). — *gate:* ARMv6-M (Thumb) per-instruction + flag vectors; NVIC-lite exceptions; a `Pico` (RP2040 SIO GPIO) blink toggles GP25. Implements the same `McuCore`/co-sim surface as AVR.
 - [ ] **CP-BRD-M2.4** ATmega2560 / ATtiny variants. — *gate:* variant peripheral map test.
 - [ ] **CP-BRD-M2.5** External toolchain compile orchestration (`arduino-cli`/`avr-gcc`/`arm-none-eabi`). — *gate:* compile a `.ino` → hex → run end-to-end (skipped if toolchain absent).
 
@@ -109,11 +109,11 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 | Track | Done | In progress | Total |
 |---|---|---|---|
 | sim-core | 14 | 0 | 15 |
-| boards | 6 | 0 | 10 |
+| boards | 8 | 0 | 10 |
 | ui-shell | 12 | 0 | 13 |
 | ai-fmt | 5 | 0 | 9 |
 | platform | 3 | 0 | 5 |
-| **Total** | **40** | **0** | **52** |
+| **Total** | **42** | **0** | **52** |
 
 *Update this table when flipping a checkpoint.*
 
