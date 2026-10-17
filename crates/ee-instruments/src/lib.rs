@@ -8,9 +8,17 @@
 //! Instruments *consume* signals and *control* sources; they hold no solver
 //! state of their own.
 
-pub mod oscilloscope;
+mod fmt;
 
+pub mod dmm;
+pub mod funcgen;
+pub mod oscilloscope;
+pub mod psu;
+
+pub use dmm::{measure, DmmMode, DmmReading, Multimeter};
+pub use funcgen::{FuncGen, Waveform};
 pub use oscilloscope::{CursorReadout, Cursors, Oscilloscope, Slope, Timebase, Trigger};
+pub use psu::{BenchPsu, PsuMode, PsuOutput};
 
 /// A named signal an instrument can display (a node voltage, a branch current,
 /// an MCU pin, or a math channel).
