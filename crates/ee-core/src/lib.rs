@@ -13,7 +13,7 @@ pub mod time;
 pub mod units;
 pub mod value;
 
-pub use graph::{Circuit, NetId, PartId};
+pub use graph::{Circuit, NetId, PartId, Waveform};
 pub use signal::{Complex, Domain, Signal, SignalData};
 pub use units::Unit;
 pub use value::Value;

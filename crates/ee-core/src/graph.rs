@@ -38,8 +38,42 @@ pub enum PartKind {
     Other(String),
 }
 
-/// A part instance: a kind, a human reference (`R1`), a primary value, and the
-/// nets its terminals connect to.
+/// How an independent source varies over time.
+///
+/// The operating point and the `t = 0` transient sample use the waveform's bias:
+/// the constant for [`Dc`](Waveform::Dc), the `offset` of a [`Sine`](Waveform::Sine),
+/// the `v1` of a [`Pulse`](Waveform::Pulse). During a transient the formula is
+/// evaluated at the current time; AC analysis treats a `Sine` source as the
+/// 1∠0 small-signal drive. Non-source parts ignore their waveform. (`CP-SIM-M1`.)
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum Waveform {
+    /// Constant source — the part's own [`Value`] magnitude is the level. This is
+    /// the default, so a source built with [`Circuit::add_part`] behaves exactly
+    /// as it did before waveforms existed.
+    #[default]
+    Dc,
+    /// `offset + amplitude·sin(2π·freq·t + phase)`. `freq` is in hertz, `phase_deg`
+    /// in degrees. The DC/operating-point value is `offset`.
+    Sine {
+        amplitude: f64,
+        freq: f64,
+        offset: f64,
+        phase_deg: f64,
+    },
+    /// A repeating pulse: `v1` until `delay`, then `v2` for `width`, back to `v1`
+    /// for the rest of each `period` (set `period <= 0` for a single, non-repeating
+    /// pulse). The DC/operating-point value is `v1`.
+    Pulse {
+        v1: f64,
+        v2: f64,
+        delay: f64,
+        width: f64,
+        period: f64,
+    },
+}
+
+/// A part instance: a kind, a human reference (`R1`), a primary value, the nets
+/// its terminals connect to, and (for sources) a time [`Waveform`].
 #[derive(Debug, Clone)]
 pub struct Part {
     pub id: PartId,
@@ -47,6 +81,9 @@ pub struct Part {
     pub kind: PartKind,
     pub value: Option<Value>,
     pub terminals: Vec<NetId>,
+    /// The source's time behavior; [`Waveform::Dc`] for everything else. Set via
+    /// [`Circuit::set_waveform`]; [`Circuit::add_part`] always starts it at `Dc`.
+    pub waveform: Waveform,
 }
 
 /// The whole circuit — the single source of truth every front end mutates.
@@ -139,8 +176,22 @@ impl Circuit {
             kind,
             value,
             terminals,
+            waveform: Waveform::default(),
         });
         id
+    }
+
+    /// Attach a time [`Waveform`] to an existing source by reference designator.
+    /// Returns `true` if a part with that reference was found and updated, `false`
+    /// otherwise. Only independent sources act on it; other parts carry it inertly.
+    pub fn set_waveform(&mut self, reference: &str, waveform: Waveform) -> bool {
+        match self.parts.iter_mut().find(|p| p.reference == reference) {
+            Some(p) => {
+                p.waveform = waveform;
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn parts(&self) -> &[Part] {
@@ -192,5 +243,25 @@ mod tests {
         c.add_part("R1", PartKind::Resistor, None, vec![a, b]);
         assert!(c.part_by_ref("R1").is_some());
         assert!(c.part_by_ref("R2").is_none());
+    }
+
+    #[test]
+    fn parts_default_to_dc_and_set_waveform_targets_by_reference() {
+        let mut c = Circuit::new("c");
+        let (a, b) = (c.new_net(), c.new_net());
+        c.add_part("V1", PartKind::VoltageSource, None, vec![a, b]);
+        // A freshly added source is DC by default (no behavior change at M0).
+        assert_eq!(c.part_by_ref("V1").unwrap().waveform, Waveform::Dc);
+
+        let wf = Waveform::Sine {
+            amplitude: 1.0,
+            freq: 1_000.0,
+            offset: 0.0,
+            phase_deg: 0.0,
+        };
+        assert!(c.set_waveform("V1", wf));
+        assert_eq!(c.part_by_ref("V1").unwrap().waveform, wf);
+        // An unknown reference leaves the circuit untouched and reports false.
+        assert!(!c.set_waveform("V9", Waveform::Dc));
     }
 }
