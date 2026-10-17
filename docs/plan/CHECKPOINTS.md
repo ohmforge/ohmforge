@@ -90,8 +90,8 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 - [x] **CP-AF-M2.3** VCD + CSV waveform export. — *gate:* CSV matches the probe data byte-for-byte (complex → mag/phase columns); VCD is well-formed ($timescale/$var, strictly-increasing ticks, change-only records; analog `real` vars, 0/1 → scalar bits).
 
 ### M3 — breadth interop + offline
-- [ ] **CP-AF-M3.1** KiCad netlist import; BOM export (CSV). — *gate:* import a known KiCad netlist (sim matches); BOM lists every part with value/qty.
-- [ ] **CP-AF-M3.2** Offline mode: RAG parts index + heuristics/tutor. — *gate:* offline value calculators + rule checks (floating node, no ground, LED w/o resistor) fire correctly with no API key.
+- [x] **CP-AF-M3.1** KiCad netlist import; BOM export (CSV). — *gate:* a KiCad s-expr netlist imports and solves to the 5 V divider midpoint; BOM groups by kind+value with quantities + sorted references (summed qty = part count). `import_kicad` / `to_bom_csv`.
+- [x] **CP-AF-M3.2** Offline mode: RAG parts index + heuristics/tutor. — *gate:* `offline_needs_no_api_key_or_transport` — DRC rules (short-across-source, no-path-to-ground, floating node, LED-without-resistor), value calculators (divider, RC/RL τ, cutoff, series/parallel, LED resistor), and a keyword-scored parts catalog — all pure, deterministic, no model/network.
 
 ---
 
@@ -111,9 +111,9 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 | sim-core | 14 | 0 | 15 |
 | boards | 8 | 0 | 10 |
 | ui-shell | 13 | 0 | 13 |
-| ai-fmt | 7 | 0 | 9 |
+| ai-fmt | 9 | 0 | 9 |
 | platform | 4 | 0 | 5 |
-| **Total** | **46** | **0** | **52** |
+| **Total** | **48** | **0** | **52** |
 
 *Update this table when flipping a checkpoint.*
 
