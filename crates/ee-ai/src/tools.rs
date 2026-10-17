@@ -1,7 +1,7 @@
 //! The tool layer over the circuit API — the grounding path (CP-AF-M1.3).
 //!
 //! Last checkpoint built the tool-use *loop* ([`crate::client`]) with a generic
-//! [`ToolHandler`](crate::client::ToolHandler) seam. This checkpoint fills that
+//! [`ToolHandler`] seam. This checkpoint fills that
 //! seam with the concrete tools the model actually gets, and they map onto the
 //! **same `eesh` shell and simulator a user drives** — the trust model from
 //! docs/AI.md: *the AI can only do what a user could.*

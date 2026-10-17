@@ -82,7 +82,7 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 ### M1 — interop + first AI
 - [x] **CP-AF-M1.1** SPICE netlist import/export. — *gate:* `imported_divider_simulates_to_the_midpoint` (import→`ee-sim` op-point = 5 V) + `round_trip_preserves_parts_and_topology`; handles the SPICE `m`(milli)-vs-`meg`(mega) footgun.
 - [x] **CP-AF-M1.2** Claude client (Messages API, streaming, tool schema, prompt caching) over a mockable transport. — *gate:* tool-use loop driven to completion via `MockTransport` (tool_use→result→final text), streaming reassembly, cache markers, `claude-sonnet-5-5` default + env override, key runtime-only — 13 tests, no network, no new deps.
-- [ ] **CP-AF-M1.3** AI tool layer over the circuit API (add/wire/set/run/read). — *gate:* "ask" answers a question grounded in a real sim read (stub model, real sim).
+- [x] **CP-AF-M1.3** AI tool layer over the circuit API (add/wire/set/run/read). — *gate:* `ask_is_grounded_in_a_real_sim_read` — stub model drives a REAL `Shell`+engine via `eesh`/`read_op` tools, builds a 12 V divider, and its answer (8.000000 V) matches the real solve (12·2k/3k). The AI does only what a user could; no network.
 
 ### M2 — verified design + waveform export
 - [ ] **CP-AF-M2.1** Verification loop: staged patch → scratch apply → re-sim → measure → present diff; `apply`/`reject` gate. — *gate:* "5 V→3.3 V @ 500 mA" yields a patch whose sim meets spec; nothing applies without approval.
@@ -111,9 +111,9 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 | sim-core | 7 | 0 | 15 |
 | boards | 3 | 0 | 10 |
 | ui-shell | 6 | 0 | 13 |
-| ai-fmt | 3 | 0 | 9 |
+| ai-fmt | 4 | 0 | 9 |
 | platform | 3 | 0 | 5 |
-| **Total** | **22** | **0** | **52** |
+| **Total** | **23** | **0** | **52** |
 
 *Update this table when flipping a checkpoint.*
 
