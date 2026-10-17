@@ -43,6 +43,28 @@ impl BoardDef {
         }
     }
 
+    /// The Arduino Mega 2560 (ATmega2560) manifest: digital D0..D53, analog
+    /// A0..A15, and the on-board LED on D13 (PB7). The runnable core + pin
+    /// resolution lives in `ee-mcu`'s `avr::board::Mega`; this manifest is the
+    /// catalog entry. The ATmega2560 is the same AVR ISA as the Uno's 328P with
+    /// a larger memory map and more ports/timers.
+    pub fn mega() -> Self {
+        let mut pins = Vec::new();
+        // The PORTB header pins the emulator models: D10..D13 → PB4..PB7, with
+        // the on-board LED on D13 (PB7). The full Mega header spans more ports
+        // (see `ee-mcu`'s `avr::board::Mega`); the catalog records the LED and
+        // the modelled PORTB pins.
+        for d in 10u8..=13 {
+            pins.push(format!("D{d}=PB{}", d - 6));
+        }
+        pins.push("LED=PB7".to_string());
+        Self {
+            model: "mega".to_string(),
+            mcu: "atmega2560".to_string(),
+            pins,
+        }
+    }
+
     /// The Raspberry Pi Pico (RP2040 / Cortex-M0+) manifest: GP0..GP28 mapped to
     /// the SIO GPIO bits (the GP number is the GPIO number), plus the on-board
     /// LED on GP25. The runnable core + pin resolution lives in `ee-mcu`'s
@@ -74,6 +96,15 @@ mod tests {
         assert!(uno.pins.contains(&"D13=PB5".to_string()));
         assert!(uno.pins.contains(&"A0=PC0".to_string()));
         assert_eq!(uno.pins.len(), 14 + 6);
+    }
+
+    #[test]
+    fn mega_manifest_maps_the_led_pin() {
+        let mega = BoardDef::mega();
+        assert_eq!(mega.mcu, "atmega2560");
+        assert!(mega.pins.contains(&"D13=PB7".to_string()));
+        assert!(mega.pins.contains(&"LED=PB7".to_string()));
+        assert!(mega.pins.contains(&"D10=PB4".to_string()));
     }
 
     #[test]

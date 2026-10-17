@@ -677,10 +677,20 @@ impl Usart {
     }
 }
 
-/// The ATmega328P's memory-mapped peripherals.
+/// The AVR core's memory-mapped peripherals.
+///
+/// The live register file (GPIO ports B/C/D and Timer0/Timer1 at their
+/// ATmega328P I/O addresses) is the shared subset reused across every variant;
+/// `port_count` records how many of those ports the current part actually bonds
+/// out, so the co-sim exchange only samples and publishes real pins (see
+/// [`variant`](crate::avr::variant) for the declared-vs-modelled split).
 #[derive(Debug, Clone, Default)]
 pub struct Peripherals {
     ports: [PortReg; 3],
+    /// Number of GPIO ports this part bonds out (sizes the [`PinIo`] exchange
+    /// and bounds the live-port iteration). `1` for a single-port part, up to
+    /// `PORTS.len()` modelled register-decoded ports.
+    port_count: usize,
     timer0: Timer8,
     timer1: Timer16,
     adc: Adc,
@@ -692,15 +702,35 @@ pub struct Peripherals {
 }
 
 impl Peripherals {
-    /// A reset peripheral set.
+    /// A reset peripheral set for the default three-port (ATmega328P) map.
     pub fn new() -> Self {
+        Self::with_port_count(PORTS.len())
+    }
+
+    /// A reset peripheral set bonding out `port_count` GPIO ports. The co-sim
+    /// [`PinIo`] exchange is sized to `port_count * 8`; only the first
+    /// `port_count` ports (of the modelled B/C/D set) are sampled and published.
+    pub fn with_port_count(port_count: usize) -> Self {
         Self {
+            port_count,
             usart: Usart::default(),
             adc: Adc::default(),
             thresholds: InputThresholds::default(),
             drive: OutputDrive::default(),
             ..Default::default()
         }
+    }
+
+    /// The number of pins in this part's [`PinIo`] exchange: eight per bonded
+    /// port.
+    pub fn pin_count(&self) -> usize {
+        self.port_count * 8
+    }
+
+    /// The live, register-decoded ports to sample/publish: the first
+    /// `port_count` of the modelled B/C/D set.
+    fn live_port_count(&self) -> usize {
+        self.port_count.min(PORTS.len())
     }
 
     fn port_mut(&mut self, p: Port) -> &mut PortReg {
@@ -757,7 +787,7 @@ impl Peripherals {
     /// held state for a voltage inside the band), and each Port C pin
     /// additionally feeds its ADC channel. Called at the top of a co-sim step.
     pub fn sample_inputs(&mut self, io: &PinIo) {
-        for &port in &PORTS {
+        for &port in &PORTS[..self.live_port_count()] {
             for bit in 0..8u8 {
                 let v = io.input(pin_id(port, bit));
                 // The input's last settled level is the hysteresis memory: a
@@ -812,7 +842,7 @@ impl Peripherals {
     /// Publish each pin's drive into the co-sim exchange's *out* half. Called at
     /// the end of a co-sim step.
     pub fn publish_drives(&self, io: &mut PinIo) {
-        for &port in &PORTS {
+        for &port in &PORTS[..self.live_port_count()] {
             for bit in 0..8u8 {
                 io.set_drive(pin_id(port, bit), self.pin_drive(port, bit));
             }

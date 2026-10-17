@@ -1,24 +1,28 @@
-//! The ATmega328P core: register file, memory model, interrupt controller, and
-//! the fetch/decode/execute step loop.
+//! The AVR core: register file, memory model, interrupt controller, and the
+//! fetch/decode/execute step loop. The core is shared across variants; an
+//! [`AvrVariant`] sizes its memory and sets the vector stride and clock (see
+//! [`variant`](super::variant)).
 //!
 //! # Memory model
 //!
 //! The AVR data space is a single byte-addressed space that overlays the
-//! register file, the I/O registers, and SRAM:
+//! register file, the I/O registers, and SRAM. The ranges below are for the
+//! default ATmega328P; the SRAM start (`sram_start`) and size, and so `RAMEND`,
+//! come from the variant:
 //!
 //! | range           | contents                                   |
 //! |-----------------|--------------------------------------------|
 //! | `0x0000..0x0020`| the 32 general-purpose registers `r0..r31` |
-//! | `0x0020..0x0100`| I/O and extended-I/O registers             |
-//! | `0x0100..0x0900`| 2 KiB internal SRAM                        |
+//! | `0x0020..sram_start`| I/O and extended-I/O registers         |
+//! | `sram_start..=RAMEND`| internal SRAM                         |
 //!
 //! `SREG` (`0x5F`), `SPL` (`0x5D`) and `SPH` (`0x5E`) live in the I/O window but
 //! are kept as dedicated fields ([`Sreg`], [`Avr::sp`]) so there is a single
 //! source of truth; data-space accesses to those addresses route to the fields.
 //! `IN`/`OUT` address the I/O window via `addr + 0x20`.
 //!
-//! Flash is 16 K words (32 KiB) of 16-bit instructions; the program counter
-//! ([`Avr::pc`]) is a **word** index.
+//! Flash holds 16-bit instructions (`flash_words` of them, per variant); the
+//! program counter ([`Avr::pc`]) is a **word** index.
 //!
 //! # Interrupts
 //!
@@ -32,38 +36,34 @@ use crate::{FirmwareError, McuCore, PinIo};
 
 use super::decode::decode;
 use super::isa::{Instr, Ptr, PtrMode};
-use super::periph::{Peripherals, Port, PIN_COUNT};
+use super::periph::{Peripherals, Port};
 use super::sreg::Sreg;
+use super::variant::AvrVariant;
 
-/// Flash size in 16-bit words (ATmega328P: 32 KiB).
-const FLASH_WORDS: usize = 16 * 1024;
-/// Internal SRAM size in bytes (ATmega328P: 2 KiB).
-const SRAM_SIZE: usize = 2 * 1024;
-/// First data-space address of SRAM.
-const SRAM_START: u16 = 0x0100;
-/// First data-space address of the I/O window.
+/// First data-space address of the I/O window (same on every AVR variant).
 const IO_START: u16 = 0x0020;
-/// Highest valid data address (`RAMEND`): the stack pointer's reset value.
-const RAMEND: u16 = SRAM_START + SRAM_SIZE as u16 - 1; // 0x08FF
-/// Data-space addresses of `SPL`/`SPH`/`SREG`.
+/// Data-space addresses of `SPL`/`SPH`/`SREG` (same on every modelled variant).
 const SPL_ADDR: u16 = 0x5D;
 const SPH_ADDR: u16 = 0x5E;
 const SREG_ADDR: u16 = 0x5F;
-/// Each interrupt vector is two words apart on the ATmega328P (it uses `JMP`).
-const VECTOR_SIZE_WORDS: u16 = 2;
-/// Default clock, matching the Arduino Uno (16 MHz).
-const DEFAULT_F_CPU: f64 = 16_000_000.0;
 
-/// An instruction-accurate ATmega328P core.
+/// An instruction-accurate AVR core, specialised to a part by an
+/// [`AvrVariant`].
+///
+/// The register file, decoder and step loop are shared across every variant;
+/// the [`variant`](Avr::variant) sizes flash, SRAM and the I/O window and fixes
+/// `RAMEND`, the interrupt-vector stride and the default clock. See
+/// [`variant`](super::variant) for the per-part parameters.
 pub struct Avr {
     /// Program flash, one 16-bit instruction word per entry.
     flash: Vec<u16>,
     /// The 32 general-purpose registers `r0..r31`.
     regs: [u8; 32],
-    /// The I/O window `0x20..0x100` (minus the `SP`/`SREG` fields).
-    io: [u8; (SRAM_START - IO_START) as usize],
-    /// 2 KiB of internal SRAM.
-    sram: [u8; SRAM_SIZE],
+    /// The I/O (and extended-I/O) window `0x20..sram_start`, minus the
+    /// `SP`/`SREG` fields.
+    io: Vec<u8>,
+    /// Internal SRAM (`sram_start..=RAMEND`).
+    sram: Vec<u8>,
     /// Status register.
     sreg: Sreg,
     /// Stack pointer (full 16-bit data address of the next free byte).
@@ -78,6 +78,8 @@ pub struct Avr {
     f_cpu: f64,
     /// Memory-mapped peripherals (GPIO, timers/PWM, ADC, USART).
     periph: Peripherals,
+    /// The part this core models (memory map, pin count, vector stride, clock).
+    variant: AvrVariant,
 }
 
 impl Default for Avr {
@@ -87,37 +89,52 @@ impl Default for Avr {
 }
 
 impl Avr {
-    /// A reset core with empty flash and the Arduino Uno's 16 MHz clock.
+    /// A reset ATmega328P core with empty flash and the Arduino Uno's 16 MHz
+    /// clock.
     pub fn new() -> Self {
+        Self::with_variant(AvrVariant::atmega328p())
+    }
+
+    /// A reset core specialised to `variant`: flash, SRAM and the I/O window are
+    /// sized from it, the stack is parked at `RAMEND`, and the clock defaults to
+    /// the part's `f_cpu`.
+    pub fn with_variant(variant: AvrVariant) -> Self {
+        let io_len = (variant.sram_start - IO_START) as usize;
         let mut avr = Self {
-            flash: vec![0; FLASH_WORDS],
+            flash: vec![0; variant.flash_words],
             regs: [0; 32],
-            io: [0; (SRAM_START - IO_START) as usize],
-            sram: [0; SRAM_SIZE],
+            io: vec![0; io_len],
+            sram: vec![0; variant.sram_bytes],
             sreg: Sreg::default(),
-            sp: RAMEND,
+            sp: variant.ramend(),
             pc: 0,
             pending: 0,
             cycles: 0,
-            f_cpu: DEFAULT_F_CPU,
-            periph: Peripherals::new(),
+            f_cpu: variant.f_cpu,
+            periph: Peripherals::with_port_count(variant.port_count),
+            variant,
         };
         avr.reset();
         avr
+    }
+
+    /// The part this core models.
+    pub fn variant(&self) -> &AvrVariant {
+        &self.variant
     }
 
     /// Reset the core state (registers, SREG, SP, PC, pending interrupts, and the
     /// cycle counter) without touching flash.
     pub fn reset(&mut self) {
         self.regs = [0; 32];
-        self.io = [0; (SRAM_START - IO_START) as usize];
-        self.sram = [0; SRAM_SIZE];
+        self.io.iter_mut().for_each(|b| *b = 0);
+        self.sram.iter_mut().for_each(|b| *b = 0);
         self.sreg = Sreg::default();
-        self.sp = RAMEND;
+        self.sp = self.variant.ramend();
         self.pc = 0;
         self.pending = 0;
         self.cycles = 0;
-        self.periph = Peripherals::new();
+        self.periph = Peripherals::with_port_count(self.variant.port_count);
     }
 
     /// Set the CPU clock in Hz (affects only the cycles-to-seconds mapping).
@@ -129,7 +146,8 @@ impl Avr {
     /// reset. A convenience for tests and hand-assembled snippets.
     pub fn load_program(&mut self, words: &[u16]) {
         self.flash.iter_mut().for_each(|w| *w = 0);
-        for (i, &w) in words.iter().enumerate().take(FLASH_WORDS) {
+        let n = self.flash.len();
+        for (i, &w) in words.iter().enumerate().take(n) {
             self.flash[i] = w;
         }
         self.reset();
@@ -171,11 +189,18 @@ impl Avr {
             SPL_ADDR => self.sp as u8,
             SPH_ADDR => (self.sp >> 8) as u8,
             SREG_ADDR => self.sreg.to_u8(),
-            IO_START..=0xFF => self
+            // SRAM sits above the I/O / extended-I/O window at a per-variant
+            // start; anything past RAMEND reads as zero.
+            _ if addr >= self.variant.sram_start => {
+                let i = (addr - self.variant.sram_start) as usize;
+                self.sram.get(i).copied().unwrap_or(0)
+            }
+            // The I/O window: peripheral-claimed addresses route to the
+            // peripherals, the rest is plain storage.
+            _ if addr >= IO_START => self
                 .periph
                 .read(addr)
                 .unwrap_or_else(|| self.io[(addr - IO_START) as usize]),
-            SRAM_START..=RAMEND => self.sram[(addr - SRAM_START) as usize],
             _ => 0, // outside the modelled data space
         }
     }
@@ -189,12 +214,21 @@ impl Avr {
             SPL_ADDR => self.sp = (self.sp & 0xFF00) | val as u16,
             SPH_ADDR => self.sp = (self.sp & 0x00FF) | (val as u16) << 8,
             SREG_ADDR => self.sreg = Sreg::from_u8(val),
-            IO_START..=0xFF => {
-                if !self.periph.write(addr, val) {
+            // SRAM above the per-variant start; writes past RAMEND are dropped.
+            _ if addr >= self.variant.sram_start => {
+                let i = (addr - self.variant.sram_start) as usize;
+                if let Some(slot) = self.sram.get_mut(i) {
+                    *slot = val;
+                }
+            }
+            _ if addr >= IO_START => {
+                // Peripheral-claimed addresses route to the peripherals; the
+                // rest of the I/O window is plain storage.
+                let claimed = self.periph.write(addr, val);
+                if !claimed {
                     self.io[(addr - IO_START) as usize] = val;
                 }
             }
-            SRAM_START..=RAMEND => self.sram[(addr - SRAM_START) as usize] = val,
             _ => {}
         }
     }
@@ -248,7 +282,7 @@ impl Avr {
     fn service_interrupt(&mut self, vector: u8) {
         self.push16(self.pc);
         self.sreg.i = false;
-        self.pc = vector as u16 * VECTOR_SIZE_WORDS;
+        self.pc = vector as u16 * self.variant.vector_size_words;
         self.cycles += 5;
     }
 
@@ -794,7 +828,7 @@ impl McuCore for Avr {
     }
 
     fn pin_count(&self) -> usize {
-        PIN_COUNT
+        self.variant.pin_count()
     }
 
     fn next_event(&self) -> Option<u64> {
@@ -836,7 +870,7 @@ impl McuCore for Avr {
 impl Avr {
     /// Load a raw binary image: little-endian 16-bit words straight into flash.
     fn load_raw(&mut self, image: &[u8]) -> Result<(), FirmwareError> {
-        if image.len() > FLASH_WORDS * 2 {
+        if image.len() > self.flash.len() * 2 {
             return Err(FirmwareError::BadImage);
         }
         for (i, pair) in image.chunks(2).enumerate() {
@@ -850,7 +884,7 @@ impl Avr {
     /// Write one flash byte at a byte address (used by the Intel HEX loader).
     fn set_flash_byte(&mut self, byte_addr: u32, val: u8) -> Result<(), FirmwareError> {
         let word = (byte_addr / 2) as usize;
-        if word >= FLASH_WORDS {
+        if word >= self.flash.len() {
             return Err(FirmwareError::BadImage);
         }
         if byte_addr & 1 == 0 {
