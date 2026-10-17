@@ -31,6 +31,10 @@ pub enum AiError {
     /// reason. The loop surfaces this instead of silently presenting a bogus
     /// verdict; the live circuit is never touched.
     Patch(String),
+    /// Debug-mode fault localization could not complete — the target node is not
+    /// in the operating point, could not be mapped onto a solved net, or a solve
+    /// failed. Carries a human-readable reason; the live circuit is never touched.
+    Diagnosis(String),
 }
 
 impl fmt::Display for AiError {
@@ -48,6 +52,7 @@ impl fmt::Display for AiError {
                 )
             }
             AiError::Patch(why) => write!(f, "could not verify the staged patch: {why}"),
+            AiError::Diagnosis(why) => write!(f, "could not localize the fault: {why}"),
         }
     }
 }

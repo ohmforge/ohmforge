@@ -61,6 +61,7 @@ pub mod client;
 pub mod config;
 pub mod error;
 pub mod message;
+pub mod modes;
 pub mod tools;
 pub mod transport;
 pub mod verify;
@@ -71,6 +72,10 @@ pub use error::AiError;
 pub use message::{
     response_to_events, CacheControl, ContentBlock, ContentDelta, Message, ModelRequest,
     ModelResponse, Role, StopReason, StreamAssembler, StreamEvent, SystemBlock, Tool, Usage,
+};
+pub use modes::{
+    debug_circuit, firmware, localize_fault, parse_intel_hex, DebugOutcome, Debugger, FaultReport,
+    FirmwareBuilder, FirmwareImage, FirmwareOutcome, HexError, Suspect,
 };
 pub use tools::{ask, CircuitTools, EESH_TOOL, READ_OP_TOOL};
 pub use transport::{MockTransport, Transport};
