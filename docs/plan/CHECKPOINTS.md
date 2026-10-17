@@ -80,7 +80,7 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 - [x] **CP-AF-M0.1** Native project format save/load (round-trip). — *gate:* save→load yields an equal circuit; golden file stable. _(Bonus: a friendly netlist import format also landed — partial progress toward `CP-AF-M1.1`, though that one is SPICE-specific.)_
 
 ### M1 — interop + first AI
-- [ ] **CP-AF-M1.1** SPICE netlist import/export. — *gate:* import a known netlist (sim matches) and export round-trips.
+- [x] **CP-AF-M1.1** SPICE netlist import/export. — *gate:* `imported_divider_simulates_to_the_midpoint` (import→`ee-sim` op-point = 5 V) + `round_trip_preserves_parts_and_topology`; handles the SPICE `m`(milli)-vs-`meg`(mega) footgun.
 - [ ] **CP-AF-M1.2** Claude client (Messages API, streaming, tool schema, prompt caching) over a mockable transport. — *gate:* tool-call loop unit-tested with a fake transport (no network).
 - [ ] **CP-AF-M1.3** AI tool layer over the circuit API (add/wire/set/run/read). — *gate:* "ask" answers a question grounded in a real sim read (stub model, real sim).
 
@@ -111,9 +111,9 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 | sim-core | 5 | 0 | 15 |
 | boards | 0 | 0 | 10 |
 | ui-shell | 4 | 0 | 13 |
-| ai-fmt | 1 | 0 | 9 |
+| ai-fmt | 2 | 0 | 9 |
 | platform | 3 | 0 | 5 |
-| **Total** | **13** | **0** | **52** |
+| **Total** | **14** | **0** | **52** |
 
 *Update this table when flipping a checkpoint.*
 
