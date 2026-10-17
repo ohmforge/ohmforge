@@ -140,16 +140,21 @@ pub fn magnitude_spectrum(sig: &Signal, window: Window) -> Signal {
 /// and for testing that a tone lands where it should.
 pub fn peak_bin(spectrum: &Signal) -> Option<(f64, f64)> {
     let c = spectrum.complex()?;
-    let (idx, _) = c
+    // Only consider bins that have a matching frequency sample: a malformed
+    // signal may carry more complex bins than `x` points (the fields are public),
+    // and a peak we can't name a frequency for is not a usable readout. `take`
+    // keeps `idx` in range so `spectrum.x[idx]` can never index past the axis.
+    let (idx, z) = c
         .iter()
         .enumerate()
+        .take(spectrum.x.len())
         .filter(|(_, z)| z.magnitude().is_finite())
         .max_by(|(_, a), (_, b)| {
             a.magnitude()
                 .partial_cmp(&b.magnitude())
                 .unwrap_or(core::cmp::Ordering::Equal)
         })?;
-    Some((spectrum.x[idx], c[idx].magnitude_db()))
+    Some((spectrum.x[idx], z.magnitude_db()))
 }
 
 #[cfg(test)]
@@ -279,6 +284,32 @@ mod tests {
         // A frequency-domain (complex) input is rejected gracefully.
         let cplx = Signal::freq("h", Unit::None, vec![1.0], vec![Complex::ONE]);
         assert!(magnitude_spectrum(&cplx, Window::Rectangular).is_empty());
+    }
+
+    #[test]
+    fn peak_bin_tolerates_a_length_mismatched_spectrum() {
+        use ee_core::signal::{Domain, SignalData};
+        // A malformed frequency-domain signal: more complex bins than frequency
+        // samples (fields are public, and `peak_bin` is a public, total-looking
+        // API — "None for an empty or non-complex spectrum"). The strongest bin is
+        // one that has no matching `x`, so a naive `spectrum.x[idx]` indexes past
+        // the axis. It must not panic.
+        let bad = Signal {
+            name: "h".to_string(),
+            unit: Unit::None,
+            domain: Domain::Freq,
+            x: vec![0.0, 10.0],
+            y: SignalData::Complex(vec![
+                Complex::new(1.0, 0.0),
+                Complex::new(5.0, 0.0), // in-range peak
+                Complex::new(9.0, 0.0), // strongest, but has no frequency sample
+            ]),
+        };
+        let (f, _db) = peak_bin(&bad).expect("a peak within the frequency axis");
+        assert!(
+            bad.x.contains(&f),
+            "peak frequency must come from the x axis, got {f}"
+        );
     }
 
     #[test]

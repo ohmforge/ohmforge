@@ -426,6 +426,13 @@ fn trace_rows(
 
         let mut prev: Option<usize> = None;
         for (px, &yd) in samples.iter().enumerate() {
+            // A non-finite sample (an inf/NaN from a diverged solve) leaves a gap
+            // and breaks the connecting segment, matching `braille::trace_rows` —
+            // rather than clamping to a spurious full-height spike.
+            if !yd.is_finite() {
+                prev = None;
+                continue;
+            }
             let frac = (ymax - yd) / (ymax - ymin);
             let py = (frac * (ph - 1) as f64).round().clamp(0.0, (ph - 1) as f64) as usize;
             // Connect to the previous column so steep segments stay unbroken.
@@ -673,6 +680,31 @@ mod tests {
             .channel(Signal::time("v(x)", Unit::Volt, vec![0.0], vec![1.0]))
             .render();
         assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn non_finite_sample_leaves_a_gap_not_a_spike() {
+        // A flat 0 V trace with one inf sample. The finite trace lands mid-frame,
+        // so the top braille row must stay blank: the inf must gap, not clamp to a
+        // full-height spike reaching the top row.
+        let n = 60;
+        let x: Vec<f64> = (0..n).map(|i| i as f64 * 1e-4).collect();
+        let mut y = vec![0.0; n];
+        y[n / 2] = f64::INFINITY;
+        let out = Oscilloscope::new("inf")
+            .size(48, 6)
+            .timebase(Timebase::new(n as f64 * 1e-4))
+            .channel(Signal::time("v(x)", Unit::Volt, x, y))
+            .render();
+        // The first braille row (nearest the top) is the first line carrying '┤'.
+        let top = out
+            .lines()
+            .find(|l| l.contains('\u{2524}'))
+            .expect("a braille row");
+        assert!(
+            !top.chars().any(|c| ('\u{2801}'..='\u{28FF}').contains(&c)),
+            "an inf sample spiked to the top row instead of gapping:\n{out}"
+        );
     }
 
     #[test]
