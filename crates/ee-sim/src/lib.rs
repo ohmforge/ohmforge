@@ -22,6 +22,7 @@ use std::f64::consts::TAU;
 use std::fmt;
 
 use ee_core::graph::{BjtModel, Circuit, MosfetModel, NetId, Part, PartKind, Polarity, Waveform};
+use ee_core::value::Value;
 use ee_core::{Complex, Signal, Unit};
 use mna::System;
 use mna_complex::ComplexSystem;
@@ -75,6 +76,8 @@ pub enum SimError {
     /// Newton–Raphson did not reach the voltage/current tolerance within the
     /// iteration cap. Carries the cap that was hit.
     NonConvergence(usize),
+    /// A sweep names a part reference that is not in the circuit.
+    UnknownPart(String),
 }
 
 impl fmt::Display for SimError {
@@ -98,6 +101,7 @@ impl fmt::Display for SimError {
                     "nonlinear solve did not converge within {iters} Newton–Raphson iterations"
                 )
             }
+            SimError::UnknownPart(r) => write!(f, "no part named {r} to sweep"),
         }
     }
 }
@@ -128,10 +132,17 @@ impl Engine {
                 f_stop,
                 points_per_decade,
             } => ac(circuit, &layout, *f_start, *f_stop, *points_per_decade),
-            Analysis::DcSweep { .. } => Err(SimError::Unsupported("DC sweep (CP-SIM-M1.5)")),
-            Analysis::Parametric { .. } => {
-                Err(SimError::Unsupported("parametric sweep (CP-SIM-M1.5)"))
-            }
+            Analysis::DcSweep {
+                source,
+                start,
+                stop,
+                step,
+            } => dc_sweep(circuit, source, *start, *stop, *step),
+            Analysis::Parametric {
+                source,
+                values,
+                inner,
+            } => self.parametric(circuit, source, values, inner),
         }
     }
 }
@@ -319,16 +330,18 @@ fn stamp_resistors(sys: &mut System, circuit: &Circuit, layout: &Layout) -> Resu
 
 /// Stamp every voltage source, each using its own branch-current row. `t` selects
 /// the source level: `None` for the operating-point bias, `Some(secs)` for the
-/// waveform value at that transient time.
+/// waveform value at that transient time. `scale` multiplies the level — `1.0` for
+/// the real circuit, a ramp in `[0, 1]` during source stepping ([`source_stepping`]).
 fn stamp_vsources(
     sys: &mut System,
     circuit: &Circuit,
     layout: &Layout,
     t: Option<f64>,
+    scale: f64,
 ) -> Result<(), SimError> {
     for (branch, &pi) in layout.vsources.iter().enumerate() {
         let part = &circuit.parts()[pi];
-        let volts = source_value(part, t)?;
+        let volts = source_value(part, t)? * scale;
         let (plus, minus) = terminals2(part)?;
         let k = layout.n_nodes() + branch;
         sys.stamp_vsource(
@@ -345,15 +358,17 @@ fn stamp_vsources(
 /// drives that current from `a` into `b` (no new unknown — a pure RHS term). `t`
 /// selects the level: `None` for the operating-point bias, `Some(secs)` for the
 /// waveform value at that transient time (a DC source is the same either way).
+/// `scale` multiplies the level, as in [`stamp_vsources`] (source stepping).
 fn stamp_current_sources(
     sys: &mut System,
     circuit: &Circuit,
     layout: &Layout,
     t: Option<f64>,
+    scale: f64,
 ) -> Result<(), SimError> {
     for part in circuit.parts() {
         if matches!(part.kind, PartKind::CurrentSource) {
-            let amps = source_value(part, t)?;
+            let amps = source_value(part, t)? * scale;
             let (a, b) = terminals2(part)?;
             // `stamp_current(i, j, amps)` injects `amps` flowing from `j` into `i`,
             // so `(b, a)` reads as "amps from a into b" — the source's own direction.
@@ -760,23 +775,36 @@ fn collect_nonlinear(circuit: &Circuit) -> Result<Vec<Box<dyn NonlinearDevice>>,
 /// With **no** nonlinear devices the routine stamps and solves exactly once,
 /// reproducing the linear M0 result bit-for-bit — so the existing linear tests
 /// do not move.
+///
+/// `x_init` is the starting guess (`None` = every node at 0 V); the convergence
+/// aids ([`gmin_stepping`] / [`source_stepping`]) warm-start each continuation
+/// step from the previous one. `gmin` adds a conductance from every node to
+/// ground on every iteration — the knob gmin stepping ramps from large → 0; pass
+/// `0.0` for the unaided solve.
 fn solve_nr(
     circuit: &Circuit,
     layout: &Layout,
     size: usize,
     devices: &[Box<dyn NonlinearDevice>],
     stamp_linear: &dyn Fn(&mut System) -> Result<(), SimError>,
+    x_init: Option<&[f64]>,
+    gmin: f64,
 ) -> Result<Vec<f64>, SimError> {
-    // Purely linear: one stamp-and-solve is exact (and identical to M0).
+    // Purely linear: one stamp-and-solve is exact (and identical to M0). A linear
+    // circuit always solves in one shot, so the convergence aids never reach here.
     if devices.is_empty() {
         let mut sys = System::new(size);
         stamp_linear(&mut sys)?;
         return sys.solve().ok_or(SimError::Singular);
     }
 
-    let mut x = vec![0.0; size]; // initial guess: every node at 0 V
-                                 // Per-device limiting memory (previous limited controlling voltages) and the
-                                 // previous iteration's terminal currents, for the current-convergence test.
+    // Initial guess: the warm start if given, else every node at 0 V.
+    let mut x = match x_init {
+        Some(x0) => x0.to_vec(),
+        None => vec![0.0; size],
+    };
+    // Per-device limiting memory (previous limited controlling voltages) and the
+    // previous iteration's terminal currents, for the current-convergence test.
     let mut states: Vec<Vec<f64>> = devices.iter().map(|d| vec![0.0; d.state_len()]).collect();
     let mut i_prev: Vec<Vec<f64>> = devices
         .iter()
@@ -786,6 +814,13 @@ fn solve_nr(
     for _ in 0..NR_MAX_ITERS {
         let mut sys = System::new(size);
         stamp_linear(&mut sys)?;
+        // gmin stepping: a tiny conductance from every node to ground props up an
+        // otherwise ill-conditioned Jacobian; it is ramped to 0 across outer steps.
+        if gmin > 0.0 {
+            for i in 0..layout.n_nodes() {
+                sys.stamp_conductance(Some(i), None, gmin);
+            }
+        }
 
         let mut i_now: Vec<Vec<f64>> = Vec::with_capacity(devices.len());
         for (k, dev) in devices.iter().enumerate() {
@@ -828,19 +863,137 @@ fn solve_nr(
     Err(SimError::NonConvergence(NR_MAX_ITERS))
 }
 
+/// Number of continuation steps in gmin and source stepping: the aid ramps its
+/// knob across this many solves, warm-starting each from the last.
+const STEPPING_STEPS: usize = 16;
+/// Largest node-to-ground conductance gmin stepping starts from (1 kΩ to ground
+/// on every node — enough to tame almost any ill-conditioned Jacobian).
+const GMIN_START: f64 = 1e-3;
+/// Smallest non-zero gmin before the final gmin = 0 solve on the real circuit.
+const GMIN_FLOOR: f64 = 1e-12;
+
 /// Solve the DC operating point: resistors + sources, capacitors open, inductors
 /// shorted, and any nonlinear device driven to steady state by Newton–Raphson.
+///
+/// Tries plain NR first (the fast path — a plain-convergent or purely linear
+/// circuit takes exactly this and nothing more). Only if NR fails — hitting its
+/// iteration cap, *or* returning a singular Jacobian — does it fall back to the
+/// convergence aids: gmin stepping, then source stepping. A singular plain solve
+/// is routed in too, because an isolated node at the cold-start guess (a
+/// cutoff-at-0 V MOSFET channel, say) is exactly what gmin stepping props up and
+/// resolves; a node that stays floating at the real circuit (gmin's final step at
+/// gmin = 0) still surfaces as [`SimError::Singular`], and only a genuinely
+/// hopeless nonlinear solve surfaces as [`SimError::NonConvergence`].
 fn solve_dc(circuit: &Circuit, layout: &Layout) -> Result<Vec<f64>, SimError> {
     let size = layout.n_nodes() + layout.vsources.len() + layout.inductors.len();
     let devices = collect_nonlinear(circuit)?;
-    solve_nr(circuit, layout, size, &devices, &|sys| {
+    // The linear stamp at source scale `alpha` (1.0 = the real circuit).
+    let stamp_at = |sys: &mut System, alpha: f64| -> Result<(), SimError> {
         stamp_resistors(sys, circuit, layout)?;
-        // Operating point: sources at their bias (`None`).
-        stamp_vsources(sys, circuit, layout, None)?;
-        stamp_current_sources(sys, circuit, layout, None)?;
+        // Operating point: sources at their bias (`None`), scaled for source stepping.
+        stamp_vsources(sys, circuit, layout, None, alpha)?;
+        stamp_current_sources(sys, circuit, layout, None, alpha)?;
         stamp_inductor_shorts(sys, circuit, layout)?;
         Ok(())
-    })
+    };
+
+    // 1. Plain Newton–Raphson, full sources, no gmin, cold start.
+    match solve_nr(
+        circuit,
+        layout,
+        size,
+        &devices,
+        &|sys| stamp_at(sys, 1.0),
+        None,
+        0.0,
+    ) {
+        Ok(x) => return Ok(x),
+        // Hit the iteration cap or a singular guess — the aids may still get there.
+        Err(SimError::NonConvergence(_)) | Err(SimError::Singular) => {}
+        Err(e) => return Err(e), // Bad*/Missing* are data faults no aid can cure
+    }
+
+    // 2. gmin stepping, then 3. source stepping. Each returns `Ok(None)` when a
+    // continuation step fails to converge; a real fault (still singular at the
+    // final gmin = 0 — a truly floating node) propagates straight out.
+    if let Some(x) = gmin_stepping(circuit, layout, size, &devices, &stamp_at)? {
+        return Ok(x);
+    }
+    if let Some(x) = source_stepping(circuit, layout, size, &devices, &stamp_at)? {
+        return Ok(x);
+    }
+    Err(SimError::NonConvergence(NR_MAX_ITERS))
+}
+
+/// gmin stepping: solve with a large node-to-ground conductance first (which
+/// makes the Jacobian diagonally dominant and trivially solvable), then ramp that
+/// conductance geometrically down to zero, warm-starting each solve from the last.
+/// The final solve sits at gmin = 0 — the true circuit — so the returned point
+/// carries no residual-conductance error. `Ok(None)` means a continuation step
+/// failed to converge (the caller then tries source stepping); a real error (a
+/// singular system) propagates.
+fn gmin_stepping(
+    circuit: &Circuit,
+    layout: &Layout,
+    size: usize,
+    devices: &[Box<dyn NonlinearDevice>],
+    stamp_at: &dyn Fn(&mut System, f64) -> Result<(), SimError>,
+) -> Result<Option<Vec<f64>>, SimError> {
+    let mut x = vec![0.0; size];
+    let ratio = GMIN_FLOOR / GMIN_START; // < 1
+    for k in 0..=STEPPING_STEPS {
+        let gmin = if k == STEPPING_STEPS {
+            0.0 // the last step is the real circuit
+        } else {
+            GMIN_START * ratio.powf(k as f64 / STEPPING_STEPS as f64)
+        };
+        match solve_nr(
+            circuit,
+            layout,
+            size,
+            devices,
+            &|sys| stamp_at(sys, 1.0),
+            Some(&x),
+            gmin,
+        ) {
+            Ok(sol) => x = sol,
+            Err(SimError::NonConvergence(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(Some(x))
+}
+
+/// Source stepping: ramp every independent source from 0 → 100% of its value
+/// across the continuation, warm-starting each solve from the last. At 0% the
+/// circuit is dead and the solution is the origin; each small increment moves the
+/// operating point only a little, keeping every Newton solve inside its basin of
+/// attraction. `Ok(None)` means a step failed to converge; a real error propagates.
+fn source_stepping(
+    circuit: &Circuit,
+    layout: &Layout,
+    size: usize,
+    devices: &[Box<dyn NonlinearDevice>],
+    stamp_at: &dyn Fn(&mut System, f64) -> Result<(), SimError>,
+) -> Result<Option<Vec<f64>>, SimError> {
+    let mut x = vec![0.0; size];
+    for k in 0..=STEPPING_STEPS {
+        let alpha = k as f64 / STEPPING_STEPS as f64; // 0 → 1
+        match solve_nr(
+            circuit,
+            layout,
+            size,
+            devices,
+            &|sys| stamp_at(sys, alpha),
+            Some(&x),
+            0.0,
+        ) {
+            Ok(sol) => x = sol,
+            Err(SimError::NonConvergence(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(Some(x))
 }
 
 /// Voltage across a two-terminal device (`v(plus) - v(minus)`), ground = 0 V.
@@ -848,77 +1001,105 @@ fn across(x: &[f64], plus: Option<usize>, minus: Option<usize>) -> f64 {
     plus.map_or(0.0, |i| x[i]) - minus.map_or(0.0, |i| x[i])
 }
 
-/// Backward-Euler transient.
+/// Backward-Euler timestep bounds and local-truncation-error controls for the
+/// adaptive transient (`CP-SIM-M1.6`). The error estimate is a step-doubling
+/// (Richardson) comparison of one step of `h` against two of `h/2`; since
+/// Backward Euler is first order, that difference *is* the finer solution's LTE.
+/// A step is accepted when the normalized error is ≤ 1 and the next step is
+/// `safety·err^(−1/2)` larger (the first-order exponent), clamped so it never
+/// grows or shrinks too violently.
+const LTE_RELTOL: f64 = 1e-4;
+const LTE_ABSTOL: f64 = 1e-6;
+const LTE_SAFETY: f64 = 0.9;
+const LTE_GROW_MAX: f64 = 5.0;
+const LTE_SHRINK_MIN: f64 = 0.2;
+/// The adaptive step is never larger than `duration / MIN_ADAPTIVE_STEPS` (so
+/// even a lazy waveform is sampled) nor smaller than `duration · H_MIN_FRAC`
+/// (the floor at which a step is force-accepted to guarantee progress).
+const MIN_ADAPTIVE_STEPS: f64 = 20.0;
+const H_MIN_FRAC: f64 = 1e-6;
+/// A safety net on the adaptive driver's accept/reject iterations — far above any
+/// real run, it only trips on a pathological limit cycle.
+const ADAPTIVE_ITER_CAP: usize = 5_000_000;
+
+/// A transient assembled once: the reactive devices (capacitors, inductors), the
+/// nonlinear devices, and the MNA dimensions. Both the fixed-step and the
+/// adaptive drivers advance it through the identical Backward-Euler [`step`].
 ///
-/// Capacitors start uncharged (0 V initial condition) and discretize into a
-/// companion model — a conductance `C/h` in parallel with a current source
-/// `(C/h)·v_prev`, refreshed each timestep.
-///
-/// Inductors start de-energized (`i(0) = 0`). Backward Euler gives
-/// `i_n = i_prev + (h/L)·(v_a − v_b)`, whose Norton companion is a conductance
-/// `g_eq = h/L` between the terminals in parallel with a history current source
-/// of value `i_prev` oriented `a → b`. After each solved step `i_prev` is refreshed
-/// to `i_prev + g_eq·(v_a − v_b)` from the new node voltages. At `t = 0` the
-/// inductor is left open (not stamped) so the recorded start matches `i(0) = 0`.
-fn transient(
-    circuit: &Circuit,
-    layout: &Layout,
-    duration: f64,
-    step: Option<f64>,
-) -> Result<Vec<Signal>, SimError> {
-    let h = step.unwrap_or(duration / 1000.0);
-    if h <= 0.0 || duration <= 0.0 {
-        return Err(SimError::BadValue("transient duration/step".into()));
+/// Capacitors discretize into a companion model — a conductance `C/h` in parallel
+/// with a current source `(C/h)·v_prev`, refreshed each step. Inductors give
+/// `i_n = i_prev + (h/L)·(v_a − v_b)`: a conductance `g_eq = h/L` in parallel with
+/// a history source `i_prev` oriented `a → b`, with `i_prev` refreshed from the
+/// solved node voltages. At `t = 0` capacitors are held at their initial voltage
+/// (a 0 V source) and inductors are open (`i(0) = 0`), per [`initial`](Self::initial).
+/// One Backward-Euler step's outcome: the node solution, the refreshed capacitor
+/// voltages, and the refreshed inductor currents — the state the next step reads.
+type StepResult = (Vec<f64>, Vec<f64>, Vec<f64>);
+
+struct TransientModel<'a> {
+    circuit: &'a Circuit,
+    layout: &'a Layout,
+    /// Capacitors as `(plus, minus, farads)`.
+    caps: Vec<(NetId, NetId, f64)>,
+    /// Inductors as `(a, b, henries)`.
+    inds: Vec<(NetId, NetId, f64)>,
+    /// Nonlinear devices, re-linearized inside each step's Newton loop.
+    devices: Vec<Box<dyn NonlinearDevice>>,
+    /// Node count and voltage-source branch count (the step system is `n + m`).
+    n: usize,
+    m: usize,
+}
+
+impl<'a> TransientModel<'a> {
+    fn build(circuit: &'a Circuit, layout: &'a Layout) -> Result<Self, SimError> {
+        let caps: Vec<(NetId, NetId, f64)> = circuit
+            .parts()
+            .iter()
+            .filter(|p| matches!(p.kind, PartKind::Capacitor))
+            .map(|p| {
+                let (a, b) = terminals2(p)?;
+                Ok::<_, SimError>((a, b, magnitude(p)?))
+            })
+            .collect::<Result<_, _>>()?;
+
+        // A non-positive inductance would blow up `h/L`.
+        let inds: Vec<(NetId, NetId, f64)> = circuit
+            .parts()
+            .iter()
+            .filter(|p| matches!(p.kind, PartKind::Inductor))
+            .map(|p| {
+                let (a, b) = terminals2(p)?;
+                let l = magnitude(p)?;
+                if l <= 0.0 {
+                    return Err(SimError::BadValue(p.reference.clone()));
+                }
+                Ok::<_, SimError>((a, b, l))
+            })
+            .collect::<Result<_, _>>()?;
+
+        let devices = collect_nonlinear(circuit)?;
+        Ok(Self {
+            circuit,
+            layout,
+            caps,
+            inds,
+            devices,
+            n: layout.n_nodes(),
+            m: layout.vsources.len(),
+        })
     }
-    let steps = (duration / h).round().max(1.0) as usize;
-    let n = layout.n_nodes();
-    let m = layout.vsources.len();
 
-    // Capacitors: (plus, minus, farads).
-    let caps: Vec<(NetId, NetId, f64)> = circuit
-        .parts()
-        .iter()
-        .filter(|p| matches!(p.kind, PartKind::Capacitor))
-        .map(|p| {
-            let (a, b) = terminals2(p)?;
-            Ok::<_, SimError>((a, b, magnitude(p)?))
-        })
-        .collect::<Result<_, _>>()?;
-
-    // Inductors: (a, b, henries). A non-positive inductance would blow up `h/L`.
-    let inds: Vec<(NetId, NetId, f64)> = circuit
-        .parts()
-        .iter()
-        .filter(|p| matches!(p.kind, PartKind::Inductor))
-        .map(|p| {
-            let (a, b) = terminals2(p)?;
-            let l = magnitude(p)?;
-            if l <= 0.0 {
-                return Err(SimError::BadValue(p.reference.clone()));
-            }
-            Ok::<_, SimError>((a, b, l))
-        })
-        .collect::<Result<_, _>>()?;
-
-    // Nonlinear devices are re-linearized inside the per-step Newton–Raphson
-    // loop, on top of the C / L companions.
-    let diodes = collect_nonlinear(circuit)?;
-
-    let mut times: Vec<f64> = Vec::with_capacity(steps + 1);
-    let mut traces: Vec<Vec<f64>> = vec![Vec::with_capacity(steps + 1); n];
-    let mut cap_prev = vec![0.0; caps.len()]; // 0 V initial condition (UIC)
-    let mut ind_prev = vec![0.0; inds.len()]; // 0 A initial condition (de-energized)
-
-    // t = 0: hold each capacitor at its initial voltage (a 0 V source), solve the
-    // rest, and record. This is the true starting point of every curve.
-    {
+    /// Solve the `t = 0` start: capacitors held at 0 V (their initial condition,
+    /// each a 0 V source), inductors open. Returns the node solution and the
+    /// initial capacitor voltages (the inductor currents start at 0 A).
+    fn initial(&self) -> Result<(Vec<f64>, Vec<f64>), SimError> {
+        let (circuit, layout, n, m) = (self.circuit, self.layout, self.n, self.m);
         let stamp = |sys: &mut System| -> Result<(), SimError> {
             stamp_resistors(sys, circuit, layout)?;
             // t = 0 uses the waveform bias (sine → offset, pulse → v1).
-            stamp_vsources(sys, circuit, layout, None)?;
-            stamp_current_sources(sys, circuit, layout, None)?;
-            // Inductors are open at t = 0 (i(0) = 0), so they are not stamped.
-            for (ci, (a, b, _)) in caps.iter().enumerate() {
+            stamp_vsources(sys, circuit, layout, None, 1.0)?;
+            stamp_current_sources(sys, circuit, layout, None, 1.0)?;
+            for (ci, (a, b, _)) in self.caps.iter().enumerate() {
                 let k = n + m + ci;
                 sys.stamp_vsource(
                     layout.node_of(circuit, *a),
@@ -929,35 +1110,52 @@ fn transient(
             }
             Ok(())
         };
-        let x0 = solve_nr(circuit, layout, n + m + caps.len(), &diodes, &stamp)?;
-        times.push(0.0);
-        for (d, trace) in traces.iter_mut().enumerate() {
-            trace.push(x0[d]);
-        }
-        for (ci, (a, b, _)) in caps.iter().enumerate() {
-            cap_prev[ci] = across(
-                &x0,
-                layout.node_of(circuit, *a),
-                layout.node_of(circuit, *b),
-            );
-        }
+        let x0 = solve_nr(
+            circuit,
+            layout,
+            n + m + self.caps.len(),
+            &self.devices,
+            &stamp,
+            None,
+            0.0,
+        )?;
+        let cap_v0 = self
+            .caps
+            .iter()
+            .map(|(a, b, _)| {
+                across(
+                    &x0,
+                    layout.node_of(circuit, *a),
+                    layout.node_of(circuit, *b),
+                )
+            })
+            .collect();
+        Ok((x0, cap_v0))
     }
 
-    // t = h, 2h, … : companion-stamp the reactive devices, Newton-solve, advance.
-    for k in 1..=steps {
-        let t = k as f64 * h;
+    /// One Backward-Euler step of size `h` landing at time `t_end`, from the
+    /// capacitor voltages `cap_prev` and inductor currents `ind_prev`. Returns the
+    /// node solution at `t_end` and the refreshed `(cap_prev, ind_prev)`.
+    fn step(
+        &self,
+        t_end: f64,
+        h: f64,
+        cap_prev: &[f64],
+        ind_prev: &[f64],
+    ) -> Result<StepResult, SimError> {
+        let (circuit, layout) = (self.circuit, self.layout);
         let stamp = |sys: &mut System| -> Result<(), SimError> {
             stamp_resistors(sys, circuit, layout)?;
-            // Sources evaluated at the current transient time.
-            stamp_vsources(sys, circuit, layout, Some(t))?;
-            stamp_current_sources(sys, circuit, layout, Some(t))?;
-            for (ci, (a, b, c)) in caps.iter().enumerate() {
+            // Sources evaluated at the step's end time.
+            stamp_vsources(sys, circuit, layout, Some(t_end), 1.0)?;
+            stamp_current_sources(sys, circuit, layout, Some(t_end), 1.0)?;
+            for (ci, (a, b, c)) in self.caps.iter().enumerate() {
                 let g_eq = c / h;
                 let (ia, ib) = (layout.node_of(circuit, *a), layout.node_of(circuit, *b));
                 sys.stamp_conductance(ia, ib, g_eq);
                 sys.stamp_current(ia, ib, g_eq * cap_prev[ci]);
             }
-            for (li, (a, b, l)) in inds.iter().enumerate() {
+            for (li, (a, b, l)) in self.inds.iter().enumerate() {
                 let g_eq = h / l;
                 let (ia, ib) = (layout.node_of(circuit, *a), layout.node_of(circuit, *b));
                 sys.stamp_conductance(ia, ib, g_eq);
@@ -966,33 +1164,188 @@ fn transient(
             }
             Ok(())
         };
-        let x = solve_nr(circuit, layout, n + m, &diodes, &stamp)?;
-        times.push(k as f64 * h);
+        let x = solve_nr(
+            circuit,
+            layout,
+            self.n + self.m,
+            &self.devices,
+            &stamp,
+            None,
+            0.0,
+        )?;
+        let new_caps = self
+            .caps
+            .iter()
+            .map(|(a, b, _)| across(&x, layout.node_of(circuit, *a), layout.node_of(circuit, *b)))
+            .collect();
+        let new_inds = self
+            .inds
+            .iter()
+            .enumerate()
+            .map(|(li, (a, b, l))| {
+                ind_prev[li]
+                    + (h / l) * across(&x, layout.node_of(circuit, *a), layout.node_of(circuit, *b))
+            })
+            .collect();
+        Ok((x, new_caps, new_inds))
+    }
+
+    /// Package recorded `times` × per-node `traces` into one [`Signal`] per node.
+    fn signals(&self, times: Vec<f64>, traces: Vec<Vec<f64>>) -> Vec<Signal> {
+        traces
+            .into_iter()
+            .enumerate()
+            .map(|(d, y)| {
+                Signal::time(
+                    format!("v(n{})", self.layout.inv[d]),
+                    Unit::Volt,
+                    times.clone(),
+                    y,
+                )
+            })
+            .collect()
+    }
+}
+
+/// Transient dispatcher. `step = Some(h)` runs the fixed-step Backward-Euler
+/// exactly as M0 did (bit-for-bit — the existing tests do not move); `step = None`
+/// asks the engine to choose the timestep and runs the error-controlled adaptive
+/// driver ([`adaptive_transient`], `CP-SIM-M1.6`).
+fn transient(
+    circuit: &Circuit,
+    layout: &Layout,
+    duration: f64,
+    step: Option<f64>,
+) -> Result<Vec<Signal>, SimError> {
+    if duration <= 0.0 {
+        return Err(SimError::BadValue("transient duration/step".into()));
+    }
+    let model = TransientModel::build(circuit, layout)?;
+    let (x0, cap_v0) = model.initial()?;
+    match step {
+        Some(h) if h > 0.0 => fixed_transient(&model, duration, h, x0, cap_v0),
+        Some(_) => Err(SimError::BadValue("transient duration/step".into())),
+        None => adaptive_transient(&model, duration, x0, cap_v0),
+    }
+}
+
+/// Fixed-step Backward Euler at uniform `t = k·h`, `k = 1 … round(duration/h)`.
+/// Identical to the original M0 loop, so every fixed-step result is unchanged.
+fn fixed_transient(
+    model: &TransientModel,
+    duration: f64,
+    h: f64,
+    x0: Vec<f64>,
+    cap_v0: Vec<f64>,
+) -> Result<Vec<Signal>, SimError> {
+    let steps = (duration / h).round().max(1.0) as usize;
+    let n = model.n;
+    let mut times: Vec<f64> = Vec::with_capacity(steps + 1);
+    let mut traces: Vec<Vec<f64>> = vec![Vec::with_capacity(steps + 1); n];
+    times.push(0.0);
+    for (d, trace) in traces.iter_mut().enumerate() {
+        trace.push(x0[d]);
+    }
+    let mut cap_prev = cap_v0;
+    let mut ind_prev = vec![0.0; model.inds.len()];
+    for k in 1..=steps {
+        let t = k as f64 * h;
+        let (x, caps, inds) = model.step(t, h, &cap_prev, &ind_prev)?;
+        times.push(t);
         for (d, trace) in traces.iter_mut().enumerate() {
             trace.push(x[d]);
         }
-        for (ci, (a, b, _)) in caps.iter().enumerate() {
-            cap_prev[ci] = across(&x, layout.node_of(circuit, *a), layout.node_of(circuit, *b));
+        cap_prev = caps;
+        ind_prev = inds;
+    }
+    Ok(model.signals(times, traces))
+}
+
+/// The normalized step-doubling error: the largest per-node difference between
+/// the coarse one-step solution `x_coarse` and the finer two-half-step solution
+/// `x_fine`, each scaled by `abstol + reltol·max|·|`. For first-order Backward
+/// Euler this difference is the finer solution's local truncation error, so a
+/// value ≤ 1 means the step met tolerance.
+fn lte_norm(x_fine: &[f64], x_coarse: &[f64]) -> f64 {
+    x_fine
+        .iter()
+        .zip(x_coarse)
+        .map(|(&f, &c)| {
+            let scale = LTE_ABSTOL + LTE_RELTOL * f.abs().max(c.abs());
+            (f - c).abs() / scale
+        })
+        .fold(0.0, f64::max)
+}
+
+/// The next-step multiplier from the normalized error: `safety·err^(−1/2)` (the
+/// Backward-Euler order-1 exponent), clamped to `[SHRINK_MIN, GROW_MAX]`. A
+/// vanishing error (e.g. a memoryless step) grows at the cap.
+fn lte_step_factor(err: f64) -> f64 {
+    if err <= 0.0 {
+        return LTE_GROW_MAX;
+    }
+    (LTE_SAFETY * err.powf(-0.5)).clamp(LTE_SHRINK_MIN, LTE_GROW_MAX)
+}
+
+/// Error-controlled adaptive Backward Euler (`CP-SIM-M1.6`).
+///
+/// Each attempt estimates the local truncation error by step doubling — one step
+/// of `h` versus two of `h/2` — accepts the finer solution when [`lte_norm`] ≤ 1
+/// (or the step has hit its floor, to guarantee progress), and resizes `h` by
+/// [`lte_step_factor`] within `[h_min, h_max]`. The result is a non-uniform time
+/// grid: fine where the solution bends, coarse where it is placid — materially
+/// fewer points than a fixed step dense enough to resolve the fast region.
+fn adaptive_transient(
+    model: &TransientModel,
+    duration: f64,
+    x0: Vec<f64>,
+    cap_v0: Vec<f64>,
+) -> Result<Vec<Signal>, SimError> {
+    let n = model.n;
+    let h_max = duration / MIN_ADAPTIVE_STEPS;
+    let h_min = duration * H_MIN_FRAC;
+
+    let mut times: Vec<f64> = vec![0.0];
+    let mut traces: Vec<Vec<f64>> = (0..n).map(|d| vec![x0[d]]).collect();
+    let mut cap_prev = cap_v0;
+    let mut ind_prev = vec![0.0; model.inds.len()];
+    let mut t = 0.0;
+    let mut h = (duration / 100.0).clamp(h_min, h_max);
+
+    let mut iters = 0usize;
+    while t < duration * (1.0 - 1e-12) {
+        iters += 1;
+        if iters > ADAPTIVE_ITER_CAP {
+            return Err(SimError::NonConvergence(ADAPTIVE_ITER_CAP));
         }
-        for (li, (a, b, l)) in inds.iter().enumerate() {
-            let g_eq = h / l;
-            ind_prev[li] +=
-                g_eq * across(&x, layout.node_of(circuit, *a), layout.node_of(circuit, *b));
+        // Clamp the attempt to land exactly on `duration`.
+        let h_try = h.min(duration - t);
+        let at_floor = h_try <= h_min * (1.0 + 1e-9);
+
+        // Coarse: one step of h_try. Fine: two steps of h_try/2.
+        let (x_coarse, _, _) = model.step(t + h_try, h_try, &cap_prev, &ind_prev)?;
+        let half = 0.5 * h_try;
+        let (_, caps_mid, inds_mid) = model.step(t + half, half, &cap_prev, &ind_prev)?;
+        let (x_fine, caps_fine, inds_fine) = model.step(t + h_try, half, &caps_mid, &inds_mid)?;
+
+        let err = lte_norm(&x_fine, &x_coarse);
+        if err <= 1.0 || at_floor {
+            // Accept the finer solution and advance.
+            t += h_try;
+            cap_prev = caps_fine;
+            ind_prev = inds_fine;
+            times.push(t);
+            for (d, trace) in traces.iter_mut().enumerate() {
+                trace.push(x_fine[d]);
+            }
+            h = (h_try * lte_step_factor(err)).clamp(h_min, h_max);
+        } else {
+            // Reject: shrink and retry from the same state.
+            h = (h_try * lte_step_factor(err)).max(h_min);
         }
     }
 
-    Ok(traces
-        .into_iter()
-        .enumerate()
-        .map(|(d, y)| {
-            Signal::time(
-                format!("v(n{})", layout.inv[d]),
-                Unit::Volt,
-                times.clone(),
-                y,
-            )
-        })
-        .collect())
+    Ok(model.signals(times, traces))
 }
 
 // ---------------------------------------------------------------------------
@@ -1205,6 +1558,120 @@ fn op_signals(layout: &Layout, x: &[f64]) -> Vec<Signal> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// DC sweep + parametric sweep (CP-SIM-M1.5)
+// ---------------------------------------------------------------------------
+
+/// The unit a sweep must drive its target source with, and the guard that the
+/// target exists and is an independent source we can retarget.
+fn sweep_source_unit(circuit: &Circuit, source: &str) -> Result<Unit, SimError> {
+    match circuit.part_by_ref(source) {
+        Some(p) if matches!(p.kind, PartKind::VoltageSource) => Ok(Unit::Volt),
+        Some(p) if matches!(p.kind, PartKind::CurrentSource) => Ok(Unit::Ampere),
+        Some(_) => Err(SimError::Unsupported(
+            "sweep target is not an independent source",
+        )),
+        None => Err(SimError::UnknownPart(source.to_string())),
+    }
+}
+
+/// The sample points a sweep visits: `start` to `stop` inclusive in steps of
+/// `step`. `step` must be finite, non-zero, and point from `start` toward `stop`.
+/// Endpoints are included — the count is nudged by a hair so float drift cannot
+/// drop the final sample — and a zero span yields the single point `[start]`.
+fn sweep_values(start: f64, stop: f64, step: f64) -> Result<Vec<f64>, SimError> {
+    if !start.is_finite() || !stop.is_finite() || !step.is_finite() || step == 0.0 {
+        return Err(SimError::BadValue("DC sweep range/step".into()));
+    }
+    let span = stop - start;
+    if span != 0.0 && span.signum() != step.signum() {
+        return Err(SimError::BadValue(
+            "DC sweep step points the wrong way".into(),
+        ));
+    }
+    let count = (span / step + 1e-9).floor() as usize; // number of whole steps
+    Ok((0..=count).map(|i| start + i as f64 * step).collect())
+}
+
+/// `Analysis::DcSweep`: step an independent source's level from `start` to `stop`
+/// by `step`, solve the DC operating point (convergence aids and all) at every
+/// sample, and return one [`Signal`] per node — the node voltage as a function of
+/// the swept level, with the swept level on the `x` axis.
+///
+/// The swept source is driven as a plain DC source at each level (any waveform it
+/// carried is dropped for the sweep, so the stepped value always takes effect).
+/// The topology never changes across the sweep, so the MNA layout is built once.
+fn dc_sweep(
+    circuit: &Circuit,
+    source: &str,
+    start: f64,
+    stop: f64,
+    step: f64,
+) -> Result<Vec<Signal>, SimError> {
+    let unit = sweep_source_unit(circuit, source)?;
+    let values = sweep_values(start, stop, step)?;
+
+    let mut work = circuit.clone();
+    work.set_waveform(source, Waveform::Dc); // sweep the DC level, ignore any waveform
+    let layout = Layout::build(&work);
+    let n = layout.n_nodes();
+    let mut traces: Vec<Vec<f64>> = vec![Vec::with_capacity(values.len()); n];
+    for &val in &values {
+        work.set_value(source, Value::new(val, unit));
+        let x = solve_dc(&work, &layout)?;
+        for (d, trace) in traces.iter_mut().enumerate() {
+            trace.push(x[d]);
+        }
+    }
+
+    Ok(traces
+        .into_iter()
+        .enumerate()
+        .map(|(d, y)| {
+            Signal::time(
+                format!("v(n{})", layout.inv[d]),
+                Unit::Volt,
+                values.clone(),
+                y,
+            )
+        })
+        .collect())
+}
+
+impl Engine {
+    /// `Analysis::Parametric`: run the boxed `inner` analysis once per value in
+    /// `values`, retargeting `source`'s DC level to each value first. Every signal
+    /// the inner run returns is tagged with the swept value (`"v(n2) @ V1=3"`) so
+    /// the families stay distinguishable, and the runs are concatenated in order.
+    ///
+    /// The inner analysis flows back through [`Engine::run`], so it may be any
+    /// analysis — an operating point, a transient, an AC sweep, even a nested
+    /// sweep. As in [`dc_sweep`], the swept source is driven as a DC source at the
+    /// swept level.
+    fn parametric(
+        &self,
+        circuit: &Circuit,
+        source: &str,
+        values: &[f64],
+        inner: &Analysis,
+    ) -> Result<Vec<Signal>, SimError> {
+        // Validate the target up front so an empty `values` list still rejects a typo.
+        let unit = sweep_source_unit(circuit, source)?;
+
+        let mut work = circuit.clone();
+        work.set_waveform(source, Waveform::Dc);
+        let mut out = Vec::new();
+        for &val in values {
+            work.set_value(source, Value::new(val, unit));
+            for mut sig in self.run(&work, inner)? {
+                sig.name = format!("{} @ {source}={val}", sig.name);
+                out.push(sig);
+            }
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1212,6 +1679,155 @@ mod tests {
 
     fn v(s: &str, u: Unit) -> Option<Value> {
         Some(Value::parse(s, u).unwrap())
+    }
+    // --- Convergence aids — CP-SIM-M1.3 ------------------------------------
+
+    /// Build the plain-NR DC stamp and solve it with a cold start, no gmin, full
+    /// sources — i.e. the fast path alone, bypassing the convergence aids. Used by
+    /// the gate test to show a stiff circuit the aids are needed for.
+    fn plain_nr_dc(c: &Circuit) -> Result<Vec<f64>, SimError> {
+        let layout = Layout::build(c);
+        let size = layout.n_nodes() + layout.vsources.len() + layout.inductors.len();
+        let devices = collect_nonlinear(c).unwrap();
+        solve_nr(
+            c,
+            &layout,
+            size,
+            &devices,
+            &|sys| {
+                stamp_resistors(sys, c, &layout)?;
+                stamp_vsources(sys, c, &layout, None, 1.0)?;
+                stamp_current_sources(sys, c, &layout, None, 1.0)?;
+                stamp_inductor_shorts(sys, c, &layout)?;
+                Ok(())
+            },
+            None,
+            0.0,
+        )
+    }
+
+    /// The acceptance gate: a stiff netlist plain Newton–Raphson cannot crack, but
+    /// the convergence aids can.
+    ///
+    /// A diode-connected NMOS (gate tied to drain) is fed only by an ideal current
+    /// source — the channel is the drain node's *sole* DC path. At the cold-start
+    /// guess (every node 0 V) the gate sits at 0 V ≤ Vth, so the channel is cut off
+    /// with exactly zero transconductance: the drain row is all zeros and plain NR
+    /// solves a singular system and fails. gmin stepping props the node up with a
+    /// ramped conductance to ground, walks the bias onto the channel, and lands the
+    /// true operating point once the ramp reaches gmin = 0.
+    ///
+    /// Diode-connected ⇒ always saturated, so with λ = 0 the forced current obeys
+    /// I = K·(Vd − Vth)². With defaults K = 1 mA/V², Vth = 1 V and I = 1 mA that is
+    /// Vd = 2.0 V exactly — the value the aided solve must return.
+    #[test]
+    fn stiff_mosfet_needs_convergence_aids() {
+        let mut c = Circuit::new("isrc_mos");
+        let d = c.new_net();
+        c.add_part(
+            "I1",
+            PartKind::CurrentSource,
+            v("1m", Unit::Ampere),
+            vec![NetId::GROUND, d],
+        );
+        c.add_part(
+            "M1",
+            PartKind::Mosfet(Polarity::N, MosfetModel::default()),
+            None,
+            vec![d, d, NetId::GROUND],
+        );
+
+        // Plain NR alone cannot solve it (singular at the cold-start guess).
+        assert!(
+            plain_nr_dc(&c).is_err(),
+            "plain NR unexpectedly solved the stiff netlist — the gate proves nothing"
+        );
+
+        // The aided operating point solves and matches the square-law prediction.
+        let layout = Layout::build(&c);
+        let x = solve_dc(&c, &layout).unwrap();
+        let vd = x[layout.node_of(&c, d).unwrap()];
+        assert!(
+            (vd - 2.0).abs() <= 1e-6,
+            "aided Vd = {vd} V, expected 2.0 V"
+        );
+        // KCL: the channel carries exactly the injected current at that bias.
+        let m = MosfetModel::default();
+        let id = m.kp * (vd - m.vth).powi(2);
+        assert!(
+            (id - 1e-3).abs() <= 1e-9,
+            "channel current {id} A != injected 1 mA"
+        );
+    }
+
+    /// Both aids, called directly, reach the diode–resistor operating point from a
+    /// cold start — covering the gmin- and source-stepping continuations and
+    /// showing each lands the same junction drop the plain solve does.
+    #[test]
+    fn both_aids_reach_the_diode_resistor_point() {
+        let mut c = Circuit::new("diode_r");
+        let vin = c.new_net();
+        let mid = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("5", Unit::Volt),
+            vec![vin, NetId::GROUND],
+        );
+        c.add_part("R1", PartKind::Resistor, v("1k", Unit::Ohm), vec![vin, mid]);
+        c.add_part("D1", PartKind::Diode, None, vec![mid, NetId::GROUND]);
+
+        let layout = Layout::build(&c);
+        let size = layout.n_nodes() + layout.vsources.len() + layout.inductors.len();
+        let devices = collect_nonlinear(&c).unwrap();
+        let stamp_at = |sys: &mut System, alpha: f64| -> Result<(), SimError> {
+            stamp_resistors(sys, &c, &layout)?;
+            stamp_vsources(sys, &c, &layout, None, alpha)?;
+            stamp_current_sources(sys, &c, &layout, None, alpha)?;
+            stamp_inductor_shorts(sys, &c, &layout)?;
+            Ok(())
+        };
+
+        let reference = solve_dc(&c, &layout).unwrap()[layout.node_of(&c, mid).unwrap()];
+        let g = gmin_stepping(&c, &layout, size, &devices, &stamp_at)
+            .unwrap()
+            .expect("gmin stepping converged");
+        let s = source_stepping(&c, &layout, size, &devices, &stamp_at)
+            .unwrap()
+            .expect("source stepping converged");
+        let gi = layout.node_of(&c, mid).unwrap();
+        assert!(
+            (g[gi] - reference).abs() <= 1e-9,
+            "gmin: {} vs {reference}",
+            g[gi]
+        );
+        assert!(
+            (s[gi] - reference).abs() <= 1e-9,
+            "source: {} vs {reference}",
+            s[gi]
+        );
+    }
+
+    /// A plain-convergent circuit must never pay for the aids: the diode–resistor
+    /// bias solves on the plain-NR fast path alone, with no stepping.
+    #[test]
+    fn plain_convergent_circuit_skips_the_aids() {
+        let mut c = Circuit::new("diode_r");
+        let vin = c.new_net();
+        let mid = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("5", Unit::Volt),
+            vec![vin, NetId::GROUND],
+        );
+        c.add_part("R1", PartKind::Resistor, v("1k", Unit::Ohm), vec![vin, mid]);
+        c.add_part("D1", PartKind::Diode, None, vec![mid, NetId::GROUND]);
+        // If plain NR already solves it, the aids are not exercised for this input.
+        assert!(
+            plain_nr_dc(&c).is_ok(),
+            "fast path must crack a plain-convergent bias"
+        );
     }
 
     #[test]
@@ -2321,5 +2937,415 @@ mod tests {
             "phase {}° not inverting",
             h.phase_deg()
         );
+    }
+
+    // --- Adaptive timestep (LTE control) — CP-SIM-M1.6 ---------------------
+
+    #[test]
+    fn adaptive_transient_beats_fixed_on_an_rc_step() {
+        // Gate: an RC step run over 20 τ has a fast rise then a long placid tail —
+        // a fixed step must stay small throughout to resolve the knee, while the
+        // adaptive step grows once the curve flattens. The adaptive run must use
+        // materially fewer points than a fine fixed reference while holding the
+        // same order of accuracy against the analytic 5·(1 − e^(−t/RC)), RC = 1 ms.
+        let rc = 1e-3;
+        let dur = 20e-3;
+        let mut c = Circuit::new("rc");
+        let vin = c.new_net();
+        let out = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("5", Unit::Volt),
+            vec![vin, NetId::GROUND],
+        );
+        c.add_part("R1", PartKind::Resistor, v("1k", Unit::Ohm), vec![vin, out]);
+        c.add_part(
+            "C1",
+            PartKind::Capacitor,
+            v("1u", Unit::Farad),
+            vec![out, NetId::GROUND],
+        );
+        let name = format!("v(n{})", c.resolve(out).0);
+        let max_err = |sig: &Signal| -> f64 {
+            sig.x
+                .iter()
+                .zip(sig.real().unwrap())
+                .map(|(&t, &y)| (y - 5.0 * (1.0 - (-t / rc).exp())).abs())
+                .fold(0.0, f64::max)
+        };
+
+        // Adaptive (step = None): the engine chooses the grid.
+        let asig_all = Engine::new()
+            .run(
+                &c,
+                &Analysis::Transient {
+                    duration: dur,
+                    step: None,
+                },
+            )
+            .unwrap();
+        let asig = asig_all.iter().find(|s| s.name == name).unwrap();
+        // Fine fixed reference at 2 µs (10 000 steps).
+        let fsig_all = Engine::new()
+            .run(
+                &c,
+                &Analysis::Transient {
+                    duration: dur,
+                    step: Some(2e-6),
+                },
+            )
+            .unwrap();
+        let fsig = fsig_all.iter().find(|s| s.name == name).unwrap();
+
+        let (a_pts, f_pts) = (asig.len(), fsig.len());
+        let (a_err, f_err) = (max_err(asig), max_err(fsig));
+
+        // Materially fewer points — at least 4× (the real ratio is ~50×).
+        assert!(
+            a_pts * 4 < f_pts,
+            "adaptive used {a_pts} points vs fine {f_pts} — not materially fewer"
+        );
+        // Holds accuracy: a small absolute error, and the same order as the fine
+        // reference (within 15×, not the ~10 000× a coarse fixed grid would cost).
+        assert!(a_err <= 0.02, "adaptive max error {a_err} V too large");
+        assert!(
+            a_err <= 15.0 * f_err,
+            "adaptive error {a_err} not comparable to fine {f_err}"
+        );
+
+        // The grid actually adapts: the first step (on the steep rise) is far
+        // finer than the last (on the flat tail), and it lands exactly on `dur`.
+        let first_gap = asig.x[1] - asig.x[0];
+        let last_gap = asig.x[a_pts - 1] - asig.x[a_pts - 2];
+        assert!(
+            last_gap > 4.0 * first_gap,
+            "step did not coarsen: first {first_gap} s, last {last_gap} s"
+        );
+        assert!((asig.x[0]).abs() < 1e-15, "starts at t = 0");
+        assert!(
+            (asig.x[a_pts - 1] - dur).abs() <= dur * 1e-9,
+            "ends at {} s, expected {dur} s",
+            asig.x[a_pts - 1]
+        );
+        // Physically sane: uncharged start, charged near the rail at the end.
+        let y = asig.real().unwrap();
+        assert!(y[0].abs() < 1e-9 && *y.last().unwrap() > 4.9);
+    }
+
+    #[test]
+    fn adaptive_and_fixed_agree_on_the_rlc_ring() {
+        // A reactive, oscillatory circuit (underdamped series RLC) is a sterner LTE
+        // test than a monotone RC: the adaptive grid must track the ring. Its first
+        // overshoot peak must land at the same place a fine fixed run puts it.
+        let build = || {
+            let mut c = Circuit::new("rlc");
+            let vin = c.new_net();
+            let a = c.new_net();
+            let out = c.new_net();
+            c.add_part(
+                "V1",
+                PartKind::VoltageSource,
+                v("5", Unit::Volt),
+                vec![vin, NetId::GROUND],
+            );
+            c.add_part("R1", PartKind::Resistor, v("10", Unit::Ohm), vec![vin, a]);
+            c.add_part("L1", PartKind::Inductor, v("1m", Unit::Henry), vec![a, out]);
+            c.add_part(
+                "C1",
+                PartKind::Capacitor,
+                v("1u", Unit::Farad),
+                vec![out, NetId::GROUND],
+            );
+            (c, out)
+        };
+        let (c, out) = build();
+        let name = format!("v(n{})", c.resolve(out).0);
+        let dur = 400e-6;
+
+        let peak_time = |sig: &Signal| -> (f64, f64) {
+            let (xs, ys) = (&sig.x, sig.real().unwrap());
+            for i in 1..ys.len() - 1 {
+                if ys[i] >= ys[i - 1] && ys[i] > ys[i + 1] {
+                    return (xs[i], ys[i]);
+                }
+            }
+            (f64::NAN, f64::NAN)
+        };
+
+        let a = Engine::new()
+            .run(
+                &c,
+                &Analysis::Transient {
+                    duration: dur,
+                    step: None,
+                },
+            )
+            .unwrap();
+        let asig = a.iter().find(|s| s.name == name).unwrap();
+        let f = Engine::new()
+            .run(
+                &c,
+                &Analysis::Transient {
+                    duration: dur,
+                    step: Some(2e-8),
+                },
+            )
+            .unwrap();
+        let fsig = f.iter().find(|s| s.name == name).unwrap();
+
+        let (at, av) = peak_time(asig);
+        let (ft, fv) = peak_time(fsig);
+        assert!(av > 5.0 && fv > 5.0, "both overshoot 5 V (a={av}, f={fv})");
+        // The adaptive first peak lands within 3 % of the fine reference's.
+        assert!(
+            (at - ft).abs() / ft <= 0.03,
+            "adaptive peak at {at} s vs fine {ft} s"
+        );
+        assert!(
+            asig.len() * 3 < fsig.len(),
+            "adaptive {} pts not materially fewer than fine {}",
+            asig.len(),
+            fsig.len()
+        );
+    }
+
+    // --- DC sweep + parametric sweep — CP-SIM-M1.5 -------------------------
+
+    /// Build the 1k/1k divider driven by `V1` (DC, initial 0 V).
+    fn divider() -> (Circuit, NetId, NetId) {
+        let mut c = Circuit::new("divider");
+        let vin = c.new_net();
+        let mid = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("0", Unit::Volt),
+            vec![vin, NetId::GROUND],
+        );
+        c.add_part("R1", PartKind::Resistor, v("1k", Unit::Ohm), vec![vin, mid]);
+        c.add_part(
+            "R2",
+            PartKind::Resistor,
+            v("1k", Unit::Ohm),
+            vec![mid, NetId::GROUND],
+        );
+        (c, vin, mid)
+    }
+
+    #[test]
+    fn dc_sweep_divider_is_linear_in_the_source() {
+        // Sweep V1 0 → 10 V in 1 V steps: the midpoint tracks Vin/2 and the input
+        // node tracks the swept level, so the whole family is linear in the source.
+        let (c, vin, mid) = divider();
+        let sigs = Engine::new()
+            .run(
+                &c,
+                &Analysis::DcSweep {
+                    source: "V1".into(),
+                    start: 0.0,
+                    stop: 10.0,
+                    step: 1.0,
+                },
+            )
+            .unwrap();
+
+        let mid_name = format!("v(n{})", c.resolve(mid).0);
+        let mid_sig = sigs.iter().find(|s| s.name == mid_name).unwrap();
+        // 11 inclusive samples, the swept level on the x axis (0 … 10 V).
+        assert_eq!(mid_sig.x.len(), 11, "expected 11 sweep points");
+        assert!((mid_sig.x[0]).abs() < 1e-12);
+        assert!((mid_sig.x[10] - 10.0).abs() < 1e-9);
+        for (&xin, &vm) in mid_sig.x.iter().zip(mid_sig.real().unwrap()) {
+            assert!((vm - xin / 2.0).abs() <= 1e-9, "x={xin}: mid={vm}");
+        }
+
+        let vin_name = format!("v(n{})", c.resolve(vin).0);
+        let vin_sig = sigs.iter().find(|s| s.name == vin_name).unwrap();
+        for (&xin, &vv) in vin_sig.x.iter().zip(vin_sig.real().unwrap()) {
+            assert!((vv - xin).abs() <= 1e-9, "x={xin}: vin={vv}");
+        }
+    }
+
+    #[test]
+    fn dc_sweep_diode_matches_shockley() {
+        // Sweep the current forced through a diode (1 → 10 mA) and read the
+        // junction voltage back: each point is the inverse-Shockley law
+        // V = n·Vt·ln(I/Is + 1), solved by the Newton path at every sample.
+        let mut c = Circuit::new("diode_sweep");
+        let node = c.new_net();
+        c.add_part(
+            "I1",
+            PartKind::CurrentSource,
+            v("1m", Unit::Ampere),
+            vec![NetId::GROUND, node],
+        );
+        c.add_part("D1", PartKind::Diode, None, vec![node, NetId::GROUND]);
+
+        let sigs = Engine::new()
+            .run(
+                &c,
+                &Analysis::DcSweep {
+                    source: "I1".into(),
+                    start: 1e-3,
+                    stop: 10e-3,
+                    step: 1e-3,
+                },
+            )
+            .unwrap();
+
+        let name = format!("v(n{})", c.resolve(node).0);
+        let sig = sigs.iter().find(|s| s.name == name).unwrap();
+        assert_eq!(sig.x.len(), 10);
+        for (&i, &vd) in sig.x.iter().zip(sig.real().unwrap()) {
+            let expected = VTE * (i / IS + 1.0).ln();
+            assert!(
+                (vd - expected).abs() <= 1e-7,
+                "I={i}: vd={vd}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn parametric_runs_inner_once_per_value() {
+        // Parametric over V1 ∈ {2, 5, 8} V with an inner DC operating point of the
+        // divider: three runs × two nodes = six tagged signals, midpoint = Vin/2.
+        let (c, _vin, mid) = divider();
+        let values = vec![2.0, 5.0, 8.0];
+        let sigs = Engine::new()
+            .run(
+                &c,
+                &Analysis::Parametric {
+                    source: "V1".into(),
+                    values: values.clone(),
+                    inner: Box::new(Analysis::OperatingPoint),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(sigs.len(), 6, "2 nodes × 3 values");
+        let mid_raw = c.resolve(mid).0;
+        for &val in &values {
+            let tag = format!("v(n{mid_raw}) @ V1={val}");
+            let s = sigs
+                .iter()
+                .find(|s| s.name == tag)
+                .unwrap_or_else(|| panic!("missing tagged signal {tag}"));
+            assert!(
+                (s.real().unwrap()[0] - val / 2.0).abs() <= 1e-9,
+                "{tag}: mid={}",
+                s.real().unwrap()[0]
+            );
+        }
+    }
+
+    #[test]
+    fn parametric_over_transient_sweeps_the_bias() {
+        // An inner transient per value proves the inner analysis is a full run, not
+        // just an operating point: an RC charging from a swept rail settles toward
+        // that rail. Sweep V1 ∈ {1, 4} V; the last sample of v(out) nears the rail.
+        let mut c = Circuit::new("rc");
+        let vin = c.new_net();
+        let out = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("1", Unit::Volt),
+            vec![vin, NetId::GROUND],
+        );
+        c.add_part("R1", PartKind::Resistor, v("1k", Unit::Ohm), vec![vin, out]);
+        c.add_part(
+            "C1",
+            PartKind::Capacitor,
+            v("1u", Unit::Farad),
+            vec![out, NetId::GROUND],
+        );
+
+        let sigs = Engine::new()
+            .run(
+                &c,
+                &Analysis::Parametric {
+                    source: "V1".into(),
+                    values: vec![1.0, 4.0],
+                    inner: Box::new(Analysis::Transient {
+                        duration: 5e-3,
+                        step: Some(5e-6),
+                    }),
+                },
+            )
+            .unwrap();
+
+        let out_raw = c.resolve(out).0;
+        for &rail in &[1.0_f64, 4.0] {
+            let tag = format!("v(n{out_raw}) @ V1={rail}");
+            let s = sigs.iter().find(|s| s.name == tag).unwrap();
+            let y = s.real().unwrap();
+            assert!(y[0].abs() < 1e-9, "{tag}: starts uncharged");
+            assert!(
+                *y.last().unwrap() > 0.98 * rail,
+                "{tag}: ends at {} V, near {rail}",
+                y.last().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn sweep_rejects_bad_targets_and_steps() {
+        let (c, _vin, _mid) = divider();
+        let run = |a| Engine::new().run(&c, &a);
+
+        // Unknown source reference.
+        assert!(matches!(
+            run(Analysis::DcSweep {
+                source: "VX".into(),
+                start: 0.0,
+                stop: 10.0,
+                step: 1.0,
+            })
+            .unwrap_err(),
+            SimError::UnknownPart(_)
+        ));
+        // A resistor is not an independent source.
+        assert!(matches!(
+            run(Analysis::DcSweep {
+                source: "R1".into(),
+                start: 0.0,
+                stop: 10.0,
+                step: 1.0,
+            })
+            .unwrap_err(),
+            SimError::Unsupported(_)
+        ));
+        // Zero step, and a step pointing the wrong way, are both bad values.
+        assert!(matches!(
+            run(Analysis::DcSweep {
+                source: "V1".into(),
+                start: 0.0,
+                stop: 10.0,
+                step: 0.0,
+            })
+            .unwrap_err(),
+            SimError::BadValue(_)
+        ));
+        assert!(matches!(
+            run(Analysis::DcSweep {
+                source: "V1".into(),
+                start: 0.0,
+                stop: 10.0,
+                step: -1.0,
+            })
+            .unwrap_err(),
+            SimError::BadValue(_)
+        ));
+        // Parametric validates the target even with an empty value list.
+        assert!(matches!(
+            run(Analysis::Parametric {
+                source: "VX".into(),
+                values: vec![],
+                inner: Box::new(Analysis::OperatingPoint),
+            })
+            .unwrap_err(),
+            SimError::UnknownPart(_)
+        ));
     }
 }
