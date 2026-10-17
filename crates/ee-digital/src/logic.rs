@@ -29,10 +29,10 @@ impl Default for Logic {
 
 impl Logic {
     /// Collapse a floating (`Z`) level to unknown (`X`) for gate evaluation; a
-    /// definite `0`/`1` is returned unchanged. A gate input that nobody drives is
-    /// unknowable, not a logic `0`.
+    /// definite `0`/`1` is returned unchanged. A gate (or flip-flop) input that
+    /// nobody drives is unknowable, not a logic `0`.
     #[inline]
-    fn sensed(self) -> Logic {
+    pub fn sensed(self) -> Logic {
         match self {
             Logic::Z => Logic::X,
             other => other,
