@@ -319,16 +319,18 @@ fn stamp_resistors(sys: &mut System, circuit: &Circuit, layout: &Layout) -> Resu
 
 /// Stamp every voltage source, each using its own branch-current row. `t` selects
 /// the source level: `None` for the operating-point bias, `Some(secs)` for the
-/// waveform value at that transient time.
+/// waveform value at that transient time. `scale` multiplies the level — `1.0` for
+/// the real circuit, a ramp in `[0, 1]` during source stepping ([`source_stepping`]).
 fn stamp_vsources(
     sys: &mut System,
     circuit: &Circuit,
     layout: &Layout,
     t: Option<f64>,
+    scale: f64,
 ) -> Result<(), SimError> {
     for (branch, &pi) in layout.vsources.iter().enumerate() {
         let part = &circuit.parts()[pi];
-        let volts = source_value(part, t)?;
+        let volts = source_value(part, t)? * scale;
         let (plus, minus) = terminals2(part)?;
         let k = layout.n_nodes() + branch;
         sys.stamp_vsource(
@@ -345,15 +347,17 @@ fn stamp_vsources(
 /// drives that current from `a` into `b` (no new unknown — a pure RHS term). `t`
 /// selects the level: `None` for the operating-point bias, `Some(secs)` for the
 /// waveform value at that transient time (a DC source is the same either way).
+/// `scale` multiplies the level, as in [`stamp_vsources`] (source stepping).
 fn stamp_current_sources(
     sys: &mut System,
     circuit: &Circuit,
     layout: &Layout,
     t: Option<f64>,
+    scale: f64,
 ) -> Result<(), SimError> {
     for part in circuit.parts() {
         if matches!(part.kind, PartKind::CurrentSource) {
-            let amps = source_value(part, t)?;
+            let amps = source_value(part, t)? * scale;
             let (a, b) = terminals2(part)?;
             // `stamp_current(i, j, amps)` injects `amps` flowing from `j` into `i`,
             // so `(b, a)` reads as "amps from a into b" — the source's own direction.
@@ -760,23 +764,36 @@ fn collect_nonlinear(circuit: &Circuit) -> Result<Vec<Box<dyn NonlinearDevice>>,
 /// With **no** nonlinear devices the routine stamps and solves exactly once,
 /// reproducing the linear M0 result bit-for-bit — so the existing linear tests
 /// do not move.
+///
+/// `x_init` is the starting guess (`None` = every node at 0 V); the convergence
+/// aids ([`gmin_stepping`] / [`source_stepping`]) warm-start each continuation
+/// step from the previous one. `gmin` adds a conductance from every node to
+/// ground on every iteration — the knob gmin stepping ramps from large → 0; pass
+/// `0.0` for the unaided solve.
 fn solve_nr(
     circuit: &Circuit,
     layout: &Layout,
     size: usize,
     devices: &[Box<dyn NonlinearDevice>],
     stamp_linear: &dyn Fn(&mut System) -> Result<(), SimError>,
+    x_init: Option<&[f64]>,
+    gmin: f64,
 ) -> Result<Vec<f64>, SimError> {
-    // Purely linear: one stamp-and-solve is exact (and identical to M0).
+    // Purely linear: one stamp-and-solve is exact (and identical to M0). A linear
+    // circuit always solves in one shot, so the convergence aids never reach here.
     if devices.is_empty() {
         let mut sys = System::new(size);
         stamp_linear(&mut sys)?;
         return sys.solve().ok_or(SimError::Singular);
     }
 
-    let mut x = vec![0.0; size]; // initial guess: every node at 0 V
-                                 // Per-device limiting memory (previous limited controlling voltages) and the
-                                 // previous iteration's terminal currents, for the current-convergence test.
+    // Initial guess: the warm start if given, else every node at 0 V.
+    let mut x = match x_init {
+        Some(x0) => x0.to_vec(),
+        None => vec![0.0; size],
+    };
+    // Per-device limiting memory (previous limited controlling voltages) and the
+    // previous iteration's terminal currents, for the current-convergence test.
     let mut states: Vec<Vec<f64>> = devices.iter().map(|d| vec![0.0; d.state_len()]).collect();
     let mut i_prev: Vec<Vec<f64>> = devices
         .iter()
@@ -786,6 +803,13 @@ fn solve_nr(
     for _ in 0..NR_MAX_ITERS {
         let mut sys = System::new(size);
         stamp_linear(&mut sys)?;
+        // gmin stepping: a tiny conductance from every node to ground props up an
+        // otherwise ill-conditioned Jacobian; it is ramped to 0 across outer steps.
+        if gmin > 0.0 {
+            for i in 0..layout.n_nodes() {
+                sys.stamp_conductance(Some(i), None, gmin);
+            }
+        }
 
         let mut i_now: Vec<Vec<f64>> = Vec::with_capacity(devices.len());
         for (k, dev) in devices.iter().enumerate() {
@@ -828,19 +852,137 @@ fn solve_nr(
     Err(SimError::NonConvergence(NR_MAX_ITERS))
 }
 
+/// Number of continuation steps in gmin and source stepping: the aid ramps its
+/// knob across this many solves, warm-starting each from the last.
+const STEPPING_STEPS: usize = 16;
+/// Largest node-to-ground conductance gmin stepping starts from (1 kΩ to ground
+/// on every node — enough to tame almost any ill-conditioned Jacobian).
+const GMIN_START: f64 = 1e-3;
+/// Smallest non-zero gmin before the final gmin = 0 solve on the real circuit.
+const GMIN_FLOOR: f64 = 1e-12;
+
 /// Solve the DC operating point: resistors + sources, capacitors open, inductors
 /// shorted, and any nonlinear device driven to steady state by Newton–Raphson.
+///
+/// Tries plain NR first (the fast path — a plain-convergent or purely linear
+/// circuit takes exactly this and nothing more). Only if NR fails — hitting its
+/// iteration cap, *or* returning a singular Jacobian — does it fall back to the
+/// convergence aids: gmin stepping, then source stepping. A singular plain solve
+/// is routed in too, because an isolated node at the cold-start guess (a
+/// cutoff-at-0 V MOSFET channel, say) is exactly what gmin stepping props up and
+/// resolves; a node that stays floating at the real circuit (gmin's final step at
+/// gmin = 0) still surfaces as [`SimError::Singular`], and only a genuinely
+/// hopeless nonlinear solve surfaces as [`SimError::NonConvergence`].
 fn solve_dc(circuit: &Circuit, layout: &Layout) -> Result<Vec<f64>, SimError> {
     let size = layout.n_nodes() + layout.vsources.len() + layout.inductors.len();
     let devices = collect_nonlinear(circuit)?;
-    solve_nr(circuit, layout, size, &devices, &|sys| {
+    // The linear stamp at source scale `alpha` (1.0 = the real circuit).
+    let stamp_at = |sys: &mut System, alpha: f64| -> Result<(), SimError> {
         stamp_resistors(sys, circuit, layout)?;
-        // Operating point: sources at their bias (`None`).
-        stamp_vsources(sys, circuit, layout, None)?;
-        stamp_current_sources(sys, circuit, layout, None)?;
+        // Operating point: sources at their bias (`None`), scaled for source stepping.
+        stamp_vsources(sys, circuit, layout, None, alpha)?;
+        stamp_current_sources(sys, circuit, layout, None, alpha)?;
         stamp_inductor_shorts(sys, circuit, layout)?;
         Ok(())
-    })
+    };
+
+    // 1. Plain Newton–Raphson, full sources, no gmin, cold start.
+    match solve_nr(
+        circuit,
+        layout,
+        size,
+        &devices,
+        &|sys| stamp_at(sys, 1.0),
+        None,
+        0.0,
+    ) {
+        Ok(x) => return Ok(x),
+        // Hit the iteration cap or a singular guess — the aids may still get there.
+        Err(SimError::NonConvergence(_)) | Err(SimError::Singular) => {}
+        Err(e) => return Err(e), // Bad*/Missing* are data faults no aid can cure
+    }
+
+    // 2. gmin stepping, then 3. source stepping. Each returns `Ok(None)` when a
+    // continuation step fails to converge; a real fault (still singular at the
+    // final gmin = 0 — a truly floating node) propagates straight out.
+    if let Some(x) = gmin_stepping(circuit, layout, size, &devices, &stamp_at)? {
+        return Ok(x);
+    }
+    if let Some(x) = source_stepping(circuit, layout, size, &devices, &stamp_at)? {
+        return Ok(x);
+    }
+    Err(SimError::NonConvergence(NR_MAX_ITERS))
+}
+
+/// gmin stepping: solve with a large node-to-ground conductance first (which
+/// makes the Jacobian diagonally dominant and trivially solvable), then ramp that
+/// conductance geometrically down to zero, warm-starting each solve from the last.
+/// The final solve sits at gmin = 0 — the true circuit — so the returned point
+/// carries no residual-conductance error. `Ok(None)` means a continuation step
+/// failed to converge (the caller then tries source stepping); a real error (a
+/// singular system) propagates.
+fn gmin_stepping(
+    circuit: &Circuit,
+    layout: &Layout,
+    size: usize,
+    devices: &[Box<dyn NonlinearDevice>],
+    stamp_at: &dyn Fn(&mut System, f64) -> Result<(), SimError>,
+) -> Result<Option<Vec<f64>>, SimError> {
+    let mut x = vec![0.0; size];
+    let ratio = GMIN_FLOOR / GMIN_START; // < 1
+    for k in 0..=STEPPING_STEPS {
+        let gmin = if k == STEPPING_STEPS {
+            0.0 // the last step is the real circuit
+        } else {
+            GMIN_START * ratio.powf(k as f64 / STEPPING_STEPS as f64)
+        };
+        match solve_nr(
+            circuit,
+            layout,
+            size,
+            devices,
+            &|sys| stamp_at(sys, 1.0),
+            Some(&x),
+            gmin,
+        ) {
+            Ok(sol) => x = sol,
+            Err(SimError::NonConvergence(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(Some(x))
+}
+
+/// Source stepping: ramp every independent source from 0 → 100% of its value
+/// across the continuation, warm-starting each solve from the last. At 0% the
+/// circuit is dead and the solution is the origin; each small increment moves the
+/// operating point only a little, keeping every Newton solve inside its basin of
+/// attraction. `Ok(None)` means a step failed to converge; a real error propagates.
+fn source_stepping(
+    circuit: &Circuit,
+    layout: &Layout,
+    size: usize,
+    devices: &[Box<dyn NonlinearDevice>],
+    stamp_at: &dyn Fn(&mut System, f64) -> Result<(), SimError>,
+) -> Result<Option<Vec<f64>>, SimError> {
+    let mut x = vec![0.0; size];
+    for k in 0..=STEPPING_STEPS {
+        let alpha = k as f64 / STEPPING_STEPS as f64; // 0 → 1
+        match solve_nr(
+            circuit,
+            layout,
+            size,
+            devices,
+            &|sys| stamp_at(sys, alpha),
+            Some(&x),
+            0.0,
+        ) {
+            Ok(sol) => x = sol,
+            Err(SimError::NonConvergence(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(Some(x))
 }
 
 /// Voltage across a two-terminal device (`v(plus) - v(minus)`), ground = 0 V.
@@ -915,8 +1057,8 @@ fn transient(
         let stamp = |sys: &mut System| -> Result<(), SimError> {
             stamp_resistors(sys, circuit, layout)?;
             // t = 0 uses the waveform bias (sine → offset, pulse → v1).
-            stamp_vsources(sys, circuit, layout, None)?;
-            stamp_current_sources(sys, circuit, layout, None)?;
+            stamp_vsources(sys, circuit, layout, None, 1.0)?;
+            stamp_current_sources(sys, circuit, layout, None, 1.0)?;
             // Inductors are open at t = 0 (i(0) = 0), so they are not stamped.
             for (ci, (a, b, _)) in caps.iter().enumerate() {
                 let k = n + m + ci;
@@ -929,7 +1071,15 @@ fn transient(
             }
             Ok(())
         };
-        let x0 = solve_nr(circuit, layout, n + m + caps.len(), &diodes, &stamp)?;
+        let x0 = solve_nr(
+            circuit,
+            layout,
+            n + m + caps.len(),
+            &diodes,
+            &stamp,
+            None,
+            0.0,
+        )?;
         times.push(0.0);
         for (d, trace) in traces.iter_mut().enumerate() {
             trace.push(x0[d]);
@@ -949,8 +1099,8 @@ fn transient(
         let stamp = |sys: &mut System| -> Result<(), SimError> {
             stamp_resistors(sys, circuit, layout)?;
             // Sources evaluated at the current transient time.
-            stamp_vsources(sys, circuit, layout, Some(t))?;
-            stamp_current_sources(sys, circuit, layout, Some(t))?;
+            stamp_vsources(sys, circuit, layout, Some(t), 1.0)?;
+            stamp_current_sources(sys, circuit, layout, Some(t), 1.0)?;
             for (ci, (a, b, c)) in caps.iter().enumerate() {
                 let g_eq = c / h;
                 let (ia, ib) = (layout.node_of(circuit, *a), layout.node_of(circuit, *b));
@@ -966,7 +1116,7 @@ fn transient(
             }
             Ok(())
         };
-        let x = solve_nr(circuit, layout, n + m, &diodes, &stamp)?;
+        let x = solve_nr(circuit, layout, n + m, &diodes, &stamp, None, 0.0)?;
         times.push(k as f64 * h);
         for (d, trace) in traces.iter_mut().enumerate() {
             trace.push(x[d]);
@@ -1212,6 +1362,155 @@ mod tests {
 
     fn v(s: &str, u: Unit) -> Option<Value> {
         Some(Value::parse(s, u).unwrap())
+    }
+    // --- Convergence aids — CP-SIM-M1.3 ------------------------------------
+
+    /// Build the plain-NR DC stamp and solve it with a cold start, no gmin, full
+    /// sources — i.e. the fast path alone, bypassing the convergence aids. Used by
+    /// the gate test to show a stiff circuit the aids are needed for.
+    fn plain_nr_dc(c: &Circuit) -> Result<Vec<f64>, SimError> {
+        let layout = Layout::build(c);
+        let size = layout.n_nodes() + layout.vsources.len() + layout.inductors.len();
+        let devices = collect_nonlinear(c).unwrap();
+        solve_nr(
+            c,
+            &layout,
+            size,
+            &devices,
+            &|sys| {
+                stamp_resistors(sys, c, &layout)?;
+                stamp_vsources(sys, c, &layout, None, 1.0)?;
+                stamp_current_sources(sys, c, &layout, None, 1.0)?;
+                stamp_inductor_shorts(sys, c, &layout)?;
+                Ok(())
+            },
+            None,
+            0.0,
+        )
+    }
+
+    /// The acceptance gate: a stiff netlist plain Newton–Raphson cannot crack, but
+    /// the convergence aids can.
+    ///
+    /// A diode-connected NMOS (gate tied to drain) is fed only by an ideal current
+    /// source — the channel is the drain node's *sole* DC path. At the cold-start
+    /// guess (every node 0 V) the gate sits at 0 V ≤ Vth, so the channel is cut off
+    /// with exactly zero transconductance: the drain row is all zeros and plain NR
+    /// solves a singular system and fails. gmin stepping props the node up with a
+    /// ramped conductance to ground, walks the bias onto the channel, and lands the
+    /// true operating point once the ramp reaches gmin = 0.
+    ///
+    /// Diode-connected ⇒ always saturated, so with λ = 0 the forced current obeys
+    /// I = K·(Vd − Vth)². With defaults K = 1 mA/V², Vth = 1 V and I = 1 mA that is
+    /// Vd = 2.0 V exactly — the value the aided solve must return.
+    #[test]
+    fn stiff_mosfet_needs_convergence_aids() {
+        let mut c = Circuit::new("isrc_mos");
+        let d = c.new_net();
+        c.add_part(
+            "I1",
+            PartKind::CurrentSource,
+            v("1m", Unit::Ampere),
+            vec![NetId::GROUND, d],
+        );
+        c.add_part(
+            "M1",
+            PartKind::Mosfet(Polarity::N, MosfetModel::default()),
+            None,
+            vec![d, d, NetId::GROUND],
+        );
+
+        // Plain NR alone cannot solve it (singular at the cold-start guess).
+        assert!(
+            plain_nr_dc(&c).is_err(),
+            "plain NR unexpectedly solved the stiff netlist — the gate proves nothing"
+        );
+
+        // The aided operating point solves and matches the square-law prediction.
+        let layout = Layout::build(&c);
+        let x = solve_dc(&c, &layout).unwrap();
+        let vd = x[layout.node_of(&c, d).unwrap()];
+        assert!(
+            (vd - 2.0).abs() <= 1e-6,
+            "aided Vd = {vd} V, expected 2.0 V"
+        );
+        // KCL: the channel carries exactly the injected current at that bias.
+        let m = MosfetModel::default();
+        let id = m.kp * (vd - m.vth).powi(2);
+        assert!(
+            (id - 1e-3).abs() <= 1e-9,
+            "channel current {id} A != injected 1 mA"
+        );
+    }
+
+    /// Both aids, called directly, reach the diode–resistor operating point from a
+    /// cold start — covering the gmin- and source-stepping continuations and
+    /// showing each lands the same junction drop the plain solve does.
+    #[test]
+    fn both_aids_reach_the_diode_resistor_point() {
+        let mut c = Circuit::new("diode_r");
+        let vin = c.new_net();
+        let mid = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("5", Unit::Volt),
+            vec![vin, NetId::GROUND],
+        );
+        c.add_part("R1", PartKind::Resistor, v("1k", Unit::Ohm), vec![vin, mid]);
+        c.add_part("D1", PartKind::Diode, None, vec![mid, NetId::GROUND]);
+
+        let layout = Layout::build(&c);
+        let size = layout.n_nodes() + layout.vsources.len() + layout.inductors.len();
+        let devices = collect_nonlinear(&c).unwrap();
+        let stamp_at = |sys: &mut System, alpha: f64| -> Result<(), SimError> {
+            stamp_resistors(sys, &c, &layout)?;
+            stamp_vsources(sys, &c, &layout, None, alpha)?;
+            stamp_current_sources(sys, &c, &layout, None, alpha)?;
+            stamp_inductor_shorts(sys, &c, &layout)?;
+            Ok(())
+        };
+
+        let reference = solve_dc(&c, &layout).unwrap()[layout.node_of(&c, mid).unwrap()];
+        let g = gmin_stepping(&c, &layout, size, &devices, &stamp_at)
+            .unwrap()
+            .expect("gmin stepping converged");
+        let s = source_stepping(&c, &layout, size, &devices, &stamp_at)
+            .unwrap()
+            .expect("source stepping converged");
+        let gi = layout.node_of(&c, mid).unwrap();
+        assert!(
+            (g[gi] - reference).abs() <= 1e-9,
+            "gmin: {} vs {reference}",
+            g[gi]
+        );
+        assert!(
+            (s[gi] - reference).abs() <= 1e-9,
+            "source: {} vs {reference}",
+            s[gi]
+        );
+    }
+
+    /// A plain-convergent circuit must never pay for the aids: the diode–resistor
+    /// bias solves on the plain-NR fast path alone, with no stepping.
+    #[test]
+    fn plain_convergent_circuit_skips_the_aids() {
+        let mut c = Circuit::new("diode_r");
+        let vin = c.new_net();
+        let mid = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("5", Unit::Volt),
+            vec![vin, NetId::GROUND],
+        );
+        c.add_part("R1", PartKind::Resistor, v("1k", Unit::Ohm), vec![vin, mid]);
+        c.add_part("D1", PartKind::Diode, None, vec![mid, NetId::GROUND]);
+        // If plain NR already solves it, the aids are not exercised for this input.
+        assert!(
+            plain_nr_dc(&c).is_ok(),
+            "fast path must crack a plain-convergent bias"
+        );
     }
 
     #[test]
