@@ -37,6 +37,20 @@ pub enum Analysis {
         f_stop: f64,
         points_per_decade: u32,
     },
+    /// Sweep an independent source's value across `[start, stop]` by `step`,
+    /// recording the operating point at each point. (CP-SIM-M1.5.)
+    DcSweep {
+        source: String,
+        start: f64,
+        stop: f64,
+        step: f64,
+    },
+    /// Repeat an inner analysis once per value of a source/parameter. (CP-SIM-M1.5.)
+    Parametric {
+        source: String,
+        values: Vec<f64>,
+        inner: Box<Analysis>,
+    },
 }
 
 /// What can go wrong assembling or solving a circuit.
@@ -93,6 +107,10 @@ impl Engine {
             }
             Analysis::Transient { duration, step } => transient(circuit, &layout, *duration, *step),
             Analysis::Ac { .. } => Err(SimError::Unsupported("AC analysis (CP-SIM-M1.4)")),
+            Analysis::DcSweep { .. } => Err(SimError::Unsupported("DC sweep (CP-SIM-M1.5)")),
+            Analysis::Parametric { .. } => {
+                Err(SimError::Unsupported("parametric sweep (CP-SIM-M1.5)"))
+            }
         }
     }
 }
