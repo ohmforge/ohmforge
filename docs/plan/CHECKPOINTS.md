@@ -117,17 +117,29 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 
 ---
 
+## M4 — vision / stretch  → plan: [`M4-PLAN.md`](M4-PLAN.md)
+
+- [ ] **CP-SIM-M4.1** (sim-core) Plugin device-model API + registry. — *gate:* a device defined outside `ee-sim` participates in a real solve and matches hand analysis.
+- [ ] **CP-SIM-M4.2** (sim-core) KLU-class sparse: fill-reducing ordering + symbolic-factorization reuse. — *gate:* correct vs current solver + improved scaling on a ≈10k-node net.
+- [ ] **CP-SIM-M4.3** (sim-core) Multithreaded analyses (MC/sweep), native-gated, deterministic. — *gate:* single- vs multi-threaded identical results + a measured speedup.
+- [ ] **CP-BRD-M4.1** (boards) Cortex-M3/M4 (Thumb-2) STM32-class core. — *gate:* Thumb-2 instruction vectors + an STM32 blink.
+- [ ] **CP-AF-M4.1** (ai-fmt) SPICE `.model` import + a small vendor model library. — *gate:* a `.model`-parameterized device simulates with the given params; the catalog resolves known parts.
+- [ ] **CP-UX-M4.1** (ui-shell) Instrument/block plugin surface + session export. — *gate:* a custom block runs in a patch; a session round-trips identically.
+- [ ] **CP-WEB.2** (web) Shareable/publishable circuit via a URL fragment. — *gate:* encode→decode round-trip; the page loads + simulates a circuit from a link.
+
+---
+
 ### Progress summary
 
 | Track | Done | In progress | Total |
 |---|---|---|---|
-| sim-core | 16 | 0 | 16 |
-| boards | 12 | 0 | 12 |
-| ui-shell | 14 | 0 | 14 |
-| ai-fmt | 11 | 0 | 11 |
+| sim-core | 16 | 0 | 19 |
+| boards | 12 | 0 | 13 |
+| ui-shell | 14 | 0 | 15 |
+| ai-fmt | 11 | 0 | 12 |
 | platform | 6 | 0 | 6 |
-| web | 1 | 0 | 1 |
-| **Total** | **60** | **0** | **60** ✅ |
+| web | 1 | 0 | 2 |
+| **Total** | **60** | **0** | **67** |
 
 _**60/60 — M0, M1, M2, and M3 all complete**, tagged **v0.1.0**. M3 added the dataflow patcher, HDL-lite, manifest boards + drop-in modules, behavioral/expression sources, a tutor with graded challenges, Fritzing export, and a **WebAssembly browser front end** (`ee-web`). The roadmap horizon beyond here is M4 (sparse-KLU/multithread, collaborative sessions, plugin API, QEMU full-SBC bridge)._
 
