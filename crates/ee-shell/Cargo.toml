@@ -13,4 +13,7 @@ workspace = true
 ee-core = { workspace = true }
 ee-sim = { workspace = true }
 ee-tui = { workspace = true }
+# ee-fmt supplies the native project text for the circuit half of a saved
+# session (CP-UX-M4.1). The arrow is acyclic: ee-fmt depends only on ee-core.
+ee-fmt = { workspace = true }
 # rhai = { workspace = true }   # embedded scripting, added at M1

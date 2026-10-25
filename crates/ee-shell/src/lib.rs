@@ -32,8 +32,10 @@
 //! ```
 
 pub mod script;
+pub mod session;
 
 pub use script::{Recording, ScriptError, ScriptRun};
+pub use session::SessionError;
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -114,6 +116,8 @@ impl Shell {
         "undo",
         "checkpoint",
         "restore",
+        "save",
+        "load",
         "help",
     ];
 
@@ -164,6 +168,8 @@ impl Shell {
             "undo" => self.cmd_undo(&args),
             "checkpoint" => self.cmd_checkpoint(&args),
             "restore" => self.cmd_restore(&args),
+            "save" => self.cmd_save(&args),
+            "load" => self.cmd_load(&args),
             "help" => Ok(Self::help_text()),
             other => Err(ShellError::UnknownCommand(other.to_string())),
         }
@@ -266,6 +272,91 @@ impl Shell {
             });
         };
         self.restore(name)
+    }
+
+    // ── session export / import (CP-UX-M4.1) ───────────────────────────────
+
+    /// Serialize the whole session — circuit, node names, probes, and every named
+    /// checkpoint — to the portable text form parsed by [`Self::import_session`].
+    ///
+    /// The undo stack is deliberately *not* exported; it is session-local history,
+    /// not part of the saved document. Checkpoints are written in sorted order so
+    /// the output is deterministic.
+    pub fn export_session(&self) -> String {
+        let mut out = String::new();
+        session::write_header(&mut out);
+        session::write_body(&mut out, &self.circuit, &self.nets, &self.probes);
+        let mut names: Vec<&String> = self.checkpoints.keys().collect();
+        names.sort();
+        for name in names {
+            let snap = &self.checkpoints[name];
+            session::write_checkpoint_header(&mut out, name);
+            session::write_body(&mut out, &snap.circuit, &snap.nets, &snap.probes);
+        }
+        out
+    }
+
+    /// Replace this shell's session with one decoded from [`Self::export_session`] text.
+    ///
+    /// On success the circuit, node names, probes, and checkpoints all come from
+    /// the text and the undo stack is cleared (the imported session is a fresh
+    /// starting point). On a parse error the shell is left untouched.
+    pub fn import_session(&mut self, text: &str) -> Result<(), SessionError> {
+        let parsed = session::parse(text)?;
+        self.circuit = parsed.main.circuit;
+        self.nets = parsed.main.nets;
+        self.probes = parsed.main.probes;
+        self.undo_stack.clear();
+        self.checkpoints = parsed
+            .checkpoints
+            .into_iter()
+            .map(|(name, body)| {
+                (
+                    name,
+                    Snapshot {
+                        circuit: body.circuit,
+                        nets: body.nets,
+                        probes: body.probes,
+                    },
+                )
+            })
+            .collect();
+        Ok(())
+    }
+
+    /// `save <path>` — write the exported session to a file.
+    fn cmd_save(&self, args: &[&str]) -> Result<String, ShellError> {
+        let [path] = args else {
+            return Err(ShellError::Usage {
+                command: "save",
+                usage: "save <path>",
+            });
+        };
+        std::fs::write(path, self.export_session()).map_err(|e| ShellError::Io {
+            path: (*path).to_string(),
+            detail: e.to_string(),
+        })?;
+        Ok(format!("saved session to {path}"))
+    }
+
+    /// `load <path>` — read a session file and replace the current session.
+    fn cmd_load(&mut self, args: &[&str]) -> Result<String, ShellError> {
+        let [path] = args else {
+            return Err(ShellError::Usage {
+                command: "load",
+                usage: "load <path>",
+            });
+        };
+        let text = std::fs::read_to_string(path).map_err(|e| ShellError::Io {
+            path: (*path).to_string(),
+            detail: e.to_string(),
+        })?;
+        self.import_session(&text).map_err(ShellError::Session)?;
+        let n = self.circuit.parts().len();
+        Ok(format!(
+            "loaded session from {path} — {n} part{}",
+            if n == 1 { "" } else { "s" }
+        ))
     }
 
     // ── commands ──────────────────────────────────────────────────────────
@@ -444,6 +535,8 @@ impl Shell {
             "  undo                        revert the last add/wire/probe",
             "  checkpoint <name>           save the session under a name",
             "  restore <name>              restore the session to a checkpoint",
+            "  save <path>                 write the whole session to a file",
+            "  load <path>                 replace the session from a file",
             "  help                        show this help",
         ]
         .join("\n")
@@ -577,6 +670,15 @@ pub enum ShellError {
     NothingToUndo,
     /// `restore` named a checkpoint that was never saved.
     UnknownCheckpoint(String),
+    /// A `save`/`load` file could not be written or read.
+    Io {
+        /// The path that failed.
+        path: String,
+        /// The underlying OS error.
+        detail: String,
+    },
+    /// A `load` file was not a valid session.
+    Session(SessionError),
     /// The simulation engine rejected or could not solve the circuit.
     Sim(SimError),
 }
@@ -614,6 +716,10 @@ impl fmt::Display for ShellError {
             ShellError::UnknownCheckpoint(n) => {
                 write!(f, "no checkpoint named {n:?} — `checkpoint {n}` saves one")
             }
+            ShellError::Io { path, detail } => {
+                write!(f, "could not access {path:?}: {detail}")
+            }
+            ShellError::Session(e) => write!(f, "{e}"),
             ShellError::Sim(e) => write!(f, "simulation failed: {e}"),
         }
     }
@@ -623,6 +729,7 @@ impl Error for ShellError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             ShellError::Sim(e) => Some(e),
+            ShellError::Session(e) => Some(e),
             _ => None,
         }
     }
@@ -836,6 +943,163 @@ mod tests {
         assert_eq!(sh.circuit().parts().len(), 1);
         sh.undo().unwrap(); // the manual snapshot
         assert_eq!(sh.circuit().parts().len(), 1, "manual snapshot was post-R1");
+    }
+
+    // ── session export / import (CP-UX-M4.1) ───────────────────────────────
+
+    /// Two shells are session-equivalent when their circuits serialize to the
+    /// same canonical project text (same parts/values/topology, by ee-fmt's
+    /// lossless round-trip), and they carry the same node names, probes, and
+    /// checkpoint names.
+    fn assert_equivalent(a: &Shell, b: &Shell) {
+        assert_eq!(
+            ee_fmt::project::save(a.circuit()),
+            ee_fmt::project::save(b.circuit()),
+            "circuits differ"
+        );
+        let mut an = a.node_names();
+        let mut bn = b.node_names();
+        an.sort();
+        bn.sort();
+        assert_eq!(an, bn, "node names differ");
+        assert_eq!(a.probes, b.probes, "probes differ");
+        let mut ac = a.checkpoint_names();
+        let mut bc = b.checkpoint_names();
+        ac.sort();
+        bc.sort();
+        assert_eq!(ac, bc, "checkpoint names differ");
+    }
+
+    /// A built session (parts, a wire, probes, a checkpoint) exports and imports
+    /// into a fresh shell as an equivalent session: same topology, probes, node
+    /// names, and checkpoints — and the restored checkpoint still works.
+    #[test]
+    fn session_round_trip_is_equivalent() {
+        let mut sh = Shell::new();
+        sh.execute("add V1 in gnd 5").unwrap();
+        sh.execute("add R1 in out 1k").unwrap();
+        sh.execute("add C1 out gnd 1u").unwrap();
+        sh.execute("add R2 out spare 2k").unwrap();
+        sh.execute("wire spare gnd").unwrap(); // merge a named node into ground
+        sh.execute("probe out").unwrap();
+        sh.execute("probe in").unwrap();
+        sh.execute("checkpoint stable").unwrap();
+        // Diverge after the checkpoint so the main body and the checkpoint differ.
+        sh.execute("add R3 out gnd 3k").unwrap();
+
+        let text = sh.export_session();
+        assert!(text.starts_with("!ee-session v1\n"), "{text}");
+        assert!(text.contains("!checkpoint stable"), "{text}");
+
+        let mut fresh = Shell::new();
+        fresh.import_session(&text).unwrap();
+        assert_equivalent(&sh, &fresh);
+
+        // The probed node names actually resolve in the restored shell: run op
+        // tabulates them (the divider midpoint `out` is present).
+        let table = fresh.execute("run op").unwrap();
+        assert!(
+            table.contains("v(out)"),
+            "restored probe resolves:\n{table}"
+        );
+
+        // The imported checkpoint restores to the pre-R3 state in the fresh shell.
+        fresh.execute("restore stable").unwrap();
+        assert!(
+            fresh.circuit().part_by_ref("R3").is_none(),
+            "R3 rolled back"
+        );
+        assert!(fresh.circuit().part_by_ref("R1").is_some());
+        // And it matches the original restored to the same checkpoint.
+        sh.execute("restore stable").unwrap();
+        assert_eq!(
+            ee_fmt::project::save(sh.circuit()),
+            ee_fmt::project::save(fresh.circuit()),
+        );
+    }
+
+    /// Exporting then importing is idempotent at the text level: a second export
+    /// of the imported session is byte-identical.
+    #[test]
+    fn session_export_is_stable_across_a_round_trip() {
+        let mut sh = Shell::new();
+        sh.execute("add V1 in gnd 5").unwrap();
+        sh.execute("add R1 in out 1k").unwrap();
+        sh.execute("probe out").unwrap();
+        sh.execute("checkpoint a").unwrap();
+
+        let once = sh.export_session();
+        let mut fresh = Shell::new();
+        fresh.import_session(&once).unwrap();
+        assert_eq!(once, fresh.export_session(), "export not idempotent");
+    }
+
+    /// The `save`/`load` commands round-trip through a real file and error
+    /// cleanly on a missing file and on malformed text.
+    #[test]
+    fn save_and_load_commands_round_trip_and_fail_friendly() {
+        let mut sh = Shell::new();
+        sh.execute("add V1 in gnd 5").unwrap();
+        sh.execute("add R1 in out 1k").unwrap();
+        sh.execute("add C1 out gnd 1u").unwrap();
+        sh.execute("probe out").unwrap();
+        sh.execute("checkpoint stable").unwrap();
+
+        let path = std::env::temp_dir().join(format!(
+            "ee-session-cmd-{}-{}.eesh",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = path.to_str().unwrap();
+
+        let saved = sh.execute(&format!("save {path}")).unwrap();
+        assert!(saved.contains("saved session"), "{saved}");
+
+        let mut fresh = Shell::new();
+        let loaded = fresh.execute(&format!("load {path}")).unwrap();
+        assert!(loaded.contains("loaded session"), "{loaded}");
+        assert_equivalent(&sh, &fresh);
+
+        // A missing file is a clean Io error, not a panic.
+        let missing = fresh
+            .execute("load /no/such/ee-session/file.eesh")
+            .unwrap_err();
+        assert!(matches!(missing, ShellError::Io { .. }), "{missing}");
+
+        // Malformed session text is a clean Session error.
+        let garbage = path.replace(".eesh", "-garbage.eesh");
+        std::fs::write(&garbage, "not a session at all\n").unwrap();
+        let bad = fresh.execute(&format!("load {garbage}")).unwrap_err();
+        assert!(matches!(bad, ShellError::Session(_)), "{bad}");
+
+        // A bad load left the shell untouched (still equivalent to the original).
+        assert_equivalent(&sh, &fresh);
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(&garbage);
+    }
+
+    /// `save`/`load` with the wrong argument count is a friendly usage error.
+    #[test]
+    fn save_load_usage_errors() {
+        let mut sh = Shell::new();
+        assert!(matches!(
+            sh.execute("save").unwrap_err(),
+            ShellError::Usage {
+                command: "save",
+                ..
+            }
+        ));
+        assert!(matches!(
+            sh.execute("load a b").unwrap_err(),
+            ShellError::Usage {
+                command: "load",
+                ..
+            }
+        ));
     }
 
     /// Durations parse in engineering notation (`5m` → 5 ms) and drive the sim.
