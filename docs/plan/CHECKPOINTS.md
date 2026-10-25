@@ -113,7 +113,7 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 - [x] **CP-AF-M3.3** (ai-fmt) Tutor mode + guided lessons/graded challenges + glossary. — *gate:* `challenge_passes_a_correct_divider_via_real_sim` (3.3 V PASS) / `..._fails_a_wrong_divider_and_names_the_miss`; `LessonRunner` steps part-by-part; glossary define/search; deterministic grader (model path optional).
 - [x] **CP-AF-M3.4** (ai-fmt) Fritzing-style export. — *gate:* well-formed `.fz` XML — one `<instance>` per part (reference/kind/value) + per-connector `<connects>` encoding resolved nets; structurally validated; deterministic.
 - [x] **CP-WEB.1** (web) `ee-web`: wasm-bindgen engine bindings + a minimal browser app (build/parse → run → render). — *gate:* `cargo build -p ee-web --target wasm32-unknown-unknown` + `wasm-pack build` (~196 KB) succeed; host-side pipeline test (netlist → op + transient → charges to rail); `index.html` runs a sim and shows a braille scope + op-point table; wasm deps gated to `wasm32` so host `build/clippy/test --workspace` stays green (468 tests).
-- [ ] **CP-SHIP.1** (platform) Polish & ship: close cheap follow-ups, expand examples/README, full CI-parity sweep, tag a release. — *gate:* release checklist, everything green.
+- [x] **CP-SHIP.1** (platform) Polish & ship: expand examples/README, refresh docs for M3 + the browser build, full CI-parity sweep, tag a release. — *gate:* ~500 tests + clippy `-D warnings` + fmt + `wasm32` (core **and** `ee-web`) + docs all green; README/docs hub updated; **v0.1.0** tagged (MIT OR Apache-2.0). Documented non-cheap follow-ups kept open: SPICE diode/transistor export, native waveform round-trip, real Xtensa/Cortex-M3 cores.
 
 ---
 
@@ -125,11 +125,11 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 | boards | 12 | 0 | 12 |
 | ui-shell | 14 | 0 | 14 |
 | ai-fmt | 11 | 0 | 11 |
-| platform | 5 | 0 | 6 |
+| platform | 6 | 0 | 6 |
 | web | 1 | 0 | 1 |
-| **Total** | **59** | **0** | **60** |
+| **Total** | **60** | **0** | **60** ✅ |
 
-_M0–M2 + M3 interop = **52/52 done** (the ✅ milestone). **M3 breadth + WASM (8 new checkpoints)** are the current workstream/webstream._
+_**60/60 — M0, M1, M2, and M3 all complete**, tagged **v0.1.0**. M3 added the dataflow patcher, HDL-lite, manifest boards + drop-in modules, behavioral/expression sources, a tutor with graded challenges, Fritzing export, and a **WebAssembly browser front end** (`ee-web`). The roadmap horizon beyond here is M4 (sparse-KLU/multithread, collaborative sessions, plugin API, QEMU full-SBC bridge)._
 
 *Update this table when flipping a checkpoint.*
 

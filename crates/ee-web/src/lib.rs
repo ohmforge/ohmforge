@@ -9,7 +9,7 @@
 //! The whole "netlist → run → result" pipeline lives in plain Rust
 //! ([`run`], [`Report`]) that compiles and is unit-tested on the **host**, so the
 //! pipeline is proven in CI without a browser. The only browser-specific code is
-//! the thin [`wasm`] wrapper, gated behind `cfg(target_arch = "wasm32")` and
+//! the thin `wasm` wrapper, gated behind `cfg(target_arch = "wasm32")` and
 //! compiled only for the `wasm32-unknown-unknown` target. On the host this crate
 //! therefore pulls in nothing but the three wasm-clean compute crates
 //! (`ee-core`, `ee-sim`, `ee-fmt`), which is what keeps the host workspace gates

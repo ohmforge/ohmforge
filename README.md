@@ -27,15 +27,19 @@ Real EE tools are powerful but heavy, GUI-bound, and often expensive. Tinkerers 
 
 ## Try it now
 
-What runs today (M0–M2): a real analog/mixed-signal simulator, AVR + RP2040 emulation with co-simulation, instruments, and an AI copilot — ~370 tests, all green.
+What runs today: a real analog/mixed-signal simulator, AVR + RP2040 emulation with co-simulation, instruments, an AI copilot, and a browser build — ~500 tests, all green.
 
 ```text
 cargo run -p ee -- demo     # build an RC low-pass, run a transient, see the braille scope
 cargo run -p ee -- bode     # AC sweep → Bode plot, −3 dB at 1 kHz
 cargo run -p ee -- amp      # common-emitter BJT amplifier, op-point with a color overlay
 cargo run -p ee -- cosim    # real AVR firmware drives D13 → a simulated LED lights (19.4 mA)
-cargo run -p ee -- tui      # interactive dockable panels (schematic · scope · shell)
+cargo run -p ee -- view     # a static snapshot of the composed TUI (overlay · scope · shell)
+cargo run -p ee -- tui      # the live interactive dockable panels
 cargo run -p ee             # the eesh REPL;  or:  cat examples/tutorial/rc_lowpass.eesh | cargo run -p ee
+
+# in the browser (WebAssembly):
+wasm-pack build crates/ee-web --target web --out-dir www/pkg   # then serve crates/ee-web/www/
 ```
 
 New here? Start with the **[getting-started tutorial](docs/tutorials/getting-started.md)**.
@@ -79,7 +83,7 @@ eesh> ask "why is the LED dimmer than I expected?"
 
 ## Status
 
-**M0 + M1 complete; M2 nearly complete** (see [`docs/plan/CHECKPOINTS.md`](docs/plan/CHECKPOINTS.md)). Working today: linear + nonlinear analog (diode/BJT/MOSFET, Newton–Raphson), AC/Bode, noise, Monte-Carlo, transient with adaptive timestep; an event-driven digital kernel; instruction-accurate **AVR (ATmega328P)** and **RP2040 (Cortex-M0+)** cores with peripherals and **lockstep co-simulation**; oscilloscope/DMM/funcgen/PSU + logic analyzer with UART/SPI/I²C decode; a dockable TUI; SPICE/VCD/CSV formats; and an AI copilot whose tools drive a real sim (grounded, with a verification loop). Whole workspace stays green — tests, `clippy -D warnings`, `wasm32` core, docs.
+**M0–M3 complete** (59/60 checkpoints; see [`docs/plan/CHECKPOINTS.md`](docs/plan/CHECKPOINTS.md)). Working today: linear + nonlinear analog (diode/BJT/MOSFET, Newton–Raphson), AC/Bode, noise, Monte-Carlo, transient with adaptive timestep, a sparse solver, expression/behavioral sources + temperature; an event-driven digital kernel + **HDL-lite** (truth-table/ROM/RAM/tri-state); instruction-accurate **AVR (328P/2560/ATtiny)** and **RP2040 (Cortex-M0+)** cores with peripherals and **lockstep co-simulation**, plus manifest boards and drop-in modules (7-seg/servo/WS2812); oscilloscope/DMM/funcgen/PSU, a logic analyzer with UART/SPI/I²C decode, a Bode/FFT panel, a breadboard view, and a **dataflow patcher**; a dockable TUI; SPICE/KiCad/VCD/CSV/Fritzing/BOM formats; an AI copilot (Ask/Design/Debug/Firmware + offline mode) whose tools drive a real sim with a verification loop, and a tutor with graded challenges; and a **WebAssembly browser build**. Whole workspace stays green — ~500 tests, `clippy -D warnings`, `wasm32` core, docs.
 
 ## License
 
