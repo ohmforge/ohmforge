@@ -212,12 +212,102 @@ fn bench_sparse_scaling(c: &mut Criterion) {
     group.finish();
 }
 
+/// The `CP-SIM-M4.2` ordering gate: the fill-reducing ordered LU vs today's
+/// natural-order sparse path on the "arrow" net (a shared hub numbered first —
+/// exactly the fill pathology a global rail creates). Natural order fills the hub's
+/// whole leaf block (`O(N²)`); the ordered path eliminates the hub last and stays
+/// near-linear, so the gap widens with `N`. Natural is capped at a modest size (its
+/// fill is quadratic in both time and memory); the ordered path runs out to ~10k.
+fn bench_ordered_vs_natural(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ordered_vs_natural");
+    for leaves in [500usize, 1000, 2000] {
+        group.bench_with_input(BenchmarkId::new("natural", leaves), &leaves, |b, &n| {
+            b.iter(|| bench_support::arrow_natural_solve(black_box(n)).unwrap())
+        });
+        group.bench_with_input(BenchmarkId::new("ordered", leaves), &leaves, |b, &n| {
+            b.iter(|| bench_support::arrow_ordered_solve(black_box(n)).unwrap())
+        });
+    }
+    // The ordered path alone out to ~10k nodes, where the natural-order fill is
+    // already impractical — its own near-linear curve, end to end.
+    for leaves in [4000usize, 10000] {
+        group.bench_with_input(BenchmarkId::new("ordered", leaves), &leaves, |b, &n| {
+            b.iter(|| bench_support::arrow_ordered_solve(black_box(n)).unwrap())
+        });
+    }
+    group.finish();
+}
+
+/// The `CP-SIM-M4.2` reuse gate: a repeated solve of the *same structure* with new
+/// numbers (a transient step, a sweep point). `fresh_each_step` is the naive path
+/// — a full analyze + factor + solve every time; `reuse_symbolic` keeps the
+/// symbolic factorization (ordering + pivot sequence + fill) from the first solve
+/// and runs only the numeric `refactor` + solve thereafter — the KLU
+/// `klu_refactor` win, which skips re-running the minimum-degree ordering.
+fn bench_refactor_reuse(c: &mut Criterion) {
+    use bench_support::{SparseMatrix, Symbolic};
+
+    let mut group = c.benchmark_group("refactor_reuse");
+    for leaves in [2000usize, 10000] {
+        let (mat, rhs): (SparseMatrix, Vec<f64>) = bench_support::arrow_matrix(leaves);
+
+        // No reuse: re-analyze + factor + solve every step (what a naive caller does).
+        group.bench_with_input(
+            BenchmarkId::new("fresh_each_step", leaves),
+            &leaves,
+            |b, _| {
+                b.iter(|| {
+                    let sym = Symbolic::analyze(black_box(&mat));
+                    let num = sym.factor(black_box(&mat)).unwrap();
+                    black_box(num.solve(black_box(&rhs)))
+                })
+            },
+        );
+
+        // Reuse: analyze once (setup), then only the numeric refactor + solve run.
+        let sym = Symbolic::analyze(&mat);
+        let mut num = sym.factor(&mat).unwrap();
+        group.bench_with_input(
+            BenchmarkId::new("reuse_symbolic", leaves),
+            &leaves,
+            |b, _| {
+                b.iter(|| {
+                    num.refactor(black_box(&sym), black_box(&mat)).unwrap();
+                    black_box(num.solve(black_box(&rhs)))
+                })
+            },
+        );
+    }
+    group.finish();
+}
+
+/// The `CP-SIM-M4.3` speedup gate: a many-run Monte-Carlo, sequential vs the
+/// public (threaded under `--features parallel`) path. Each run is a nonlinear
+/// Newton solve, so with the feature on `parallel` pulls markedly ahead of
+/// `sequential` as the cores engage; without it the two coincide (same code).
+/// Both produce identical samples — the determinism gate lives in the unit tests.
+fn bench_monte_carlo(c: &mut Criterion) {
+    let mut group = c.benchmark_group("monte_carlo");
+    for runs in [2000usize, 8000] {
+        group.bench_with_input(BenchmarkId::new("sequential", runs), &runs, |b, &n| {
+            b.iter(|| bench_support::monte_carlo_sequential(black_box(n)))
+        });
+        group.bench_with_input(BenchmarkId::new("parallel", runs), &runs, |b, &n| {
+            b.iter(|| bench_support::monte_carlo_parallel(black_box(n)))
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_op_point,
     bench_transient,
     bench_op_point_scaling,
     bench_sparse_vs_dense,
-    bench_sparse_scaling
+    bench_sparse_scaling,
+    bench_ordered_vs_natural,
+    bench_refactor_reuse,
+    bench_monte_carlo
 );
 criterion_main!(benches);

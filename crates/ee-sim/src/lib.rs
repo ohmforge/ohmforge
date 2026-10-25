@@ -150,36 +150,65 @@ impl fmt::Display for SimError {
 
 impl Error for SimError {}
 
-/// The simulation engine. Stateless; hold one and call [`Engine::run`].
-#[derive(Debug, Default, Clone, Copy)]
-pub struct Engine;
+/// The simulation engine. Holds an optional [`DeviceRegistry`] of plugin device
+/// models (`CP-SIM-M4.1`); [`Engine::new`] starts empty (built-in devices only)
+/// and [`Engine::with_device`] / [`Engine::register_device`] add external models.
+/// Cheap to clone — registered factories are shared behind an `Arc`.
+#[derive(Debug, Default, Clone)]
+pub struct Engine {
+    registry: DeviceRegistry,
+}
 
 impl Engine {
+    /// A new engine with no plugin devices registered — built-ins only.
     pub fn new() -> Self {
-        Engine
+        Self::default()
+    }
+
+    /// Register an external [`NonlinearDevice`] model, matched to parts carrying
+    /// [`PartKind::Other`] with the given `name`, and return the engine
+    /// (builder-style). `Engine::run` then stamps that device in every analysis.
+    pub fn with_device<F>(mut self, name: impl Into<String>, factory: F) -> Self
+    where
+        F: Fn(&Part) -> Result<Box<dyn NonlinearDevice>, SimError> + Send + Sync + 'static,
+    {
+        self.registry.register(name, factory);
+        self
+    }
+
+    /// Register an external [`NonlinearDevice`] model in place. The `name` matches
+    /// parts whose kind is [`PartKind::Other`] carrying that string.
+    pub fn register_device<F>(&mut self, name: impl Into<String>, factory: F)
+    where
+        F: Fn(&Part) -> Result<Box<dyn NonlinearDevice>, SimError> + Send + Sync + 'static,
+    {
+        self.registry.register(name, factory);
     }
 
     /// Run an [`Analysis`] against a circuit, returning one [`Signal`] per node.
     pub fn run(&self, circuit: &Circuit, analysis: &Analysis) -> Result<Vec<Signal>, SimError> {
-        validate(circuit)?;
+        let reg = &self.registry;
+        validate(circuit, reg)?;
         let layout = Layout::build(circuit);
         match analysis {
             Analysis::OperatingPoint => {
-                let x = solve_dc(circuit, &layout)?;
+                let x = solve_dc(circuit, &layout, reg)?;
                 Ok(op_signals(&layout, &x))
             }
-            Analysis::Transient { duration, step } => transient(circuit, &layout, *duration, *step),
+            Analysis::Transient { duration, step } => {
+                transient(circuit, &layout, *duration, *step, reg)
+            }
             Analysis::Ac {
                 f_start,
                 f_stop,
                 points_per_decade,
-            } => ac(circuit, &layout, *f_start, *f_stop, *points_per_decade),
+            } => ac(circuit, &layout, *f_start, *f_stop, *points_per_decade, reg),
             Analysis::DcSweep {
                 source,
                 start,
                 stop,
                 step,
-            } => dc_sweep(circuit, source, *start, *stop, *step),
+            } => dc_sweep(circuit, source, *start, *stop, *step, reg),
             Analysis::Parametric {
                 source,
                 values,
@@ -197,6 +226,7 @@ impl Engine {
                 *f_start,
                 *f_stop,
                 *points_per_decade,
+                reg,
             ),
             Analysis::MonteCarlo {
                 seed,
@@ -209,8 +239,10 @@ impl Engine {
     }
 }
 
-/// Reject devices not modeled at M0 so a part never gets silently dropped.
-fn validate(circuit: &Circuit) -> Result<(), SimError> {
+/// Reject devices not modeled so a part never gets silently dropped. A
+/// [`PartKind::Other`] part is accepted only when `registry` carries a plugin
+/// factory for its name (`CP-SIM-M4.1`); otherwise it is still unsupported.
+fn validate(circuit: &Circuit, registry: &DeviceRegistry) -> Result<(), SimError> {
     for part in circuit.parts() {
         match &part.kind {
             PartKind::Resistor
@@ -225,6 +257,7 @@ fn validate(circuit: &Circuit) -> Result<(), SimError> {
             | PartKind::Vccs(..)
             | PartKind::Ccvs(..)
             | PartKind::Cccs(..) => {}
+            PartKind::Other(name) if registry.contains(name) => {}
             PartKind::Other(_) => {
                 return Err(SimError::Unsupported("nonlinear/unknown device (M1)"))
             }
@@ -695,9 +728,16 @@ const NR_I_TOL: f64 = 1e-12;
 /// running guess and asks it to [`linearize`](NonlinearDevice::linearize): report
 /// the current flowing into every terminal and the Jacobian `∂I_i/∂V_j` of those
 /// currents, bundled with the RHS equivalent-current sources as a [`Companion`]
-/// that [`stamp_companion`] writes into the MNA system. A diode is the
+/// that the engine writes into the MNA system. A diode is the
 /// two-terminal case; a BJT and a MOSFET stamp a 3×3 block. (`CP-SIM-M1.2`.)
-trait NonlinearDevice {
+///
+/// This trait is the **public plugin contract** (`CP-SIM-M4.1`): an external
+/// crate can implement it for its own device and register a factory with
+/// [`Engine::with_device`] / [`DeviceRegistry`], after which [`Engine::run`]
+/// stamps that device in every analysis — operating point, transient, DC/AC —
+/// exactly like a built-in. The built-in `Diode`, `Bjt`, and `Mosfet` are
+/// ordinary implementors of it.
+pub trait NonlinearDevice {
     /// The device's terminal nets, in the order [`linearize`](Self::linearize)
     /// reads voltages and reports currents. The internal controlling/branch
     /// voltages are formed from these inside the model.
@@ -721,20 +761,77 @@ trait NonlinearDevice {
 
 /// A nonlinear device's linearized multiport companion — the output of
 /// [`NonlinearDevice::linearize`]. Every vector is in the device's terminal order.
-struct Companion {
+/// Public so external device models (`CP-SIM-M4.1`) can construct one; the fields
+/// are the same multiport Norton equivalent the built-in devices return.
+pub struct Companion {
     /// Terminal currents `I_i` (the current flowing *from node `i` into the
     /// device*) at the linearization point — the solver's current-convergence
     /// probe.
-    i: Vec<f64>,
+    pub i: Vec<f64>,
     /// RHS equivalent-current sources: `i_eq[a]` is injected into node `a`'s row,
     /// equal to `Σ_j g[a][j]·V*_j − I_a` at the (possibly limited) linearization
     /// point. The model precomputes it so junction limiting stays internal and
     /// the stamped companion is self-consistent — the multiport generalization of
     /// the two-terminal Norton source `I_eq = I(v) − g·v`.
-    i_eq: Vec<f64>,
+    pub i_eq: Vec<f64>,
     /// Jacobian `g[i][j] = ∂I_i/∂V_j`, a dense `n × n` block in terminal order
     /// (possibly asymmetric — a transconductance is not reciprocal).
-    g: Vec<Vec<f64>>,
+    pub g: Vec<Vec<f64>>,
+}
+
+/// A factory that builds a plugin [`NonlinearDevice`] from the [`Part`] that
+/// carries it — the value stored in a [`DeviceRegistry`]. Shared behind an `Arc`
+/// so an [`Engine`] stays cheap to clone and `Send + Sync` (required for the
+/// native `parallel` feature). The factory reads the part's terminals, value, and
+/// any model data, and returns the boxed device (or a [`SimError`] if the part is
+/// malformed — e.g. wrong terminal count).
+pub type DeviceFactory =
+    std::sync::Arc<dyn Fn(&Part) -> Result<Box<dyn NonlinearDevice>, SimError> + Send + Sync>;
+
+/// A registry of plugin nonlinear-device models, keyed by the name a part carries
+/// in [`PartKind::Other`] (`CP-SIM-M4.1`). The engine consults it when it meets an
+/// `Other(name)` part: a registered factory builds the device, which then stamps
+/// in Newton–Raphson / operating-point / transient / AC exactly like a built-in;
+/// an unregistered name is still rejected as [`SimError::Unsupported`]. Cloning is
+/// cheap — the factories are shared behind `Arc`.
+#[derive(Default, Clone)]
+pub struct DeviceRegistry {
+    factories: BTreeMap<String, DeviceFactory>,
+}
+
+impl DeviceRegistry {
+    /// An empty registry — built-in devices only.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register `factory` under `name`; a part of kind [`PartKind::Other`] carrying
+    /// that name is then built and stamped by it. Re-registering a name replaces it.
+    pub fn register<F>(&mut self, name: impl Into<String>, factory: F)
+    where
+        F: Fn(&Part) -> Result<Box<dyn NonlinearDevice>, SimError> + Send + Sync + 'static,
+    {
+        self.factories
+            .insert(name.into(), std::sync::Arc::new(factory));
+    }
+
+    /// The factory registered for `name`, if any.
+    fn get(&self, name: &str) -> Option<&DeviceFactory> {
+        self.factories.get(name)
+    }
+
+    /// Whether a factory is registered for `name`.
+    fn contains(&self, name: &str) -> bool {
+        self.factories.contains_key(name)
+    }
+}
+
+impl fmt::Debug for DeviceRegistry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeviceRegistry")
+            .field("devices", &self.factories.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 /// Stamp an N-terminal device's linearized [`Companion`] into the system: the
@@ -1006,8 +1103,15 @@ fn diode_model(part: &Part) -> DiodeModel {
 }
 
 /// Collect every nonlinear device in the circuit as a boxed [`NonlinearDevice`].
-/// This is the one place a new device kind is wired into the solver.
-fn collect_nonlinear(circuit: &Circuit) -> Result<Vec<Box<dyn NonlinearDevice>>, SimError> {
+/// This is the one place a new device kind is wired into the solver: the built-in
+/// diode / BJT / MOSFET, plus any [`PartKind::Other`] part whose name has a plugin
+/// factory in `registry` (`CP-SIM-M4.1`). An `Other` part with no registered
+/// factory is skipped here — [`validate`] has already rejected it, so this stays a
+/// pure collector.
+fn collect_nonlinear(
+    circuit: &Circuit,
+    registry: &DeviceRegistry,
+) -> Result<Vec<Box<dyn NonlinearDevice>>, SimError> {
     let mut devices: Vec<Box<dyn NonlinearDevice>> = Vec::new();
     for part in circuit.parts() {
         match &part.kind {
@@ -1031,6 +1135,11 @@ fn collect_nonlinear(circuit: &Circuit) -> Result<Vec<Box<dyn NonlinearDevice>>,
                     polarity: *polarity,
                     model: *model,
                 }));
+            }
+            PartKind::Other(name) => {
+                if let Some(factory) = registry.get(name) {
+                    devices.push(factory(part)?);
+                }
             }
             _ => {}
         }
@@ -1202,12 +1311,16 @@ fn solve_aided(
 /// Solve the DC operating point: resistors + sources, capacitors open, inductors
 /// shorted, and any nonlinear device driven to steady state by Newton–Raphson
 /// with the shared convergence-aid ladder ([`solve_aided`]).
-fn solve_dc(circuit: &Circuit, layout: &Layout) -> Result<Vec<f64>, SimError> {
+fn solve_dc(
+    circuit: &Circuit,
+    layout: &Layout,
+    registry: &DeviceRegistry,
+) -> Result<Vec<f64>, SimError> {
     let size = layout.n_nodes()
         + layout.vsources.len()
         + layout.n_controlled_branches()
         + layout.inductors.len();
-    let devices = collect_nonlinear(circuit)?;
+    let devices = collect_nonlinear(circuit, registry)?;
     // The linear stamp at source scale `alpha` (1.0 = the real circuit).
     let stamp_at = |sys: &mut System, alpha: f64| -> Result<(), SimError> {
         stamp_resistors(sys, circuit, layout)?;
@@ -1349,7 +1462,11 @@ struct TransientModel<'a> {
 }
 
 impl<'a> TransientModel<'a> {
-    fn build(circuit: &'a Circuit, layout: &'a Layout) -> Result<Self, SimError> {
+    fn build(
+        circuit: &'a Circuit,
+        layout: &'a Layout,
+        registry: &DeviceRegistry,
+    ) -> Result<Self, SimError> {
         let caps: Vec<(NetId, NetId, f64)> = circuit
             .parts()
             .iter()
@@ -1382,7 +1499,7 @@ impl<'a> TransientModel<'a> {
             })
             .collect::<Result<_, _>>()?;
 
-        let devices = collect_nonlinear(circuit)?;
+        let devices = collect_nonlinear(circuit, registry)?;
         Ok(Self {
             circuit,
             layout,
@@ -1530,11 +1647,12 @@ fn transient(
     layout: &Layout,
     duration: f64,
     step: Option<f64>,
+    registry: &DeviceRegistry,
 ) -> Result<Vec<Signal>, SimError> {
     if duration <= 0.0 {
         return Err(SimError::BadValue("transient duration/step".into()));
     }
-    let model = TransientModel::build(circuit, layout)?;
+    let model = TransientModel::build(circuit, layout, registry)?;
     let (x0, cap_v0) = model.initial()?;
     match step {
         Some(h) if h > 0.0 => fixed_transient(&model, duration, h, x0, cap_v0),
@@ -1699,6 +1817,7 @@ fn ac(
     f_start: f64,
     f_stop: f64,
     points_per_decade: u32,
+    registry: &DeviceRegistry,
 ) -> Result<Vec<Signal>, SimError> {
     if !f_start.is_finite()
         || !f_stop.is_finite()
@@ -1710,7 +1829,7 @@ fn ac(
     }
 
     // Bias point for linearizing nonlinear devices (and verifying the topology).
-    let x_dc = solve_dc(circuit, layout)?;
+    let x_dc = solve_dc(circuit, layout, registry)?;
 
     let n = layout.n_nodes();
     let m = layout.vsources.len();
@@ -1759,7 +1878,7 @@ fn ac(
     // admittance block). A diode reduces to one conductance between its nodes; a
     // BJT / MOSFET contributes its full multiport transadmittance matrix. Flatten
     // every entry to `(row, col, g)` so each stamps as a raw complex matrix entry.
-    let devices = collect_nonlinear(circuit)?;
+    let devices = collect_nonlinear(circuit, registry)?;
     let mut device_g: Vec<(Option<usize>, Option<usize>, f64)> = Vec::new();
     for dev in &devices {
         let nodes: Vec<Option<usize>> = dev
@@ -1892,6 +2011,7 @@ fn noise(
     f_start: f64,
     f_stop: f64,
     points_per_decade: u32,
+    registry: &DeviceRegistry,
 ) -> Result<Vec<Signal>, SimError> {
     if !f_start.is_finite()
         || !f_stop.is_finite()
@@ -1903,7 +2023,7 @@ fn noise(
     }
 
     // DC bias, to linearize any nonlinear device (and verify the topology).
-    let x_dc = solve_dc(circuit, layout)?;
+    let x_dc = solve_dc(circuit, layout, registry)?;
 
     let n = layout.n_nodes();
     let m = layout.vsources.len();
@@ -1948,7 +2068,7 @@ fn noise(
     }
 
     // Nonlinear devices → small-signal Jacobian at the DC bias (purely real), as AC.
-    let devices = collect_nonlinear(circuit)?;
+    let devices = collect_nonlinear(circuit, registry)?;
     let mut device_g: Vec<(Option<usize>, Option<usize>, f64)> = Vec::new();
     for dev in &devices {
         let nodes: Vec<Option<usize>> = dev
@@ -2045,14 +2165,28 @@ struct SplitMix64 {
     state: u64,
 }
 
+/// SplitMix64's golden-ratio increment. Because each draw adds exactly this to the
+/// state, the state after `k` draws from `new(seed)` is `seed + k·γ` — which is
+/// what [`SplitMix64::at_offset`] exploits to seek into the stream.
+const SPLITMIX_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
+
 impl SplitMix64 {
-    fn new(seed: u64) -> Self {
-        Self { state: seed }
+    /// A generator positioned so its first draw is draw number `offset` of the
+    /// `seed` stream (`at_offset(seed, 0)` is the plain seeding). Since the state
+    /// advances by a fixed `γ` per draw, this is an exact `O(1)` seek:
+    /// `at_offset(seed, k)` reproduces the stream from draw `k` onward, bit-for-bit.
+    /// It lets each Monte-Carlo run own a fixed slice of the single seeded stream,
+    /// so a run's perturbations depend only on its index — never on how runs are
+    /// scheduled across threads.
+    fn at_offset(seed: u64, offset: u64) -> Self {
+        Self {
+            state: seed.wrapping_add(offset.wrapping_mul(SPLITMIX_GAMMA)),
+        }
     }
 
     /// The next 64 raw bits.
     fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        self.state = self.state.wrapping_add(SPLITMIX_GAMMA);
         let mut z = self.state;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
@@ -2076,14 +2210,18 @@ impl Engine {
     /// circuit whose toleranced parts are perturbed within their ±band, and record
     /// the `output` node's value at `sample` from every run.
     ///
-    /// **Determinism.** One [`SplitMix64`] is seeded from `seed` and advanced once
-    /// per toleranced part, in part-index order, across the whole run sequence. The
-    /// set of toleranced parts, their order, and the draw count are all fixed by the
-    /// circuit, so the same seed replays the identical stream of perturbations and
-    /// therefore the identical samples — bit for bit. Each run perturbs from the
-    /// original nominal values (it clones the untouched circuit), so draws never
-    /// compound. A part with tolerance `t` and nominal value `v` becomes
-    /// `v·(1 + t·u)`, `u` uniform in `[-1, 1)`.
+    /// **Determinism.** The single [`SplitMix64`] stream seeded from `seed` is
+    /// partitioned by run: run `k` owns draws `[k·P, (k+1)·P)` (`P` = the number of
+    /// toleranced parts), reached in `O(1)` by [`SplitMix64::at_offset`]. The set of
+    /// toleranced parts, their order, and the per-run draw count are all fixed by
+    /// the circuit, so the same seed replays the identical perturbations and
+    /// therefore the identical samples — bit for bit, and *independently of how the
+    /// runs are scheduled*. Each run perturbs from the original nominal values (it
+    /// clones the untouched circuit), so draws never compound. A part with
+    /// tolerance `t` and nominal value `v` becomes `v·(1 + t·u)`, `u` uniform in
+    /// `[-1, 1)`. This per-run independence is exactly what lets the native
+    /// `parallel` feature fan the runs across threads with no change in output
+    /// (`CP-SIM-M4.3`).
     fn monte_carlo(
         &self,
         circuit: &Circuit,
@@ -2092,6 +2230,43 @@ impl Engine {
         output: NetId,
         sample: usize,
         inner: &Analysis,
+    ) -> Result<Vec<Signal>, SimError> {
+        // The public entry allows the parallel executor when the feature is on;
+        // the forced-sequential twin (tests) shares every bit of the per-run work.
+        self.monte_carlo_impl(circuit, seed, runs, output, sample, inner, true)
+    }
+
+    /// Always-sequential Monte-Carlo, for the single-vs-multi determinism gate — it
+    /// runs the identical per-run computation through the plain sequential loop
+    /// regardless of the `parallel` feature, so a test can compare it against the
+    /// (possibly threaded) public [`monte_carlo`](Self::monte_carlo).
+    #[cfg(test)]
+    fn monte_carlo_sequential(
+        &self,
+        circuit: &Circuit,
+        seed: u64,
+        runs: usize,
+        output: NetId,
+        sample: usize,
+        inner: &Analysis,
+    ) -> Result<Vec<Signal>, SimError> {
+        self.monte_carlo_impl(circuit, seed, runs, output, sample, inner, false)
+    }
+
+    /// The shared Monte-Carlo core. `parallel_ok` selects the executor: the native
+    /// `parallel` feature fans the independent runs across OS threads, else (or on
+    /// wasm, or when `parallel_ok` is false) it is the plain sequential loop. Both
+    /// assemble the samples in run-index order, so the output is identical.
+    #[allow(clippy::too_many_arguments)] // mirrors Analysis::MonteCarlo's fields + an executor flag
+    fn monte_carlo_impl(
+        &self,
+        circuit: &Circuit,
+        seed: u64,
+        runs: usize,
+        output: NetId,
+        sample: usize,
+        inner: &Analysis,
+        parallel_ok: bool,
     ) -> Result<Vec<Signal>, SimError> {
         if runs == 0 {
             return Err(SimError::BadValue("monte-carlo run count".into()));
@@ -2108,12 +2283,13 @@ impl Engine {
                 Some((i, tol, value.magnitude, value.unit))
             })
             .collect();
-
         let out_name = format!("v(n{})", circuit.resolve(output).0);
-        let mut rng = SplitMix64::new(seed);
-        let mut samples: Vec<f64> = Vec::with_capacity(runs);
-        let mut unit = Unit::Volt;
-        for _ in 0..runs {
+        let per_run = toleranced.len() as u64;
+
+        // One run: seed a generator at this run's fixed slice of the stream, perturb
+        // a fresh clone, solve the inner analysis, read back the sample + its unit.
+        let run_one = |k: usize| -> Result<(f64, Unit), SimError> {
+            let mut rng = SplitMix64::at_offset(seed, k as u64 * per_run);
             let mut work = circuit.clone();
             for &(pi, tol, nominal, part_unit) in &toleranced {
                 let factor = 1.0 + tol * rng.next_signed();
@@ -2125,14 +2301,21 @@ impl Engine {
                 .iter()
                 .find(|s| s.name == out_name)
                 .ok_or_else(|| SimError::UnknownPart(out_name.clone()))?;
-            unit = sig.unit;
             let value = match &sig.y {
                 SignalData::Real(v) => v.get(sample).copied(),
                 SignalData::Complex(v) => v.get(sample).map(|z| z.magnitude()),
             }
             .ok_or_else(|| SimError::BadValue("monte-carlo sample index".into()))?;
-            samples.push(value);
-        }
+            Ok((value, sig.unit))
+        };
+
+        let results = if parallel_ok {
+            run_indexed(runs, &run_one)?
+        } else {
+            (0..runs).map(&run_one).collect::<Result<Vec<_>, _>>()?
+        };
+        let unit = results.first().map(|&(_, u)| u).unwrap_or(Unit::Volt);
+        let samples: Vec<f64> = results.into_iter().map(|(v, _)| v).collect();
 
         Ok(vec![Signal::time(
             format!("mc(n{})", circuit.resolve(output).0),
@@ -2141,6 +2324,75 @@ impl Engine {
             samples,
         )])
     }
+}
+
+// ---------------------------------------------------------------------------
+// Parallel execution of independent analyses (CP-SIM-M4.3)
+// ---------------------------------------------------------------------------
+
+/// Run `n` independent, index-addressed jobs and collect their results **in index
+/// order** — the executor behind parallel Monte-Carlo and sweeps (`CP-SIM-M4.3`).
+///
+/// With the native `parallel` feature on (and off wasm) the index range is split
+/// into contiguous per-thread chunks run on OS threads via [`std::thread::scope`]
+/// (no dependencies); otherwise it is a plain sequential loop. Either way the
+/// output is assembled strictly by job index and each job is a pure function of
+/// its index, so the result is **identical regardless of thread scheduling** — the
+/// determinism the gate requires. The first error in index order is returned.
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+fn run_indexed<T, F>(n: usize, f: &F) -> Result<Vec<T>, SimError>
+where
+    T: Send,
+    F: Fn(usize) -> Result<T, SimError> + Sync,
+{
+    let threads = parallel_threads(n);
+    if threads <= 1 {
+        return (0..n).map(f).collect();
+    }
+    let chunk = n.div_ceil(threads);
+    // Each thread owns a contiguous index range and returns its results in order.
+    let per_thread: Vec<Result<Vec<T>, SimError>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let start = (t * chunk).min(n);
+                let end = ((t + 1) * chunk).min(n);
+                scope.spawn(move || (start..end).map(f).collect::<Result<Vec<T>, SimError>>())
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("a parallel analysis thread panicked"))
+            .collect()
+    });
+    // Concatenate the chunks in thread order (= ascending index order).
+    let mut out = Vec::with_capacity(n);
+    for chunk in per_thread {
+        out.extend(chunk?);
+    }
+    Ok(out)
+}
+
+/// Sequential executor — the default build, and any wasm / feature-off build. Same
+/// signature and semantics as the threaded [`run_indexed`], so callers are
+/// identical; the bounds match it too (harmless here) to keep one call site.
+#[cfg(not(all(feature = "parallel", not(target_arch = "wasm32"))))]
+fn run_indexed<T, F>(n: usize, f: &F) -> Result<Vec<T>, SimError>
+where
+    T: Send,
+    F: Fn(usize) -> Result<T, SimError> + Sync,
+{
+    (0..n).map(f).collect()
+}
+
+/// The number of worker threads to use for `n` independent jobs: the hardware
+/// parallelism, capped at `n` (never more threads than jobs) and at least 1.
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+fn parallel_threads(n: usize) -> usize {
+    std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .min(n)
+        .max(1)
 }
 
 /// Operating-point node voltages as single-sample signals.
@@ -2206,18 +2458,32 @@ fn dc_sweep(
     start: f64,
     stop: f64,
     step: f64,
+    registry: &DeviceRegistry,
 ) -> Result<Vec<Signal>, SimError> {
     let unit = sweep_source_unit(circuit, source)?;
     let values = sweep_values(start, stop, step)?;
 
-    let mut work = circuit.clone();
-    work.set_waveform(source, Waveform::Dc); // sweep the DC level, ignore any waveform
-    let layout = Layout::build(&work);
+    // The topology is fixed across the sweep, so build the base circuit (any
+    // waveform dropped) and its MNA layout once; each point only retargets the
+    // swept source's level. The points are independent operating-point solves, so
+    // the native `parallel` feature fans them across threads (`CP-SIM-M4.3`); the
+    // results are assembled in sweep order either way.
+    let base = {
+        let mut w = circuit.clone();
+        w.set_waveform(source, Waveform::Dc); // sweep the DC level, ignore any waveform
+        w
+    };
+    let layout = Layout::build(&base);
     let n = layout.n_nodes();
+    let solve_point = |k: usize| -> Result<Vec<f64>, SimError> {
+        let mut work = base.clone();
+        work.set_value(source, Value::new(values[k], unit));
+        solve_dc(&work, &layout, registry)
+    };
+    let points = run_indexed(values.len(), &solve_point)?;
+
     let mut traces: Vec<Vec<f64>> = vec![Vec::with_capacity(values.len()); n];
-    for &val in &values {
-        work.set_value(source, Value::new(val, unit));
-        let x = solve_dc(&work, &layout)?;
+    for x in &points {
         for (d, trace) in traces.iter_mut().enumerate() {
             trace.push(x[d]);
         }
@@ -2257,17 +2523,29 @@ impl Engine {
         // Validate the target up front so an empty `values` list still rejects a typo.
         let unit = sweep_source_unit(circuit, source)?;
 
-        let mut work = circuit.clone();
-        work.set_waveform(source, Waveform::Dc);
-        let mut out = Vec::new();
-        for &val in values {
+        let base = {
+            let mut w = circuit.clone();
+            w.set_waveform(source, Waveform::Dc);
+            w
+        };
+        // Each value's inner run is independent, so the native `parallel` feature
+        // fans them across threads (`CP-SIM-M4.3`); the tagged signal families are
+        // concatenated in value order, matching the sequential result exactly.
+        let one = |k: usize| -> Result<Vec<Signal>, SimError> {
+            let val = values[k];
+            let mut work = base.clone();
             work.set_value(source, Value::new(val, unit));
-            for mut sig in self.run(&work, inner)? {
-                sig.name = format!("{} @ {source}={val}", sig.name);
-                out.push(sig);
-            }
-        }
-        Ok(out)
+            let sigs = self.run(&work, inner)?;
+            Ok(sigs
+                .into_iter()
+                .map(|mut sig| {
+                    sig.name = format!("{} @ {source}={val}", sig.name);
+                    sig
+                })
+                .collect())
+        };
+        let groups = run_indexed(values.len(), &one)?;
+        Ok(groups.into_iter().flatten().collect())
     }
 }
 
@@ -2310,6 +2588,96 @@ pub mod bench_support {
     pub fn dc_solve_sparse(circuit: &Circuit) -> Option<Vec<f64>> {
         linear_dc_system(circuit, System::sparse).solve()
     }
+
+    // --- CP-SIM-M4.2: fill-reducing ordered reusable sparse LU -------------
+
+    pub use crate::mna::{Numeric, SparseMatrix, Symbolic};
+
+    /// Build the `CP-SIM-M4.2` "arrow" benchmark matrix: a hub (node 0) joined by a
+    /// conductance to each of `leaves` leaf nodes, each leaf also tied to ground,
+    /// with a probe current injected at the hub — returned as a [`SparseMatrix`]
+    /// plus its right-hand side. The hub is numbered first, so natural-order
+    /// elimination fills the whole leaf block (`O(leaves²)`) while the fill-reducing
+    /// order eliminates it last (`O(leaves)`): the scaling the bench measures.
+    pub fn arrow_matrix(leaves: usize) -> (SparseMatrix, Vec<f64>) {
+        let size = leaves + 1;
+        let g = 1e-3;
+        let mut m = SparseMatrix::new(size);
+        for leaf in 1..=leaves {
+            m.stamp_conductance(Some(0), Some(leaf), g);
+            m.stamp_conductance(Some(leaf), None, g);
+        }
+        let mut rhs = vec![0.0; size];
+        rhs[0] = 1e-3;
+        (m, rhs)
+    }
+
+    /// Solve the arrow via **today's natural-order sparse path** (`System::sparse`)
+    /// — the baseline the ordered solver is raced against.
+    pub fn arrow_natural_solve(leaves: usize) -> Option<Vec<f64>> {
+        let size = leaves + 1;
+        let g = 1e-3;
+        let mut s = System::sparse(size);
+        for leaf in 1..=leaves {
+            s.stamp_conductance(Some(0), Some(leaf), g);
+            s.stamp_conductance(Some(leaf), None, g);
+        }
+        s.stamp_current(Some(0), None, 1e-3);
+        s.solve()
+    }
+
+    /// Solve the arrow via the fill-reducing ordered LU: analyze + factor + solve.
+    pub fn arrow_ordered_solve(leaves: usize) -> Option<Vec<f64>> {
+        let (m, rhs) = arrow_matrix(leaves);
+        let sym = Symbolic::analyze(&m);
+        Some(sym.factor(&m)?.solve(&rhs))
+    }
+
+    // --- CP-SIM-M4.3: parallel Monte-Carlo ---------------------------------
+
+    /// The Monte-Carlo speedup fixture: a 5 V source into a ±5 %-toleranced 1 kΩ
+    /// resistor feeding a diode to ground. Each run is a nonlinear Newton solve, so
+    /// the per-run work is real (not swamped by the circuit clone) and the thread
+    /// fan-out shows a clear speedup.
+    fn mc_fixture() -> (Circuit, NetId) {
+        let mut c = Circuit::new("mc_bench");
+        let vin = c.new_net();
+        let mid = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            Value::parse("5", Unit::Volt).ok(),
+            vec![vin, NetId::GROUND],
+        );
+        c.add_part(
+            "R1",
+            PartKind::Resistor,
+            Value::parse("1k", Unit::Ohm).ok(),
+            vec![vin, mid],
+        );
+        c.add_part("D1", PartKind::Diode, None, vec![mid, NetId::GROUND]);
+        c.set_tolerance("R1", 0.05);
+        (c, mid)
+    }
+
+    /// Run the Monte-Carlo fixture `runs` times through the **forced-sequential**
+    /// path — the `CP-SIM-M4.3` bench baseline.
+    pub fn monte_carlo_sequential(runs: usize) -> Vec<Signal> {
+        let (c, mid) = mc_fixture();
+        Engine::new()
+            .monte_carlo_impl(&c, 0xC0FFEE, runs, mid, 0, &Analysis::OperatingPoint, false)
+            .expect("mc bench solves")
+    }
+
+    /// Run the Monte-Carlo fixture `runs` times through the public path — threaded
+    /// when the `parallel` feature is on, so timing it against
+    /// [`monte_carlo_sequential`] shows the speedup.
+    pub fn monte_carlo_parallel(runs: usize) -> Vec<Signal> {
+        let (c, mid) = mc_fixture();
+        Engine::new()
+            .monte_carlo_impl(&c, 0xC0FFEE, runs, mid, 0, &Analysis::OperatingPoint, true)
+            .expect("mc bench solves")
+    }
 }
 
 #[cfg(test)]
@@ -2319,6 +2687,20 @@ mod tests {
 
     fn v(s: &str, u: Unit) -> Option<Value> {
         Some(Value::parse(s, u).unwrap())
+    }
+
+    // Built-ins-only shims: the engine-internal `solve_dc` / `collect_nonlinear`
+    // now take a `&DeviceRegistry` (`CP-SIM-M4.1`), but every pre-M4 test exercises
+    // only built-in devices. These local wrappers (which shadow the glob-imported
+    // originals) forward an empty registry, so the existing call sites stay
+    // unchanged and keep their exact behavior. Plugin devices are covered by
+    // `plugin_square_law_device_matches_hand_analysis`, which drives a real
+    // `Engine` registry instead.
+    fn solve_dc(circuit: &Circuit, layout: &Layout) -> Result<Vec<f64>, SimError> {
+        super::solve_dc(circuit, layout, &DeviceRegistry::new())
+    }
+    fn collect_nonlinear(circuit: &Circuit) -> Result<Vec<Box<dyn NonlinearDevice>>, SimError> {
+        super::collect_nonlinear(circuit, &DeviceRegistry::new())
     }
     // --- Convergence aids — CP-SIM-M1.3 ------------------------------------
 
@@ -4512,6 +4894,112 @@ mod tests {
         assert!(matches!(err, SimError::BadValue(_)), "got {err:?}");
     }
 
+    // --- Parallel analyses — CP-SIM-M4.3 -----------------------------------
+
+    /// The `CP-SIM-M4.3` determinism gate: the public Monte-Carlo (fanned across
+    /// threads when the `parallel` feature is on) returns **exactly** the same
+    /// `Signal` as the forced-sequential path, bit for bit, independently of thread
+    /// scheduling. Run it with `--features parallel` to exercise the threaded path;
+    /// without it both sides are sequential and the equality still holds. A healthy
+    /// run count (512) spans several thread chunks.
+    #[test]
+    fn parallel_monte_carlo_matches_sequential() {
+        let (c, mid) = mc_divider();
+        let engine = Engine::new();
+        let (seed, runs) = (0x5EED_1234_u64, 512usize);
+
+        // Public path: threaded under `--features parallel`, else sequential.
+        let parallel = engine
+            .run(
+                &c,
+                &Analysis::MonteCarlo {
+                    seed,
+                    runs,
+                    output: mid,
+                    sample: 0,
+                    inner: Box::new(Analysis::OperatingPoint),
+                },
+            )
+            .unwrap();
+        // Forced-sequential reference (the plain loop, always).
+        let sequential = engine
+            .monte_carlo_sequential(&c, seed, runs, mid, 0, &Analysis::OperatingPoint)
+            .unwrap();
+
+        assert_eq!(
+            parallel, sequential,
+            "parallel Monte-Carlo diverged from the sequential path"
+        );
+        assert_eq!(parallel[0].real().unwrap().len(), runs);
+    }
+
+    /// A parallel DC sweep (many independent operating-point solves) is
+    /// bit-for-bit reproducible across runs — the index-ordered executor means the
+    /// thread schedule can never reorder or perturb the result. A 60-point diode
+    /// sweep spans several chunks.
+    #[test]
+    fn parallel_dc_sweep_is_reproducible() {
+        let mut c = Circuit::new("diode_sweep");
+        let node = c.new_net();
+        c.add_part(
+            "I1",
+            PartKind::CurrentSource,
+            v("1m", Unit::Ampere),
+            vec![NetId::GROUND, node],
+        );
+        c.add_part("D1", PartKind::Diode, None, vec![node, NetId::GROUND]);
+        let sweep = Analysis::DcSweep {
+            source: "I1".into(),
+            start: 1e-3,
+            stop: 60e-3,
+            step: 1e-3,
+        };
+        let a = Engine::new().run(&c, &sweep).unwrap();
+        let b = Engine::new().run(&c, &sweep).unwrap();
+        assert_eq!(a, b, "parallel DC sweep is not reproducible");
+        assert_eq!(a[0].x.len(), 60);
+    }
+
+    /// A parallel parametric sweep (an inner transient per value) is reproducible
+    /// and preserves value order in the tagged signal families.
+    #[test]
+    fn parallel_parametric_is_reproducible() {
+        let mut c = Circuit::new("rc");
+        let vin = c.new_net();
+        let out = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("1", Unit::Volt),
+            vec![vin, NetId::GROUND],
+        );
+        c.add_part("R1", PartKind::Resistor, v("1k", Unit::Ohm), vec![vin, out]);
+        c.add_part(
+            "C1",
+            PartKind::Capacitor,
+            v("1u", Unit::Farad),
+            vec![out, NetId::GROUND],
+        );
+        let values: Vec<f64> = (1..=16).map(|i| i as f64).collect();
+        let param = Analysis::Parametric {
+            source: "V1".into(),
+            values: values.clone(),
+            inner: Box::new(Analysis::Transient {
+                duration: 2e-3,
+                step: Some(5e-4),
+            }),
+        };
+        let a = Engine::new().run(&c, &param).unwrap();
+        let b = Engine::new().run(&c, &param).unwrap();
+        assert_eq!(a, b, "parallel parametric sweep is not reproducible");
+        // The value families stay in order: the last signal carries the last value.
+        assert!(a
+            .last()
+            .unwrap()
+            .name
+            .ends_with(&format!("@ V1={}", values.last().unwrap())));
+    }
+
     #[test]
     fn noise_rejects_a_bad_sweep_range() {
         let mut c = Circuit::new("one_r");
@@ -4895,6 +5383,151 @@ mod tests {
             assert_eq!(got, dense[idx], "node {net:?}: sparse engine != dense");
             assert!(got > 0.0 && got < last, "ladder not monotone at {net:?}");
             last = got;
+        }
+    }
+
+    // --- Plugin device-model API — CP-SIM-M4.1 -----------------------------
+
+    /// A custom two-terminal nonlinear device living *outside* the engine's
+    /// built-ins — the plugin gate. Its current law is `I(V) = k·V²` for the
+    /// branch voltage `V = v(a) − v(b)`, flowing a → b. A real external crate would
+    /// define exactly this: a type implementing the public [`NonlinearDevice`]
+    /// contract, registered with [`Engine::with_device`].
+    struct SquareLaw {
+        nets: [NetId; 2],
+        k: f64,
+    }
+
+    impl NonlinearDevice for SquareLaw {
+        fn terminals(&self) -> &[NetId] {
+            &self.nets
+        }
+
+        fn state_len(&self) -> usize {
+            0 // smooth polynomial law — no junction limiting needed
+        }
+
+        fn linearize(&self, v: &[f64], _state: &mut [f64], _limit: bool) -> Companion {
+            let vd = v[0] - v[1];
+            let i = self.k * vd * vd; // I = k·V²
+            let g = 2.0 * self.k * vd; // dI/dV
+                                       // Multiport Norton source, exactly as a built-in device forms it.
+            let i_eq = g * vd - i;
+            Companion {
+                i: vec![i, -i],
+                i_eq: vec![i_eq, -i_eq],
+                g: vec![vec![g, -g], vec![-g, g]],
+            }
+        }
+    }
+
+    /// The `CP-SIM-M4.1` acceptance gate: a device defined entirely in this test
+    /// module (not an engine built-in) participates in a real operating-point
+    /// solve through the public registry, and the result matches hand analysis.
+    ///
+    /// Circuit: `V1 = 2 V — R1(1 kΩ) — n — XSQ(k = 1e-3) — gnd`, XSQ a
+    /// [`SquareLaw`]. KCL at `n`: `(2 − Vn)/1000 = 1e-3·Vn²`, i.e.
+    /// `Vn² + Vn − 2 = 0`, whose positive root is exactly `Vn = 1 V`. The node
+    /// always has a resistive path, so the plain Newton path cracks it.
+    #[test]
+    fn plugin_square_law_device_matches_hand_analysis() {
+        let mut c = Circuit::new("plugin_sqlaw");
+        let vin = c.new_net();
+        let n = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("2", Unit::Volt),
+            vec![vin, NetId::GROUND],
+        );
+        c.add_part("R1", PartKind::Resistor, v("1k", Unit::Ohm), vec![vin, n]);
+        // The plugin device: PartKind::Other("sqlaw"), its value carrying k.
+        c.add_part(
+            "XSQ",
+            PartKind::Other("sqlaw".into()),
+            Some(Value::new(1e-3, Unit::Ampere)),
+            vec![n, NetId::GROUND],
+        );
+
+        // An unregistered "sqlaw" is rejected — the registry is the only way in.
+        assert!(matches!(
+            Engine::new()
+                .run(&c, &Analysis::OperatingPoint)
+                .unwrap_err(),
+            SimError::Unsupported(_)
+        ));
+
+        // Register the plugin factory and solve the real operating point.
+        let engine = Engine::new().with_device("sqlaw", |part: &Part| {
+            let (a, b) = terminals2(part)?;
+            let k = part.value.map(|v| v.magnitude).unwrap_or(1e-3);
+            Ok(Box::new(SquareLaw { nets: [a, b], k }) as Box<dyn NonlinearDevice>)
+        });
+        let sigs = engine.run(&c, &Analysis::OperatingPoint).unwrap();
+
+        let name = format!("v(n{})", c.resolve(n).0);
+        let vn = sigs
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap()
+            .real()
+            .unwrap()[0];
+        assert!(
+            (vn - 1.0).abs() <= 1e-9,
+            "plugin device op-point Vn = {vn} V, expected exactly 1 V"
+        );
+        // KCL closes with the device's own law: the resistor current equals k·Vn².
+        let i_r = (2.0 - vn) / 1000.0;
+        let i_dev = 1e-3 * vn * vn;
+        assert!(
+            (i_r - i_dev).abs() <= 1e-12,
+            "KCL mismatch: I_R = {i_r} A vs I_dev = {i_dev} A"
+        );
+    }
+
+    /// The plugin device also flows through the other analyses the registry threads
+    /// — here a transient to the same steady state (every sample at the op-point
+    /// `Vn = 1 V`, since the sources are DC) — proving `Engine::run` stamps it in
+    /// NR / transient, not only the bare operating point.
+    #[test]
+    fn plugin_device_flows_through_transient() {
+        let mut c = Circuit::new("plugin_sqlaw_tran");
+        let vin = c.new_net();
+        let n = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("2", Unit::Volt),
+            vec![vin, NetId::GROUND],
+        );
+        c.add_part("R1", PartKind::Resistor, v("1k", Unit::Ohm), vec![vin, n]);
+        c.add_part(
+            "XSQ",
+            PartKind::Other("sqlaw".into()),
+            Some(Value::new(1e-3, Unit::Ampere)),
+            vec![n, NetId::GROUND],
+        );
+        let engine = Engine::new().with_device("sqlaw", |part: &Part| {
+            let (a, b) = terminals2(part)?;
+            let k = part.value.map(|v| v.magnitude).unwrap_or(1e-3);
+            Ok(Box::new(SquareLaw { nets: [a, b], k }) as Box<dyn NonlinearDevice>)
+        });
+        let sigs = engine
+            .run(
+                &c,
+                &Analysis::Transient {
+                    duration: 1e-3,
+                    step: Some(1e-4),
+                },
+            )
+            .expect("plugin device must stamp in the transient path");
+        let name = format!("v(n{})", c.resolve(n).0);
+        let sig = sigs.iter().find(|s| s.name == name).unwrap();
+        for &vn in sig.real().unwrap() {
+            assert!(
+                (vn - 1.0).abs() <= 1e-9,
+                "plugin transient Vn = {vn} V, expected the op-point 1 V"
+            );
         }
     }
 

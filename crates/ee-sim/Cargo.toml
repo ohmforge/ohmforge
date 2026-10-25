@@ -9,6 +9,14 @@ description = "Analog / mixed-signal engine: MNA, Newton-Raphson, transient/DC/A
 [lints]
 workspace = true
 
+[features]
+# Native-only parallel execution of independent analyses (Monte-Carlo samples,
+# DC/parametric sweep points) across OS threads via `std::thread` — no extra
+# dependencies. OFF by default and a no-op on wasm32, so the default build stays
+# single-threaded, dependency-free and wasm-clean. Results are identical to the
+# single-threaded path regardless of thread scheduling. (CP-SIM-M4.3.)
+parallel = []
+
 [dependencies]
 ee-core = { workspace = true }
 
