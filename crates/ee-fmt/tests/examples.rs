@@ -4,6 +4,9 @@
 //! midpoint, and the native project round-trips byte-for-byte and simulates. If
 //! an example drifts from the code, this test fails.
 
+use ee_core::graph::{NetId, PartKind};
+use ee_core::units::Unit;
+use ee_core::value::Value;
 use ee_fmt::{import_kicad, import_spice, load_project, save_project, to_bom_csv};
 use ee_sim::{Analysis, Engine};
 
@@ -12,6 +15,7 @@ use ee_sim::{Analysis, Engine};
 const DIVIDER_CIR: &str = include_str!("../../../examples/formats/divider.cir");
 const DIVIDER_NET: &str = include_str!("../../../examples/formats/divider.net");
 const RC_LOWPASS: &str = include_str!("../../../examples/formats/rc-lowpass.eeproj");
+const DIODE_CLAMP: &str = include_str!("../../../examples/formats/diode-clamp.cir");
 
 /// Read one solved node voltage by its resolved-net signal name.
 fn node_volts(circuit: &ee_core::graph::Circuit, net: ee_core::graph::NetId) -> f64 {
@@ -85,5 +89,55 @@ fn example_native_project_round_trips_and_simulates() {
     assert!(
         (node_volts(&circuit, out) - 5.0).abs() < 1e-9,
         "DC output sits at the rail through the series R"
+    );
+}
+
+#[test]
+fn example_spice_model_deck_applies_params_and_simulates() {
+    // The `.model`-backed example: its `.model 1N4148 D (IS=…)` card must reach
+    // the engine's diode and move the operating point off the default.
+    let circuit = import_spice(DIODE_CLAMP).expect("the diode `.model` deck imports");
+    assert_eq!(circuit.parts().len(), 3, "V1, R1, D1");
+
+    // The SPICE IS parameter landed on the diode part (amperes).
+    let d1 = circuit.part_by_ref("D1").unwrap();
+    assert!(matches!(d1.kind, PartKind::Diode));
+    assert!(
+        (d1.value.as_ref().unwrap().magnitude - 2.52e-9).abs() < 1e-18,
+        "IS=2.52n mapped onto the diode"
+    );
+
+    // The junction node (D1's anode = R1's far end) settles at a real forward
+    // drop in the silicon window.
+    let d_node = d1.terminals[0];
+    let v_modeled = node_volts(&circuit, d_node);
+    assert!(
+        (0.25..0.8).contains(&v_modeled),
+        "modeled junction drop {v_modeled} V out of range"
+    );
+
+    // Proof the params *matter*: the identical topology with a *default* diode
+    // (engine IS = 1e-14) sits at a visibly higher drop. The specified, larger
+    // IS lowers the forward voltage.
+    let mut dflt = ee_core::graph::Circuit::new("default-diode clamp");
+    let n_in = dflt.new_net();
+    let n_d = dflt.new_net();
+    dflt.add_part(
+        "V1",
+        PartKind::VoltageSource,
+        Some(Value::new(5.0, Unit::Volt)),
+        vec![n_in, NetId::GROUND],
+    );
+    dflt.add_part(
+        "R1",
+        PartKind::Resistor,
+        Some(Value::new(1000.0, Unit::Ohm)),
+        vec![n_in, n_d],
+    );
+    dflt.add_part("D1", PartKind::Diode, None, vec![n_d, NetId::GROUND]);
+    let v_default = node_volts(&dflt, dflt.part_by_ref("D1").unwrap().terminals[0]);
+    assert!(
+        v_default - v_modeled > 0.1,
+        "model IS should lower the drop: modeled {v_modeled} V vs default {v_default} V"
     );
 }

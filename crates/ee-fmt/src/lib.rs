@@ -27,5 +27,8 @@ pub use fritzing::export as export_fritzing;
 pub use kicad::{import as import_kicad, KicadError};
 pub use netlist::{parse as parse_netlist, NetlistError};
 pub use project::{load as load_project, save as save_project, ProjectError};
-pub use spice::{export as export_spice, import as import_spice, SpiceError};
+pub use spice::{
+    export as export_spice, import as import_spice, import_with_notes as import_spice_with_notes,
+    ModelType, Note as SpiceNote, SpiceError, SpiceModel,
+};
 pub use waveform::{to_csv, to_vcd, WaveformError};
