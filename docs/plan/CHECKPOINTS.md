@@ -104,16 +104,32 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 
 ---
 
+## M3 — breadth (workstream) + WASM (webstream)  → plan: [`M3-PLAN.md`](M3-PLAN.md)
+
+- [ ] **CP-SIM-M3.1** (sim-core) Behavioral/expression sources + richer device models (tempco). — *gate:* an expression source matches the evaluated waveform; a temp-shifted model moves the op-point as expected.
+- [ ] **CP-BRD-M3.1** (boards) HDL-lite: truth-table/expression logic blocks, ROM/RAM, tri-state bus. — *gate:* a ROM-lookup/adder block simulates; a tri-state bus resolves multiple drivers.
+- [ ] **CP-BRD-M3.2** (boards) Custom-board manifests + drop-in modules (7-seg/LED/servo/WS2812). — *gate:* load a manifest board; a module behaves per its inputs.
+- [ ] **CP-UX-M3.1** (ui-shell) Dataflow patcher: processing blocks → reusable virtual instruments + pass/fail test sequences. — *gate:* a source→block→measure patch computes the expected output; a pass/fail check evaluates.
+- [ ] **CP-AF-M3.3** (ai-fmt) Tutor mode + guided lessons/graded challenges + glossary. — *gate:* a graded challenge auto-scores against a real sim read.
+- [ ] **CP-AF-M3.4** (ai-fmt) Fritzing-style export. — *gate:* a well-formed export for a known circuit.
+- [ ] **CP-WEB.1** (web) `ee-web`: wasm-bindgen engine bindings + a minimal browser app (build/parse → run → render). — *gate:* `ee-web` builds for `wasm32`, a sim runs through the bindings, and host `cargo build/clippy/test --workspace` stays green.
+- [ ] **CP-SHIP.1** (platform) Polish & ship: close cheap follow-ups, expand examples/README, full CI-parity sweep, tag a release. — *gate:* release checklist, everything green.
+
+---
+
 ### Progress summary
 
 | Track | Done | In progress | Total |
 |---|---|---|---|
-| sim-core | 15 | 0 | 15 |
-| boards | 10 | 0 | 10 |
-| ui-shell | 13 | 0 | 13 |
-| ai-fmt | 9 | 0 | 9 |
-| platform | 5 | 0 | 5 |
-| **Total** | **52** | **0** | **52** ✅ |
+| sim-core | 15 | 0 | 16 |
+| boards | 10 | 0 | 12 |
+| ui-shell | 13 | 0 | 14 |
+| ai-fmt | 9 | 0 | 11 |
+| platform | 5 | 0 | 6 |
+| web | 0 | 0 | 1 |
+| **Total** | **52** | **0** | **60** |
+
+_M0–M2 + M3 interop = **52/52 done** (the ✅ milestone). **M3 breadth + WASM (8 new checkpoints)** are the current workstream/webstream._
 
 *Update this table when flipping a checkpoint.*
 
