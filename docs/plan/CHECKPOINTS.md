@@ -122,7 +122,7 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 - [ ] **CP-SIM-M4.1** (sim-core) Plugin device-model API + registry. — *gate:* a device defined outside `ee-sim` participates in a real solve and matches hand analysis.
 - [ ] **CP-SIM-M4.2** (sim-core) KLU-class sparse: fill-reducing ordering + symbolic-factorization reuse. — *gate:* correct vs current solver + improved scaling on a ≈10k-node net.
 - [ ] **CP-SIM-M4.3** (sim-core) Multithreaded analyses (MC/sweep), native-gated, deterministic. — *gate:* single- vs multi-threaded identical results + a measured speedup.
-- [ ] **CP-BRD-M4.1** (boards) Cortex-M3/M4 (Thumb-2) STM32-class core. — *gate:* Thumb-2 instruction vectors + an STM32 blink.
+- [x] **CP-BRD-M4.1** (boards) Cortex-M3/M4 (Thumb-2) STM32-class core. — *gate:* Thumb-2 vectors (MOVW/MOVT, MUL/MLA, UBFX/BFI, IT blocks, LDM/STM.W, B.W, MRS/MSR) + a runnable `Stm32` board whose hand-assembled blink toggles PC13. 16-vs-32-bit decode via `w0[15:11]`; STM32 GPIO on a disjoint co-sim pin block. 106 ee-mcu tests.
 - [x] **CP-AF-M4.1** (ai-fmt) SPICE `.model` import + a small vendor model library. — *gate:* `diode_model_is_overrides_default_and_changes_junction_drop` (IS=1n → 0.357 V vs default 0.655 V); BJT `IS/BF/BR` + MOSFET `VTO/KP/LAMBDA` mapped; catalog resolves 1N4148/2N3904/2N2222/1N4007/2N7000; unknown params noted, not errors. _(Diode `N` needs an ee-core `DiodeModel` — documented follow-up; only `IS` reaches the diode today.)_
 - [x] **CP-UX-M4.1** (ui-shell) Instrument/block plugin surface + session export. — *gate:* `plugin_block_evaluates_and_composes_with_builtins` (a `ProcessingBlock` trait obj in a patch) + `session_round_trip_is_equivalent` (circuit+probes+checkpoints export→import identical; `save`/`load` commands). ee-shell reuses ee-fmt's project format (acyclic).
 - [x] **CP-WEB.2** (web) Shareable/publishable circuit via a URL fragment. — *gate:* hand-rolled URL-safe base64url `encode`/`decode` round-trips exactly (comments/CRLF/unicode; garbage → clean Err); page reads `location.hash` → loads+runs, "Copy link" sets+copies it; decoded link runs through `run()`. 11 host tests, no dep.
@@ -134,12 +134,12 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 | Track | Done | In progress | Total |
 |---|---|---|---|
 | sim-core | 16 | 0 | 19 |
-| boards | 12 | 0 | 13 |
+| boards | 13 | 0 | 13 |
 | ui-shell | 15 | 0 | 15 |
 | ai-fmt | 12 | 0 | 12 |
 | platform | 6 | 0 | 6 |
 | web | 2 | 0 | 2 |
-| **Total** | **63** | **0** | **67** |
+| **Total** | **64** | **0** | **67** |
 
 _**60/60 — M0, M1, M2, and M3 all complete**, tagged **v0.1.0**. M3 added the dataflow patcher, HDL-lite, manifest boards + drop-in modules, behavioral/expression sources, a tutor with graded challenges, Fritzing export, and a **WebAssembly browser front end** (`ee-web`). The roadmap horizon beyond here is M4 (sparse-KLU/multithread, collaborative sessions, plugin API, QEMU full-SBC bridge)._
 
