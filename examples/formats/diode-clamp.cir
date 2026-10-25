@@ -1,0 +1,11 @@
+* ee-assist example: a diode drop from a 5 V rail through 1 kOhm (CP-AF-M4.1)
+* The `.model` card gives D1 a real saturation current; the importer maps the
+* SPICE IS parameter onto the engine's Shockley diode model, so the operating
+* point settles at a genuine forward junction drop rather than a default guess.
+* (`1N4148`-flavoured IS/N/RS; only IS reaches the engine's per-part model.)
+V1 in 0 DC 5
+R1 in d 1k
+D1 d 0 1N4148
+.model 1N4148 D (IS=2.52n N=1.752 RS=0.568)
+.op
+.end
