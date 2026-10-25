@@ -16,6 +16,12 @@ impl NetId {
     pub const GROUND: NetId = NetId(0);
 }
 
+/// The nominal reference temperature (°C) component temperature coefficients are
+/// specified about, and the default [`Circuit`] temperature. Every tempco term
+/// vanishes at this temperature, so a circuit left at the default reproduces the
+/// temperature-independent solve exactly. (`CP-SIM-M3.1`.)
+pub const NOMINAL_TEMP_C: f64 = 27.0;
+
 /// A placed part.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PartId(pub u32);
@@ -146,7 +152,10 @@ impl Default for MosfetModel {
 /// the `v1` of a [`Pulse`](Waveform::Pulse). During a transient the formula is
 /// evaluated at the current time; AC analysis treats a `Sine` source as the
 /// 1∠0 small-signal drive. Non-source parts ignore their waveform. (`CP-SIM-M1`.)
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+///
+/// [`Expr`](Waveform::Expr) carries an owned expression string, so `Waveform` is
+/// [`Clone`] but not `Copy`.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum Waveform {
     /// Constant source — the part's own [`Value`] magnitude is the level. This is
     /// the default, so a source built with [`Circuit::add_part`] behaves exactly
@@ -171,6 +180,13 @@ pub enum Waveform {
         width: f64,
         period: f64,
     },
+    /// An arbitrary function of time `t` (seconds), given as a small expression
+    /// over `+ - * / ^`, parentheses, the functions `sin cos exp ln sqrt abs`, and
+    /// the constants `pi` and `e` — e.g. `"sin(2*pi*1000*t)"`. The simulator
+    /// evaluates it at each transient step; the operating point and the `t = 0`
+    /// transient sample use its value at `t = 0`. A malformed expression surfaces
+    /// as a clean solver error, never a panic. (`CP-SIM-M3.1`.)
+    Expr(String),
 }
 
 /// A part instance: a kind, a human reference (`R1`), a primary value, the nets
@@ -206,6 +222,15 @@ pub struct Circuit {
     /// deterministic solver ignores; only the Monte-Carlo runner reads it to
     /// perturb component values within tolerance. (`CP-SIM-M2.2`.)
     tolerances: BTreeMap<String, f64>,
+    /// Optional per-part temperature coefficients (1/°C), keyed by reference
+    /// designator. Only the resistor model reads it: its effective resistance is
+    /// `R0·(1 + tc·(T − 27 °C))`. Absent ⇒ `tc = 0` (temperature-independent).
+    /// (`CP-SIM-M3.1`.)
+    tempcos: BTreeMap<String, f64>,
+    /// The circuit's operating temperature in °C — the `T` component tempcos shift
+    /// about the nominal 27 °C. Defaults to [`NOMINAL_TEMP_C`], so an untouched
+    /// circuit matches the temperature-independent solver bit-for-bit. (`CP-SIM-M3.1`.)
+    temp_c: f64,
 }
 
 // `Default` is hand-written (not derived) so net 0 is pre-seeded as ground: the
@@ -218,6 +243,8 @@ impl Default for Circuit {
             net_parent: vec![0], // net 0 = ground, its own root
             next_part: 0,
             tolerances: BTreeMap::new(),
+            tempcos: BTreeMap::new(),
+            temp_c: NOMINAL_TEMP_C,
         }
     }
 }
@@ -333,6 +360,43 @@ impl Circuit {
         self.tolerances.get(reference).copied()
     }
 
+    /// Set the circuit's operating temperature in °C. Component temperature
+    /// coefficients ([`set_tempco`](Circuit::set_tempco)) shift their value about
+    /// the nominal 27 °C at this temperature. A non-finite temperature is rejected
+    /// (reported as `false`) so the solver never sees a `NaN` resistance.
+    /// (`CP-SIM-M3.1`.)
+    pub fn set_temperature(&mut self, celsius: f64) -> bool {
+        if !celsius.is_finite() {
+            return false;
+        }
+        self.temp_c = celsius;
+        true
+    }
+
+    /// The circuit's operating temperature in °C (default [`NOMINAL_TEMP_C`]).
+    pub fn temperature(&self) -> f64 {
+        self.temp_c
+    }
+
+    /// Set a part's temperature coefficient `tc` (1/°C) by reference designator, so
+    /// a resistor's effective resistance becomes `R0·(1 + tc·(T − 27 °C))`. Returns
+    /// `true` if a part with that reference exists; a non-finite `tc` is rejected
+    /// (reported as `false`). `tc = 0` — the implicit default for any part without
+    /// one — leaves the part temperature-independent. (`CP-SIM-M3.1`.)
+    pub fn set_tempco(&mut self, reference: &str, tc: f64) -> bool {
+        if !tc.is_finite() || self.part_by_ref(reference).is_none() {
+            return false;
+        }
+        self.tempcos.insert(reference.to_string(), tc);
+        true
+    }
+
+    /// The temperature coefficient (1/°C) set for a part, or `None` if it carries
+    /// none (temperature-independent).
+    pub fn tempco(&self, reference: &str) -> Option<f64> {
+        self.tempcos.get(reference).copied()
+    }
+
     pub fn parts(&self) -> &[Part] {
         &self.parts
     }
@@ -399,7 +463,7 @@ mod tests {
             offset: 0.0,
             phase_deg: 0.0,
         };
-        assert!(c.set_waveform("V1", wf));
+        assert!(c.set_waveform("V1", wf.clone()));
         assert_eq!(c.part_by_ref("V1").unwrap().waveform, wf);
         // An unknown reference leaves the circuit untouched and reports false.
         assert!(!c.set_waveform("V9", Waveform::Dc));
@@ -442,5 +506,32 @@ mod tests {
         assert!(!c.set_tolerance("R1", f64::NAN));
         // The rejected writes left the earlier value untouched.
         assert_eq!(c.tolerance("R1"), Some(0.05));
+    }
+
+    #[test]
+    fn temperature_defaults_to_nominal_and_tempco_is_optional_metadata() {
+        let mut c = Circuit::new("c");
+        let (a, b) = (c.new_net(), c.new_net());
+        c.add_part(
+            "R1",
+            PartKind::Resistor,
+            Some(Value::new(1000.0, Unit::Ohm)),
+            vec![a, b],
+        );
+        // An untouched circuit sits at the nominal 27 °C and carries no tempcos.
+        assert_eq!(c.temperature(), NOMINAL_TEMP_C);
+        assert_eq!(c.tempco("R1"), None);
+        // A sane tempco is stored and read back by reference.
+        assert!(c.set_tempco("R1", 0.01));
+        assert_eq!(c.tempco("R1"), Some(0.01));
+        // Unknown references, and non-finite tempcos/temperatures, are rejected.
+        assert!(!c.set_tempco("R9", 0.01));
+        assert!(!c.set_tempco("R1", f64::NAN));
+        assert!(!c.set_temperature(f64::INFINITY));
+        assert_eq!(c.tempco("R1"), Some(0.01));
+        assert_eq!(c.temperature(), NOMINAL_TEMP_C);
+        // A finite temperature is accepted and read back.
+        assert!(c.set_temperature(85.0));
+        assert_eq!(c.temperature(), 85.0);
     }
 }
