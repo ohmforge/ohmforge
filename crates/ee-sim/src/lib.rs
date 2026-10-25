@@ -13,6 +13,7 @@
 //! This crate takes no clock, no filesystem, and no unseeded randomness, and
 //! stays `wasm32`-clean — the same rules as `ee-core`.
 
+mod expr;
 mod mna;
 mod mna_complex;
 
@@ -21,7 +22,9 @@ use std::error::Error;
 use std::f64::consts::TAU;
 use std::fmt;
 
-use ee_core::graph::{BjtModel, Circuit, MosfetModel, NetId, Part, PartKind, Polarity, Waveform};
+use ee_core::graph::{
+    BjtModel, Circuit, MosfetModel, NetId, Part, PartKind, Polarity, Waveform, NOMINAL_TEMP_C,
+};
 use ee_core::value::Value;
 use ee_core::{Complex, Domain, Signal, SignalData, Unit};
 use mna::System;
@@ -109,6 +112,9 @@ pub enum SimError {
     /// absent, or is not a branch-carrying voltage source whose current we can
     /// sense. Carries the offending reference.
     BadControl(String),
+    /// A source carries a [`Waveform::Expr`] whose expression could not be parsed
+    /// or evaluated. Carries the source's reference. (`CP-SIM-M3.1`.)
+    BadExpr(String),
 }
 
 impl fmt::Display for SimError {
@@ -137,6 +143,7 @@ impl fmt::Display for SimError {
                 f,
                 "controlled source references {r}, which is not a current-sensing voltage source"
             ),
+            SimError::BadExpr(r) => write!(f, "source {r} has an invalid time expression"),
         }
     }
 }
@@ -331,13 +338,35 @@ fn magnitude(part: &Part) -> Result<f64, SimError> {
         .ok_or_else(|| SimError::MissingValue(part.reference.clone()))
 }
 
+/// A resistor's effective resistance at the circuit's temperature:
+/// `R0·(1 + tc·(T − 27 °C))`, where `R0` is its nominal value, `tc` the part's
+/// [`Circuit::tempco`] (0 when it carries none), and `T` the
+/// [`Circuit::temperature`]. The reference temperature is the nominal
+/// [`NOMINAL_TEMP_C`], so a circuit left at the default temperature returns `R0`
+/// unchanged — the temperature-independent result, bit-for-bit. A non-positive
+/// nominal *or* effective resistance is a [`SimError::BadValue`], exactly as the
+/// plain resistor stamp treated a non-positive value. (`CP-SIM-M3.1`.)
+fn resistor_value(circuit: &Circuit, part: &Part) -> Result<f64, SimError> {
+    let r0 = magnitude(part)?;
+    if r0 <= 0.0 {
+        return Err(SimError::BadValue(part.reference.clone()));
+    }
+    let tc = circuit.tempco(&part.reference).unwrap_or(0.0);
+    let r = r0 * (1.0 + tc * (circuit.temperature() - NOMINAL_TEMP_C));
+    if r <= 0.0 {
+        return Err(SimError::BadValue(part.reference.clone()));
+    }
+    Ok(r)
+}
+
 /// The value an independent source presents at transient time `t`.
 ///
 /// `t = None` asks for the DC / operating-point bias — the constant for
 /// [`Waveform::Dc`], the `offset` of a sine, the `v1` of a pulse — which is also
 /// what the `t = 0` transient sample uses. `t = Some(secs)` evaluates the
-/// waveform formula at that time. A `Dc` source needs a [`Value`]; a `Sine` or
-/// `Pulse` carries its own levels and needs none.
+/// waveform formula at that time. A `Dc` source needs a [`Value`]; a `Sine`,
+/// `Pulse`, or [`Expr`](Waveform::Expr) carries its own levels and needs none. A
+/// malformed `Expr` surfaces as [`SimError::BadExpr`] rather than a panic.
 fn source_value(part: &Part, t: Option<f64>) -> Result<f64, SimError> {
     Ok(match &part.waveform {
         Waveform::Dc => magnitude(part)?,
@@ -360,6 +389,10 @@ fn source_value(part: &Part, t: Option<f64>) -> Result<f64, SimError> {
             None => *v1,
             Some(t) => pulse_value(*v1, *v2, *delay, *width, *period, t),
         },
+        // Behavioral source: evaluate the expression at the current time. The
+        // operating point / `t = 0` sample (`t = None`) uses its value at `t = 0`.
+        Waveform::Expr(src) => expr::eval(src, t.unwrap_or(0.0))
+            .map_err(|_| SimError::BadExpr(part.reference.clone()))?,
     })
 }
 
@@ -418,10 +451,7 @@ fn terminals4(part: &Part) -> Result<[NetId; 4], SimError> {
 fn stamp_resistors(sys: &mut System, circuit: &Circuit, layout: &Layout) -> Result<(), SimError> {
     for part in circuit.parts() {
         if matches!(part.kind, PartKind::Resistor) {
-            let r = magnitude(part)?;
-            if r <= 0.0 {
-                return Err(SimError::BadValue(part.reference.clone()));
-            }
+            let r = resistor_value(circuit, part)?;
             let (a, b) = terminals2(part)?;
             sys.stamp_conductance(
                 layout.node_of(circuit, a),
@@ -1697,10 +1727,7 @@ fn ac(
     for part in circuit.parts() {
         match part.kind {
             PartKind::Resistor => {
-                let r = magnitude(part)?;
-                if r <= 0.0 {
-                    return Err(SimError::BadValue(part.reference.clone()));
-                }
+                let r = resistor_value(circuit, part)?;
                 let (a, b) = terminals2(part)?;
                 conductances.push((
                     layout.node_of(circuit, a),
@@ -1894,10 +1921,7 @@ fn noise(
     for part in circuit.parts() {
         match part.kind {
             PartKind::Resistor => {
-                let r = magnitude(part)?;
-                if r <= 0.0 {
-                    return Err(SimError::BadValue(part.reference.clone()));
-                }
+                let r = resistor_value(circuit, part)?;
                 let (a, b) = terminals2(part)?;
                 let (na, nb) = (layout.node_of(circuit, a), layout.node_of(circuit, b));
                 conductances.push((na, nb, 1.0 / r));
@@ -4645,6 +4669,154 @@ mod tests {
                 },
             )
             .is_ok());
+    }
+
+    // --- Behavioral (expression) sources — CP-SIM-M3.1 ---------------------
+
+    /// Build an unloaded source node (1 MΩ bleed to ground keeps it non-floating)
+    /// driven by a behavioral `Expr` waveform on `V1`.
+    fn expr_source(src: &str) -> (Circuit, NetId) {
+        let mut c = Circuit::new("expr");
+        let out = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            None, // an expression carries its own levels — no DC Value needed
+            vec![out, NetId::GROUND],
+        );
+        c.add_part(
+            "R1",
+            PartKind::Resistor,
+            v("1meg", Unit::Ohm),
+            vec![out, NetId::GROUND],
+        );
+        assert!(c.set_waveform("V1", Waveform::Expr(src.into())));
+        (c, out)
+    }
+
+    #[test]
+    fn expr_source_reproduces_a_sine_in_transient() {
+        // A behavioral source driving sin(2π·1 kHz·t) must trace the analytic sine
+        // at every sampled time, and start at its t = 0 value (sin 0 = 0).
+        let (c, out) = expr_source("sin(2*pi*1000*t)");
+        let h = 2e-6; // 500 steps per 1 kHz cycle
+        let sigs = Engine::new()
+            .run(
+                &c,
+                &Analysis::Transient {
+                    duration: 2e-3,
+                    step: Some(h),
+                },
+            )
+            .unwrap();
+        let name = format!("v(n{})", c.resolve(out).0);
+        let sig = sigs.iter().find(|s| s.name == name).unwrap();
+        let y = sig.real().unwrap();
+        assert!(y[0].abs() < 1e-9, "t=0 value {} != sin(0)", y[0]);
+        for (&t, &val) in sig.x.iter().zip(y).skip(1) {
+            let expected = (TAU * 1000.0 * t).sin();
+            assert!(
+                (val - expected).abs() <= 1e-6,
+                "t={t}: got {val}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn expr_source_evaluates_a_compound_waveform() {
+        // A damped sinusoid exp(−t/τ)·sin(2π·1 kHz·t), τ = 1 ms — exercises the
+        // functions, the division, and operator precedence together.
+        let (c, out) = expr_source("exp(-t/0.001)*sin(2*pi*1000*t)");
+        let h = 2e-6;
+        let sigs = Engine::new()
+            .run(
+                &c,
+                &Analysis::Transient {
+                    duration: 2e-3,
+                    step: Some(h),
+                },
+            )
+            .unwrap();
+        let name = format!("v(n{})", c.resolve(out).0);
+        let sig = sigs.iter().find(|s| s.name == name).unwrap();
+        for (&t, &val) in sig.x.iter().zip(sig.real().unwrap()).skip(1) {
+            let expected = (-t / 1e-3).exp() * (TAU * 1000.0 * t).sin();
+            assert!(
+                (val - expected).abs() <= 1e-6,
+                "t={t}: got {val}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_expression_is_a_clean_error() {
+        // An unbalanced expression must surface as BadExpr(V1) — a clean error at
+        // the very first (t = 0) evaluation, never a panic.
+        let (c, _out) = expr_source("sin(2*");
+        let err = Engine::new()
+            .run(
+                &c,
+                &Analysis::Transient {
+                    duration: 1e-3,
+                    step: Some(1e-5),
+                },
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, SimError::BadExpr(ref r) if r == "V1"),
+            "expected BadExpr(V1), got {err:?}"
+        );
+    }
+
+    // --- Resistor temperature coefficient — CP-SIM-M3.1 --------------------
+
+    #[test]
+    fn resistor_tempco_shifts_a_divider() {
+        // A 1k/1k divider off 10 V sits at 5 V. Give the top resistor a +1 %/°C
+        // tempco: at the default 27 °C it is inert (exactly 5 V, no regression),
+        // and heating to 127 °C grows R1 to 2 kΩ so the midpoint drops to
+        // 10·R2/(R1+R2) = 10/3 V — the physically correct direction.
+        let mut c = Circuit::new("tempco_div");
+        let vin = c.new_net();
+        let mid = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("10", Unit::Volt),
+            vec![vin, NetId::GROUND],
+        );
+        c.add_part("R1", PartKind::Resistor, v("1k", Unit::Ohm), vec![vin, mid]);
+        c.add_part(
+            "R2",
+            PartKind::Resistor,
+            v("1k", Unit::Ohm),
+            vec![mid, NetId::GROUND],
+        );
+        assert!(c.set_tempco("R1", 0.01)); // +1 %/°C
+
+        // The topology is fixed across the temperature change, so build once.
+        let layout = Layout::build(&c);
+        let mid_idx = layout.node_of(&c, mid).unwrap();
+
+        // Default temperature: the tempco term is zero → exactly 5 V, unchanged.
+        let v_nominal = solve_dc(&c, &layout).unwrap()[mid_idx];
+        assert!(
+            (v_nominal - 5.0).abs() < 1e-12,
+            "default-temperature divider = {v_nominal} V, expected exactly 5 V"
+        );
+
+        // Heat to 127 °C (ΔT = 100 °C): R1 → 1000·(1 + 0.01·100) = 2000 Ω.
+        assert!(c.set_temperature(127.0));
+        let v_hot = solve_dc(&c, &layout).unwrap()[mid_idx];
+        let expected = 10.0 * 1000.0 / (2000.0 + 1000.0);
+        assert!(
+            (v_hot - expected).abs() <= 1e-9,
+            "hot divider = {v_hot} V, expected {expected} V"
+        );
+        assert!(
+            v_hot < v_nominal,
+            "midpoint {v_hot} V did not drop as the top leg heated (from {v_nominal} V)"
+        );
     }
 
     // --- Sparse solver routing — CP-SIM-M2.4 -------------------------------
