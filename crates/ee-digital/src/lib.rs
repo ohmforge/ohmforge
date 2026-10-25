@@ -22,12 +22,14 @@
 
 pub mod components;
 pub mod event;
+pub mod hdl;
 pub mod logic;
 pub mod seq;
 pub mod sim;
 
-pub use components::RippleCounter;
+pub use components::{add_tristate_bus, RippleCounter, TriStateDriver};
 pub use event::{Event, EventQueue, Femtos};
+pub use hdl::{Expr, ExprError, Ram, Rom, TruthTable};
 pub use logic::Logic;
 pub use seq::FlipFlop;
-pub use sim::{DriverId, GateId, GateKind, Net, SeqId, Sim};
+pub use sim::{BlockId, DriverId, GateId, GateKind, Net, SeqId, Sim};
