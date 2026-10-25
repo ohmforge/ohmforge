@@ -33,8 +33,8 @@ pub use logic_analyzer::{
 pub use math::{math_channel, MathOp};
 pub use oscilloscope::{CursorReadout, Cursors, Oscilloscope, Slope, Timebase, Trigger};
 pub use patch::{
-    Block, Bound, Check, CheckResult, Filter, FilterKind, Patch, PatchError, PatchRun, Port,
-    TestReport, TestSequence, VirtualInstrument, Wire,
+    Block, Bound, Check, CheckResult, Filter, FilterKind, Patch, PatchError, PatchRun,
+    PluginHandle, Port, ProcessingBlock, TestReport, TestSequence, VirtualInstrument, Wire,
 };
 pub use psu::{BenchPsu, PsuMode, PsuOutput};
 pub use spectrum::Spectrum;
