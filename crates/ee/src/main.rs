@@ -16,7 +16,7 @@ use ee_core::value::Value;
 use ee_core::{BjtModel, Circuit, Polarity, Waveform};
 use ee_shell::Shell;
 use ee_sim::{Analysis, Engine};
-use ee_tui::{NodeVoltages, Overlay, Plot};
+use ee_tui::{NodeVoltages, Overlay, Plot, Screen};
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
@@ -46,6 +46,7 @@ fn main() {
         Some("bode") => demo_bode(),
         Some("amp") => demo_amp(),
         Some("cosim") => demo_cosim(),
+        Some("view") => demo_view(),
         Some("tui") => {
             if let Err(e) = ee_tui::run(Shell::new()) {
                 eprintln!("{RED}tui error:{RESET} {e}");
@@ -303,6 +304,82 @@ fn demo_cosim() {
     }
 }
 
+/// `ee view` — a static snapshot of the composed TUI: the op-point overlay, the
+/// scope, and a shell pane, laid out like the live `ee tui` (which needs a real
+/// terminal). Uses an RC low-pass.
+fn demo_view() {
+    let mut c = Circuit::new("rc-lowpass");
+    let vin = c.new_net();
+    let out = c.new_net();
+    let gnd = ee_core::NetId::GROUND;
+    c.add_part(
+        "V1",
+        PartKind::VoltageSource,
+        val("5", Unit::Volt),
+        vec![vin, gnd],
+    );
+    c.add_part(
+        "R1",
+        PartKind::Resistor,
+        val("1k", Unit::Ohm),
+        vec![vin, out],
+    );
+    c.add_part(
+        "C1",
+        PartKind::Capacitor,
+        val("1u", Unit::Farad),
+        vec![out, gnd],
+    );
+
+    let engine = Engine::new();
+    // Scope: v(out) transient.
+    let tran = engine.run(
+        &c,
+        &Analysis::Transient {
+            duration: 5e-3,
+            step: Some(20e-6),
+        },
+    );
+    let scope = match &tran {
+        Ok(sigs) => {
+            let name = format!("v(n{})", c.resolve(out).0);
+            match sigs
+                .iter()
+                .find(|s| s.name == name)
+                .and_then(|s| s.real().map(|y| (s, y)))
+            {
+                Some((s, y)) => {
+                    let x_ms: Vec<f64> = s.x.iter().map(|t| t * 1e3).collect();
+                    Plot::new("v(out)")
+                        .units("V", "ms")
+                        .size(44, 12)
+                        .render(&x_ms, y)
+                }
+                None => String::new(),
+            }
+        }
+        Err(_) => String::new(),
+    };
+    // Overlay: DC operating point.
+    let volts = match engine.run(&c, &Analysis::OperatingPoint) {
+        Ok(op) => NodeVoltages::from_signals(&op),
+        Err(_) => NodeVoltages::new(),
+    };
+    let shell = [
+        "ee> add C1 out gnd 1u",
+        "added C1",
+        "ee> probe out",
+        "ee> run tran 5m",
+    ];
+    println!("Composed view (the live, interactive version is `ee tui`):\n");
+    println!(
+        "{}",
+        Screen::new()
+            .size(96, 22)
+            .render_overlay(&c, &volts, &scope, &shell, true)
+    );
+}
+
 /// Run a sequence of command lines, printing each command's output.
 fn run_lines<I, S>(shell: &mut Shell, lines: I)
 where
@@ -330,7 +407,7 @@ fn repl(shell: &mut Shell) -> rustyline::Result<()> {
     let _ = rl.load_history(&history);
 
     println!("{DIM}ee-assist — eesh (M1). Tab completes, ↑/↓ history, Ctrl-R search, Ctrl-D quits.{RESET}");
-    println!("{DIM}Try: add R1 in out 1k · probe out · run tran 5m · show · help  (or: ee demo|bode|amp|tui){RESET}\n");
+    println!("{DIM}Try: add R1 in out 1k · probe out · run tran 5m · show · help  (or: ee demo|bode|amp|cosim|view|tui){RESET}\n");
 
     loop {
         match rl.readline(PROMPT) {
