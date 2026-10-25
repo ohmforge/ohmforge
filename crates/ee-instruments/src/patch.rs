@@ -25,6 +25,7 @@ use crate::fmt::{fmt_eng, fmt_num};
 use crate::math::{math_channel, MathOp};
 use ee_core::signal::{Signal, SignalData};
 use std::fmt;
+use std::sync::Arc;
 
 /// A value flowing along a patch edge: a whole waveform or a reduced scalar.
 #[derive(Debug, Clone, PartialEq)]
@@ -144,12 +145,89 @@ impl Filter {
     }
 }
 
+/// An externally defined processing block — the extensibility seam (`CP-UX-M4.1`).
+///
+/// Implement this on your own type and register it into a [`Patch`] with
+/// [`Block::plugin`]; it then evaluates alongside the built-in [`Block`] variants,
+/// composing freely with them. A plugin is pure and deterministic like every
+/// built-in: given the same input [`Port`]s it must return the same output, and
+/// it reports a bad input as a [`PatchError`] rather than panicking.
+///
+/// ```
+/// use ee_instruments::{Block, Patch, Port, PatchError, ProcessingBlock};
+/// use ee_core::signal::{Signal, SignalData};
+///
+/// /// Squares every sample of a real signal (or a bare scalar).
+/// #[derive(Debug)]
+/// struct Square;
+/// impl ProcessingBlock for Square {
+///     fn name(&self) -> String { "Square".into() }
+///     fn arity(&self) -> usize { 1 }
+///     fn eval(&self, inputs: &[Port]) -> Result<Port, PatchError> {
+///         match &inputs[0] {
+///             Port::Scalar(v) => Ok(Port::Scalar(v * v)),
+///             Port::Signal(s) => {
+///                 let y = s.real().unwrap_or(&[]);
+///                 let sq: Vec<f64> = y.iter().map(|v| v * v).collect();
+///                 Ok(Port::Signal(Signal::time(s.name.clone(), s.unit, s.x.clone(), sq)))
+///             }
+///         }
+///     }
+/// }
+///
+/// let mut p = Patch::new();
+/// let i = p.input("in");
+/// let sq = p.add(Block::plugin(Square), &[i]);
+/// p.output("out", sq);
+/// ```
+pub trait ProcessingBlock: fmt::Debug {
+    /// A short label for the block, shown in [`Patch::render`].
+    fn name(&self) -> String;
+
+    /// How many input [`Port`]s the block consumes. The patcher checks this
+    /// before calling [`eval`](ProcessingBlock::eval), so `eval` can index
+    /// `inputs[0..arity()]` without a bounds check.
+    fn arity(&self) -> usize;
+
+    /// Evaluate the block over its resolved inputs (exactly [`arity`](ProcessingBlock::arity)
+    /// of them). Report a bad input kind/shape as a [`PatchError`] — never panic.
+    fn eval(&self, inputs: &[Port]) -> Result<Port, PatchError>;
+}
+
+/// A cheap, shareable handle to a registered [`ProcessingBlock`].
+///
+/// It wraps the boxed plugin in an [`Arc`] so a [`Block`] (and therefore a
+/// [`Patch`]) stays `Clone`, and carries hand-written [`Debug`]/[`PartialEq`]
+/// impls so [`Block`] keeps its derives. Two handles compare equal only when they
+/// refer to the very same registered block.
+#[derive(Clone)]
+pub struct PluginHandle(Arc<dyn ProcessingBlock>);
+
+impl PluginHandle {
+    fn new(block: impl ProcessingBlock + 'static) -> Self {
+        Self(Arc::new(block))
+    }
+}
+
+impl fmt::Debug for PluginHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Plugin({})", self.0.name())
+    }
+}
+
+impl PartialEq for PluginHandle {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 /// A processing block: the unit of computation at a patch node.
 ///
 /// Arity is fixed per variant — [`Add`](Block::Add)/[`Sub`](Block::Sub)/
-/// [`Mul`](Block::Mul) take two inputs, every other block takes one. The
-/// scaling/offset/bounding blocks map over a signal's samples *or* act on a bare
-/// scalar, so a reduce-then-scale chain (`… → Rms → Gain(2)`) works too.
+/// [`Mul`](Block::Mul) take two inputs, every other built-in takes one; a
+/// [`Plugin`](Block::Plugin) carries its own arity. The scaling/offset/bounding
+/// blocks map over a signal's samples *or* act on a bare scalar, so a
+/// reduce-then-scale chain (`… → Rms → Gain(2)`) works too.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Block {
     /// Multiply every sample (or the scalar) by `k`.
@@ -183,13 +261,22 @@ pub enum Block {
     Peak,
     /// Identity tap that records its input into the run's log under a label.
     Log(String),
+    /// An externally registered [`ProcessingBlock`]; build one with [`Block::plugin`].
+    Plugin(PluginHandle),
 }
 
 impl Block {
+    /// Register an external [`ProcessingBlock`] as a block, so it can be wired
+    /// into a [`Patch`] with [`add`](Patch::add) alongside the built-ins.
+    pub fn plugin(block: impl ProcessingBlock + 'static) -> Self {
+        Block::Plugin(PluginHandle::new(block))
+    }
+
     /// How many inputs this block consumes.
     pub fn arity(&self) -> usize {
         match self {
             Block::Add | Block::Sub | Block::Mul => 2,
+            Block::Plugin(p) => p.0.arity(),
             _ => 1,
         }
     }
@@ -216,6 +303,7 @@ impl Block {
             Block::Mean => "Mean".to_string(),
             Block::Peak => "Peak".to_string(),
             Block::Log(name) => format!("Log({name})"),
+            Block::Plugin(p) => p.0.name(),
         }
     }
 }
@@ -469,6 +557,11 @@ fn eval_block(
         Block::Log(name) => {
             let p = args[0].clone();
             return Ok((p.clone(), Some((name.clone(), p))));
+        }
+        Block::Plugin(p) => {
+            // The arity check in `eval` already guaranteed `args.len() == arity`.
+            let owned: Vec<Port> = args.iter().map(|&a| a.clone()).collect();
+            p.0.eval(&owned)?
         }
     };
     Ok((out, None))
@@ -1121,5 +1214,157 @@ mod tests {
         let failing: Vec<&str> = fail.failures().map(|r| r.name.as_str()).collect();
         assert_eq!(failing, vec!["peak too tight"]);
         assert!(fail.render().contains("[FAIL] peak too tight"));
+    }
+
+    // ── external ProcessingBlock plugins (CP-UX-M4.1) ──────────────────────
+
+    /// A one-input plugin that squares every real sample, and rejects a scalar
+    /// (to prove a plugin can report a clean type error).
+    #[derive(Debug)]
+    struct Square;
+    impl ProcessingBlock for Square {
+        fn name(&self) -> String {
+            "Square".to_string()
+        }
+        fn arity(&self) -> usize {
+            1
+        }
+        fn eval(&self, inputs: &[Port]) -> Result<Port, PatchError> {
+            match &inputs[0] {
+                Port::Signal(s) => {
+                    let y = s.real().unwrap_or(&[]);
+                    let sq: Vec<f64> = y.iter().map(|v| v * v).collect();
+                    Ok(Port::Signal(Signal::time(
+                        s.name.clone(),
+                        s.unit,
+                        s.x.clone(),
+                        sq,
+                    )))
+                }
+                Port::Scalar(_) => Err(PatchError::TypeMismatch {
+                    node: usize::MAX,
+                    detail: "Square needs a signal, got a scalar".to_string(),
+                }),
+            }
+        }
+    }
+
+    /// A two-input plugin: the elementwise maximum of two real signals, broadcast
+    /// via the built-in grid handling by delegating to the public API.
+    #[derive(Debug)]
+    struct WindowAvg {
+        width: usize,
+    }
+    impl ProcessingBlock for WindowAvg {
+        fn name(&self) -> String {
+            format!("WindowAvg({})", self.width)
+        }
+        fn arity(&self) -> usize {
+            1
+        }
+        fn eval(&self, inputs: &[Port]) -> Result<Port, PatchError> {
+            let s = inputs[0]
+                .as_signal()
+                .ok_or_else(|| PatchError::TypeMismatch {
+                    node: usize::MAX,
+                    detail: "WindowAvg needs a signal".to_string(),
+                })?;
+            let y = s.real().unwrap_or(&[]);
+            let w = self.width.max(1);
+            // Trailing moving average over up to `w` samples.
+            let avg: Vec<f64> = (0..y.len())
+                .map(|i| {
+                    let lo = i.saturating_sub(w - 1);
+                    let win = &y[lo..=i];
+                    win.iter().sum::<f64>() / win.len() as f64
+                })
+                .collect();
+            Ok(Port::Signal(Signal::time(
+                s.name.clone(),
+                s.unit,
+                s.x.clone(),
+                avg,
+            )))
+        }
+    }
+
+    #[test]
+    fn plugin_block_evaluates_and_composes_with_builtins() {
+        // in → Square → Gain(2): [1,2,3] → [1,4,9] → [2,8,18], and Mean = 28/3.
+        let src = ramp(vec![1.0, 2.0, 3.0]);
+        let mut p = Patch::new();
+        let i = p.input("in");
+        let sq = p.add(Block::plugin(Square), &[i]);
+        let g = p.add(Block::Gain(2.0), &[sq]);
+        let mean = p.add(Block::Mean, &[g]);
+        p.output("scaled", g);
+        p.output("mean", mean);
+
+        let run = p.eval(&[("in", src)]).unwrap();
+        assert_eq!(
+            run.signal("scaled").unwrap().real().unwrap(),
+            &[2.0, 8.0, 18.0]
+        );
+        assert!((run.scalar("mean").unwrap() - 28.0 / 3.0).abs() < 1e-12);
+        // The plugin's name rides the render.
+        assert!(p.render().contains("Square"), "{}", p.render());
+    }
+
+    #[test]
+    fn plugin_block_type_error_is_reported() {
+        // Rms yields a scalar; feeding it to Square (which needs a signal) must
+        // surface the plugin's own TypeMismatch, not a panic.
+        let src = ramp(vec![1.0, 2.0, 3.0]);
+        let mut p = Patch::new();
+        let i = p.input("in");
+        let r = p.add(Block::Rms, &[i]);
+        let bad = p.add(Block::plugin(Square), &[r]);
+        p.output("out", bad);
+
+        let err = p.eval(&[("in", src)]).unwrap_err();
+        assert!(
+            matches!(err, PatchError::TypeMismatch { .. }),
+            "want a type mismatch, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn plugin_block_arity_is_honored() {
+        // A plugin declaring arity 1 given two wires is an Arity error, checked by
+        // the patcher before the plugin ever runs.
+        let a = ramp(vec![1.0, 2.0]);
+        let b = ramp(vec![3.0, 4.0]);
+        let mut p = Patch::new();
+        let wa = p.input("a");
+        let wb = p.input("b");
+        let node = p.add(Block::plugin(Square), &[wa, wb]);
+        p.output("out", node);
+
+        let err = p.eval(&[("a", a), ("b", b)]).unwrap_err();
+        assert_eq!(
+            err,
+            PatchError::Arity {
+                node: 0,
+                expected: 1,
+                got: 2
+            }
+        );
+    }
+
+    #[test]
+    fn windowed_average_plugin_smooths() {
+        // A width-3 trailing average of [0,3,6,9]: [0, 1.5, 3, 6].
+        let src = ramp(vec![0.0, 3.0, 6.0, 9.0]);
+        let mut p = Patch::new();
+        let i = p.input("in");
+        let avg = p.add(Block::plugin(WindowAvg { width: 3 }), &[i]);
+        p.output("avg", avg);
+
+        let run = p.eval(&[("in", src)]).unwrap();
+        assert_eq!(
+            run.signal("avg").unwrap().real().unwrap(),
+            &[0.0, 1.5, 3.0, 6.0]
+        );
+        assert!(p.render().contains("WindowAvg(3)"));
     }
 }
