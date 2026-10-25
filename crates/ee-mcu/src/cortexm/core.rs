@@ -31,7 +31,7 @@ use crate::{FirmwareError, McuCore, PinIo};
 
 use super::decode::decode;
 use super::isa::{AddrMode, Instr, Mem, Size, LR, PC, SP};
-use super::periph::{Sio, PIN_COUNT};
+use super::periph::{Sio, Stm32Gpio, PIN_COUNT, STM32_PIN_COUNT};
 
 /// Size of the flat RAM, in bytes (256 KiB — ample for firmware + stack).
 const MEM_SIZE: usize = 256 * 1024;
@@ -89,10 +89,19 @@ pub struct CortexM {
     apsr: Apsr,
     /// `PRIMASK`: when set, all maskable exceptions are disabled.
     primask: bool,
+    /// The `IT` block state (`ITSTATE`): condition in bits 7:4, mask in bits 3:0
+    /// (zero outside an IT block). ARMv7-M only.
+    itstate: u8,
+    /// Whether the current instruction's value-producing flag update is suppressed
+    /// (a 16-bit flag-setting data-processing form inside an `IT` block, where the
+    /// `S` is implicitly cleared). Comparisons still set flags.
+    suppress_value_flags: bool,
     /// Flat RAM mapped from address 0.
     mem: Vec<u8>,
-    /// The SIO GPIO peripheral.
+    /// The RP2040 SIO GPIO peripheral.
     sio: Sio,
+    /// The STM32-class GPIO peripheral (a second, independently-mapped port).
+    stm32: Stm32Gpio,
     /// Latched pending external IRQs (bit `n` ⇒ IRQ `n`).
     pending_irq: u32,
     /// Pending internal exceptions by exception number (e.g. `SVCall`).
@@ -121,8 +130,11 @@ impl CortexM {
             regs: [0; 16],
             apsr: Apsr::default(),
             primask: false,
+            itstate: 0,
+            suppress_value_flags: false,
             mem: vec![0; MEM_SIZE],
             sio: Sio::new(),
+            stm32: Stm32Gpio::new(),
             pending_irq: 0,
             pending_exc: 0,
             nvic_enabled: 0,
@@ -140,6 +152,8 @@ impl CortexM {
         self.regs = [0; 16];
         self.apsr = Apsr::default();
         self.primask = false;
+        self.itstate = 0;
+        self.suppress_value_flags = false;
         self.pending_irq = 0;
         self.pending_exc = 0;
         self.nvic_enabled = 0;
@@ -239,6 +253,15 @@ impl CortexM {
         &mut self.sio
     }
 
+    /// Shared access to the STM32-class GPIO peripheral.
+    pub fn stm32(&self) -> &Stm32Gpio {
+        &self.stm32
+    }
+    /// Mutable access to the STM32-class GPIO peripheral.
+    pub fn stm32_mut(&mut self) -> &mut Stm32Gpio {
+        &mut self.stm32
+    }
+
     // --- Memory access (flat RAM + SIO) ---
 
     /// Read a byte from flat memory (0 outside the modelled RAM).
@@ -256,10 +279,13 @@ impl CortexM {
         self.read_u8(addr) as u16 | (self.read_u8(addr.wrapping_add(1)) as u16) << 8
     }
 
-    /// Read a 32-bit word, routing the SIO window to the GPIO peripheral.
+    /// Read a 32-bit word, routing the GPIO windows to their peripherals.
     pub fn read_u32(&self, addr: u32) -> u32 {
         if Sio::claims(addr) {
             return self.sio.read(addr);
+        }
+        if Stm32Gpio::claims(addr) {
+            return self.stm32.read(addr);
         }
         self.read_u16(addr) as u32 | (self.read_u16(addr.wrapping_add(2)) as u32) << 16
     }
@@ -270,10 +296,14 @@ impl CortexM {
         self.write_u8_mem(addr.wrapping_add(1), (v >> 8) as u8);
     }
 
-    /// Write a word, routing the SIO window to the GPIO peripheral.
+    /// Write a word, routing the GPIO windows to their peripherals.
     pub fn write_u32(&mut self, addr: u32, v: u32) {
         if Sio::claims(addr) {
             self.sio.write(addr, v);
+            return;
+        }
+        if Stm32Gpio::claims(addr) {
+            self.stm32.write(addr, v);
             return;
         }
         self.write_u16(addr, v as u16);
@@ -424,6 +454,59 @@ impl CortexM {
         self.apsr.c = c;
         self.apsr.v = v;
     }
+
+    /// Whether a value-producing flag update should be applied: suppressed for a
+    /// 16-bit flag-setting data-processing instruction inside an `IT` block.
+    fn flags_enabled(&self) -> bool {
+        !self.suppress_value_flags
+    }
+
+    /// Set N/Z (and the shifter carry into C) for a shift result, honouring IT
+    /// suppression.
+    fn set_shift_flags(&mut self, r: u32, c: bool) {
+        if self.flags_enabled() {
+            self.set_nz(r);
+            self.apsr.c = c;
+        }
+    }
+
+    // --- IT (If-Then) block state (ARMv7-M) ---
+
+    /// Whether the next instruction falls inside an active `IT` block.
+    fn in_it_block(&self) -> bool {
+        self.itstate & 0x0F != 0
+    }
+
+    /// The condition code governing the current in-block instruction.
+    fn it_cond(&self) -> u8 {
+        (self.itstate >> 4) & 0xF
+    }
+
+    /// `ITAdvance`: step the `IT` state on after an in-block instruction.
+    fn it_advance(&mut self) {
+        if self.itstate & 0b111 == 0 {
+            self.itstate = 0;
+        } else {
+            self.itstate = (self.itstate & 0b1110_0000) | ((self.itstate << 1) & 0b0001_1111);
+        }
+    }
+}
+
+/// Apply a register shift with its shifter carry-out. `amt == 0` with `ROR`
+/// (`stype == 3`) is `RRX`; otherwise `amt` is the pre-decoded amount (LSR/ASR of
+/// `#0` already mapped to 32 by the decoder).
+fn shift_c(val: u32, stype: u8, amt: u32, carry_in: bool) -> (u32, bool) {
+    match stype {
+        0 => lsl_c(val, amt, carry_in),
+        1 => lsr_c(val, amt, carry_in),
+        2 => asr_c(val, amt, carry_in),
+        _ if amt == 0 => {
+            // RRX: rotate right one place through the carry.
+            let r = (val >> 1) | ((carry_in as u32) << 31);
+            (r, val & 1 != 0)
+        }
+        _ => ror_c(val, amt, carry_in),
+    }
 }
 
 /// `LSL` with shifter carry-out. A zero shift passes the carry through unchanged.
@@ -505,14 +588,14 @@ impl CortexM {
 
             Instr::MovImm { rd, imm, setflags } => {
                 self.set_reg(rd, imm);
-                if setflags {
+                if setflags && self.flags_enabled() {
                     self.set_nz(imm);
                 }
                 1
             }
             Instr::MovReg { rd, rm, setflags } => {
                 let v = self.reg(rm);
-                if setflags {
+                if setflags && self.flags_enabled() {
                     self.set_nz(v);
                 }
                 self.set_reg(rd, v);
@@ -530,7 +613,7 @@ impl CortexM {
                 setflags,
             } => {
                 let (r, c, v) = Self::add_with_carry(self.reg(rn), self.reg(rm), false);
-                if setflags {
+                if setflags && self.flags_enabled() {
                     self.set_nzcv(r, c, v);
                 }
                 self.set_reg(rd, r);
@@ -547,7 +630,7 @@ impl CortexM {
                 setflags,
             } => {
                 let (r, c, v) = Self::add_with_carry(self.reg(rn), imm, false);
-                if setflags {
+                if setflags && self.flags_enabled() {
                     self.set_nzcv(r, c, v);
                 }
                 self.set_reg(rd, r);
@@ -560,7 +643,7 @@ impl CortexM {
                 setflags,
             } => {
                 let (r, c, v) = Self::add_with_carry(self.reg(rn), !self.reg(rm), true);
-                if setflags {
+                if setflags && self.flags_enabled() {
                     self.set_nzcv(r, c, v);
                 }
                 self.set_reg(rd, r);
@@ -573,7 +656,7 @@ impl CortexM {
                 setflags,
             } => {
                 let (r, c, v) = Self::add_with_carry(self.reg(rn), !imm, true);
-                if setflags {
+                if setflags && self.flags_enabled() {
                     self.set_nzcv(r, c, v);
                 }
                 self.set_reg(rd, r);
@@ -581,19 +664,25 @@ impl CortexM {
             }
             Instr::Rsb { rd, rn } => {
                 let (r, c, v) = Self::add_with_carry(!self.reg(rn), 0, true);
-                self.set_nzcv(r, c, v);
+                if self.flags_enabled() {
+                    self.set_nzcv(r, c, v);
+                }
                 self.set_reg(rd, r);
                 1
             }
             Instr::Adc { rd, rm } => {
                 let (r, c, v) = Self::add_with_carry(self.reg(rd), self.reg(rm), self.apsr.c);
-                self.set_nzcv(r, c, v);
+                if self.flags_enabled() {
+                    self.set_nzcv(r, c, v);
+                }
                 self.set_reg(rd, r);
                 1
             }
             Instr::Sbc { rd, rm } => {
                 let (r, c, v) = Self::add_with_carry(self.reg(rd), !self.reg(rm), self.apsr.c);
-                self.set_nzcv(r, c, v);
+                if self.flags_enabled() {
+                    self.set_nzcv(r, c, v);
+                }
                 self.set_reg(rd, r);
                 1
             }
@@ -621,89 +710,94 @@ impl CortexM {
 
             Instr::And { rd, rm } => {
                 let r = self.reg(rd) & self.reg(rm);
-                self.set_nz(r);
+                if self.flags_enabled() {
+                    self.set_nz(r);
+                }
                 self.set_reg(rd, r);
                 1
             }
             Instr::Orr { rd, rm } => {
                 let r = self.reg(rd) | self.reg(rm);
-                self.set_nz(r);
+                if self.flags_enabled() {
+                    self.set_nz(r);
+                }
                 self.set_reg(rd, r);
                 1
             }
             Instr::Eor { rd, rm } => {
                 let r = self.reg(rd) ^ self.reg(rm);
-                self.set_nz(r);
+                if self.flags_enabled() {
+                    self.set_nz(r);
+                }
                 self.set_reg(rd, r);
                 1
             }
             Instr::Bic { rd, rm } => {
                 let r = self.reg(rd) & !self.reg(rm);
-                self.set_nz(r);
+                if self.flags_enabled() {
+                    self.set_nz(r);
+                }
                 self.set_reg(rd, r);
                 1
             }
             Instr::Mvn { rd, rm } => {
                 let r = !self.reg(rm);
-                self.set_nz(r);
+                if self.flags_enabled() {
+                    self.set_nz(r);
+                }
                 self.set_reg(rd, r);
                 1
             }
             Instr::Mul { rd, rm } => {
                 let r = self.reg(rd).wrapping_mul(self.reg(rm));
-                self.set_nz(r);
+                if self.flags_enabled() {
+                    self.set_nz(r);
+                }
                 self.set_reg(rd, r);
                 1
             }
 
             Instr::LslImm { rd, rm, imm } => {
                 let (r, c) = lsl_c(self.reg(rm), imm as u32, self.apsr.c);
-                self.set_nz(r);
-                self.apsr.c = c;
+                self.set_shift_flags(r, c);
                 self.set_reg(rd, r);
                 1
             }
             Instr::LsrImm { rd, rm, imm } => {
                 let shift = if imm == 0 { 32 } else { imm as u32 };
                 let (r, c) = lsr_c(self.reg(rm), shift, self.apsr.c);
-                self.set_nz(r);
-                self.apsr.c = c;
+                self.set_shift_flags(r, c);
                 self.set_reg(rd, r);
                 1
             }
             Instr::AsrImm { rd, rm, imm } => {
                 let shift = if imm == 0 { 32 } else { imm as u32 };
                 let (r, c) = asr_c(self.reg(rm), shift, self.apsr.c);
-                self.set_nz(r);
-                self.apsr.c = c;
+                self.set_shift_flags(r, c);
                 self.set_reg(rd, r);
                 1
             }
             Instr::LslReg { rd, rm } => {
                 let (r, c) = lsl_c(self.reg(rd), self.reg(rm) & 0xFF, self.apsr.c);
-                self.set_nz(r);
-                self.apsr.c = c;
+                self.set_shift_flags(r, c);
                 self.set_reg(rd, r);
                 1
             }
             Instr::LsrReg { rd, rm } => {
                 let (r, c) = lsr_c(self.reg(rd), self.reg(rm) & 0xFF, self.apsr.c);
-                self.set_nz(r);
-                self.apsr.c = c;
+                self.set_shift_flags(r, c);
                 self.set_reg(rd, r);
                 1
             }
             Instr::AsrReg { rd, rm } => {
                 let (r, c) = asr_c(self.reg(rd), self.reg(rm) & 0xFF, self.apsr.c);
-                self.set_nz(r);
-                self.apsr.c = c;
+                self.set_shift_flags(r, c);
                 self.set_reg(rd, r);
                 1
             }
             Instr::RorReg { rd, rm } => {
                 let (r, c) = ror_c(self.reg(rd), self.reg(rm) & 0xFF, self.apsr.c);
-                self.set_nz(r);
-                self.apsr.c = c;
+                self.set_shift_flags(r, c);
                 self.set_reg(rd, r);
                 1
             }
@@ -811,6 +905,185 @@ impl CortexM {
                 1
             }
 
+            // --- Thumb-2 (ARMv7-M) ---
+            Instr::DpImm {
+                op,
+                rd,
+                rn,
+                imm,
+                setflags,
+                carry,
+            } => {
+                let a = if rn == 15 && (op == 0b0010 || op == 0b0011) {
+                    0 // ORR/ORN with Rn==15 are MOV/MVN.
+                } else {
+                    self.reg(rn)
+                };
+                self.dp_apply(op, rd, a, imm, carry, setflags);
+                1
+            }
+            Instr::DpShiftReg {
+                op,
+                rd,
+                rn,
+                rm,
+                stype,
+                samt,
+                setflags,
+            } => {
+                let (b, shc) = shift_c(self.reg(rm), stype, samt as u32, self.apsr.c);
+                let a = if rn == 15 && (op == 0b0010 || op == 0b0011) {
+                    0
+                } else {
+                    self.reg(rn)
+                };
+                self.dp_apply(op, rd, a, b, Some(shc), setflags);
+                1
+            }
+            Instr::ShiftReg {
+                rd,
+                rn,
+                rm,
+                stype,
+                setflags,
+            } => {
+                let (r, c) = shift_c(self.reg(rn), stype, self.reg(rm) & 0xFF, self.apsr.c);
+                if setflags && self.flags_enabled() {
+                    self.set_nz(r);
+                    self.apsr.c = c;
+                }
+                self.set_reg(rd, r);
+                1
+            }
+
+            Instr::Movw { rd, imm } => {
+                self.set_reg(rd, imm);
+                1
+            }
+            Instr::Movt { rd, imm } => {
+                let v = (self.reg(rd) & 0x0000_FFFF) | (imm << 16);
+                self.set_reg(rd, v);
+                1
+            }
+
+            Instr::Ubfx { rd, rn, lsb, width } => {
+                let r = bitfield_mask(width) & (self.reg(rn) >> lsb);
+                self.set_reg(rd, r);
+                1
+            }
+            Instr::Sbfx { rd, rn, lsb, width } => {
+                let field = bitfield_mask(width) & (self.reg(rn) >> lsb);
+                // Sign-extend from bit (width - 1).
+                let shift = 32 - width as u32;
+                let r = ((field << shift) as i32 >> shift) as u32;
+                self.set_reg(rd, r);
+                1
+            }
+            Instr::Bfi { rd, rn, lsb, width } => {
+                let mask = bitfield_mask(width) << lsb;
+                let ins = (self.reg(rn) << lsb) & mask;
+                let r = (self.reg(rd) & !mask) | ins;
+                self.set_reg(rd, r);
+                1
+            }
+            Instr::Bfc { rd, lsb, width } => {
+                let mask = bitfield_mask(width) << lsb;
+                let r = self.reg(rd) & !mask;
+                self.set_reg(rd, r);
+                1
+            }
+
+            Instr::Mul32 { rd, rn, rm } => {
+                let r = self.reg(rn).wrapping_mul(self.reg(rm));
+                self.set_reg(rd, r);
+                1
+            }
+            Instr::Mla { rd, rn, rm, ra } => {
+                let r = self
+                    .reg(ra)
+                    .wrapping_add(self.reg(rn).wrapping_mul(self.reg(rm)));
+                self.set_reg(rd, r);
+                2
+            }
+            Instr::Mls { rd, rn, rm, ra } => {
+                let r = self
+                    .reg(ra)
+                    .wrapping_sub(self.reg(rn).wrapping_mul(self.reg(rm)));
+                self.set_reg(rd, r);
+                2
+            }
+            Instr::Umull { rdlo, rdhi, rn, rm } => {
+                let p = (self.reg(rn) as u64).wrapping_mul(self.reg(rm) as u64);
+                self.set_reg(rdlo, p as u32);
+                self.set_reg(rdhi, (p >> 32) as u32);
+                2
+            }
+            Instr::Smull { rdlo, rdhi, rn, rm } => {
+                let p = (self.reg(rn) as i32 as i64).wrapping_mul(self.reg(rm) as i32 as i64);
+                self.set_reg(rdlo, p as u32);
+                self.set_reg(rdhi, (p >> 32) as u32);
+                2
+            }
+
+            Instr::Clz { rd, rm } => {
+                self.set_reg(rd, self.reg(rm).leading_zeros());
+                1
+            }
+            Instr::Rbit { rd, rm } => {
+                self.set_reg(rd, self.reg(rm).reverse_bits());
+                1
+            }
+
+            Instr::MemD {
+                load,
+                rt,
+                rt2,
+                rn,
+                imm,
+                add,
+                index,
+                wback,
+            } => self.exec_mem_d(load, rt, rt2, rn, imm, add, index, wback),
+
+            Instr::StmW {
+                rn,
+                regs,
+                wback,
+                db,
+            } => self.exec_stm_w(rn, regs, wback, db),
+            Instr::LdmW {
+                rn,
+                regs,
+                wback,
+                db,
+            } => self.exec_ldm_w(rn, regs, wback, db),
+
+            Instr::Mrs { rd, sysm } => {
+                let v = match sysm {
+                    // Program status (APSR/IPSR/EPSR view): the condition flags.
+                    0..=3 => self.apsr.to_xpsr(),
+                    // PRIMASK.
+                    16 => self.primask as u32,
+                    _ => 0,
+                };
+                self.set_reg(rd, v);
+                1
+            }
+            Instr::Msr { rn, sysm } => {
+                let v = self.reg(rn);
+                match sysm {
+                    0..=3 => self.apsr.load_xpsr(v),
+                    16 => self.primask = v & 1 != 0,
+                    _ => {}
+                }
+                1
+            }
+
+            Instr::It { firstcond, mask } => {
+                self.itstate = (firstcond << 4) | mask;
+                1
+            }
+
             Instr::Unknown(word) => {
                 debug_assert!(
                     false,
@@ -912,6 +1185,170 @@ impl CortexM {
         }
         1 + regs.count_ones() as u64
     }
+
+    /// Apply a data-processing operation (the shared `op` map of [`Instr::DpImm`]
+    /// / [`Instr::DpShiftReg`]) with second operand `b`. `a` is the first-operand
+    /// value (already zeroed for the MOV/MVN aliases). `shift_carry` is the
+    /// shifter carry-out used by the logical forms (`None` leaves `C`). A `rd`
+    /// of 15 on a comparison opcode discards the result (TST/TEQ/CMN/CMP).
+    #[allow(clippy::too_many_arguments)]
+    fn dp_apply(
+        &mut self,
+        op: u8,
+        rd: u8,
+        a: u32,
+        b: u32,
+        shift_carry: Option<bool>,
+        setflags: bool,
+    ) {
+        let set = setflags && self.flags_enabled();
+        // Logical ops share N/Z + (optional) shifter C; arithmetic ops use NZCV.
+        let logical = |s: &mut Self, r: u32, write: bool| {
+            if set {
+                s.set_nz(r);
+                if let Some(c) = shift_carry {
+                    s.apsr.c = c;
+                }
+            }
+            if write {
+                s.set_reg(rd, r);
+            }
+        };
+        match op {
+            0b0000 => logical(self, a & b, rd != 15), // AND / TST
+            0b0001 => logical(self, a & !b, true),    // BIC
+            0b0010 => logical(self, a | b, true),     // ORR / MOV
+            0b0011 => logical(self, a | !b, true),    // ORN / MVN
+            0b0100 => logical(self, a ^ b, rd != 15), // EOR / TEQ
+            _ => {
+                let (r, c, v) = match op {
+                    0b1000 => Self::add_with_carry(a, b, false), // ADD / CMN
+                    0b1010 => Self::add_with_carry(a, b, self.apsr.c), // ADC
+                    0b1011 => Self::add_with_carry(a, !b, self.apsr.c), // SBC
+                    0b1101 => Self::add_with_carry(a, !b, true), // SUB / CMP
+                    0b1110 => Self::add_with_carry(!a, b, true), // RSB
+                    _ => (0, false, false),
+                };
+                if set {
+                    self.set_nzcv(r, c, v);
+                }
+                // ADD/SUB with rd==15 on an S-form is the CMN/CMP comparison.
+                let is_cmp = (op == 0b1000 || op == 0b1101) && rd == 15;
+                if !is_cmp {
+                    self.set_reg(rd, r);
+                }
+            }
+        }
+    }
+
+    /// `LDRD`/`STRD` (two consecutive words).
+    #[allow(clippy::too_many_arguments)]
+    fn exec_mem_d(
+        &mut self,
+        load: bool,
+        rt: u8,
+        rt2: u8,
+        rn: u8,
+        imm: u32,
+        add: bool,
+        index: bool,
+        wback: bool,
+    ) -> u64 {
+        let base = if rn == PC {
+            self.reg(PC) & !0b11
+        } else {
+            self.reg(rn)
+        };
+        let offset_addr = if add {
+            base.wrapping_add(imm)
+        } else {
+            base.wrapping_sub(imm)
+        };
+        let addr = if index { offset_addr } else { base };
+        if load {
+            let v1 = self.read_u32(addr);
+            let v2 = self.read_u32(addr.wrapping_add(4));
+            self.set_reg(rt, v1);
+            self.set_reg(rt2, v2);
+        } else {
+            self.store(addr, Size::Word, self.reg(rt));
+            self.store(addr.wrapping_add(4), Size::Word, self.reg(rt2));
+        }
+        if wback {
+            self.set_reg(rn, offset_addr);
+        }
+        3
+    }
+
+    /// Wide `STM`/`STMDB` (full 16-bit register list, optional writeback).
+    fn exec_stm_w(&mut self, rn: u8, regs: u16, wback: bool, db: bool) -> u64 {
+        let n = regs.count_ones();
+        let start = self.reg(rn);
+        let lowest = if db { start.wrapping_sub(4 * n) } else { start };
+        let mut addr = lowest;
+        for r in 0..16u8 {
+            if regs & (1 << r) != 0 {
+                self.write_u32(addr, self.regs[r as usize]);
+                addr = addr.wrapping_add(4);
+            }
+        }
+        if wback {
+            let new = if db {
+                lowest
+            } else {
+                start.wrapping_add(4 * n)
+            };
+            self.set_reg(rn, new);
+        }
+        1 + n as u64
+    }
+
+    /// Wide `LDM`/`LDMDB` (full 16-bit register list, optional writeback). A `PC`
+    /// in the list branches (or returns from an exception on an `EXC_RETURN`).
+    fn exec_ldm_w(&mut self, rn: u8, regs: u16, wback: bool, db: bool) -> u64 {
+        let n = regs.count_ones();
+        let start = self.reg(rn);
+        let lowest = if db { start.wrapping_sub(4 * n) } else { start };
+        let mut addr = lowest;
+        let mut pc_target = None;
+        for r in 0..16u8 {
+            if regs & (1 << r) != 0 {
+                let v = self.read_u32(addr);
+                if r == PC {
+                    pc_target = Some(v);
+                } else {
+                    self.regs[r as usize] = v;
+                }
+                addr = addr.wrapping_add(4);
+            }
+        }
+        // Writeback (only when the base is not in the loaded list).
+        if wback && regs & (1 << rn) == 0 {
+            let new = if db {
+                lowest
+            } else {
+                start.wrapping_add(4 * n)
+            };
+            self.set_reg(rn, new);
+        }
+        if let Some(target) = pc_target {
+            if target >= 0xF000_0000 {
+                self.exception_return();
+            } else {
+                self.set_reg(PC, target);
+            }
+        }
+        1 + n as u64
+    }
+}
+
+/// A right-justified mask of `width` low bits (`width` in `1..=32`).
+fn bitfield_mask(width: u8) -> u32 {
+    if width >= 32 {
+        0xFFFF_FFFF
+    } else {
+        (1u32 << width) - 1
+    }
 }
 
 impl McuCore for CortexM {
@@ -927,7 +1364,25 @@ impl McuCore for CortexM {
         let w1 = self.read_u16(addr.wrapping_add(2));
         let (instr, len) = decode(w0, w1);
         self.regs[PC as usize] = addr.wrapping_add(len as u32);
-        let cycles = self.execute(instr);
+
+        // IT-block gating (ARMv7-M): the IT instruction itself is never gated or
+        // advanced; it only sets up the state for the instructions that follow.
+        if matches!(instr, Instr::It { .. }) {
+            self.suppress_value_flags = false;
+            let cycles = self.execute(instr);
+            self.cycles += cycles;
+            return;
+        }
+        let in_it = self.in_it_block();
+        let cond = if in_it { self.it_cond() } else { 0b1110 };
+        let passed = cond_holds(cond, self.apsr);
+        // A 16-bit flag-setting data-processing form has its S implicitly cleared
+        // inside an IT block; comparisons still set flags.
+        self.suppress_value_flags = in_it && len == 2;
+        if in_it {
+            self.it_advance();
+        }
+        let cycles = if passed { self.execute(instr) } else { 1 };
         self.cycles += cycles;
     }
 
@@ -956,20 +1411,22 @@ impl McuCore for CortexM {
     }
 
     fn pin_count(&self) -> usize {
-        PIN_COUNT
+        PIN_COUNT + STM32_PIN_COUNT
     }
 
     fn next_event(&self) -> Option<u64> {
-        // The modelled SIO has no scheduled events; the core free-runs.
+        // The modelled GPIO blocks have no scheduled events; the core free-runs.
         None
     }
 
     fn step_to_cycle(&mut self, until_cycle: u64, io: &mut PinIo) -> u64 {
         self.sio.sample_inputs(io);
+        self.stm32.sample_inputs(io);
         while self.cycles < until_cycle {
             self.step();
         }
         self.sio.publish_drives(io);
+        self.stm32.publish_drives(io);
         self.cycles
     }
 }
@@ -980,13 +1437,21 @@ impl CortexM {
     /// [`step_to_cycle`](McuCore::step_to_cycle).
     pub fn step_with_io(&mut self, io: &mut PinIo) {
         self.sio.sample_inputs(io);
+        self.stm32.sample_inputs(io);
         self.step();
         self.sio.publish_drives(io);
+        self.stm32.publish_drives(io);
     }
 
-    /// The resolved logic level on `GPIO<n>` (convenience for tests/boards).
+    /// The resolved logic level on SIO `GPIO<n>` (convenience for tests/boards).
     pub fn gpio_level(&self, gpio: u8) -> bool {
         self.sio.pin_level(gpio)
+    }
+
+    /// The resolved logic level on STM32 `P<port>`-bit `n` (convenience for the
+    /// STM32 board / tests).
+    pub fn stm32_level(&self, bit: u8) -> bool {
+        self.stm32.pin_level(bit)
     }
 }
 
@@ -1197,6 +1662,240 @@ mod tests {
         c.set_clock_hz(1_000_000.0);
         c.step_to(100e-6);
         assert!(c.cycles() >= 100, "ran at least 100 cycles: {}", c.cycles());
+    }
+
+    // --- Thumb-2 (ARMv7-M) per-instruction vectors ---
+
+    #[test]
+    fn t2_add_immediate_modified() {
+        // ADD.W r0, r1, #0x12 = 0xF101 0x0012.
+        let mut c = with_program(&[0xF101, 0x0012]);
+        c.set_reg_raw(1, 0x20);
+        c.step();
+        assert_eq!(c.reg(0), 0x32);
+    }
+
+    #[test]
+    fn t2_and_immediate_sets_flags() {
+        // ANDS.W r0, r1, #0xFF = 0xF011 0x00FF.
+        let mut c = with_program(&[0xF011, 0x00FF]);
+        c.set_reg_raw(1, 0x1234);
+        c.step();
+        assert_eq!(c.reg(0), 0x34);
+        assert!(!c.apsr().z);
+        // ANDS r1 with a zero result sets Z.
+        let mut c = with_program(&[0xF011, 0x00FF]);
+        c.set_reg_raw(1, 0x1200);
+        c.step();
+        assert_eq!(c.reg(0), 0);
+        assert!(c.apsr().z);
+    }
+
+    #[test]
+    fn t2_mov_mvn_via_orr_orn() {
+        // MOV.W r0, #0x7F (ORR with Rn=15) = 0xF04F 0x007F.
+        let mut c = with_program(&[0xF04F, 0x007F]);
+        c.step();
+        assert_eq!(c.reg(0), 0x7F);
+        // MVN.W r0, #0 (ORN with Rn=15) = 0xF06F 0x0000 → 0xFFFFFFFF.
+        let mut c = with_program(&[0xF06F, 0x0000]);
+        c.step();
+        assert_eq!(c.reg(0), 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn t2_add_shifted_register() {
+        // ADD.W r0, r1, r2, LSL #4 = 0xEB01 0x1002.
+        let mut c = with_program(&[0xEB01, 0x1002]);
+        c.set_reg_raw(1, 0x10);
+        c.set_reg_raw(2, 0x02);
+        c.step();
+        assert_eq!(c.reg(0), 0x10 + 0x20);
+    }
+
+    #[test]
+    fn t2_mul_and_mla() {
+        // MUL r0, r1, r2 = 0xFB01 0xF002.
+        let mut c = with_program(&[0xFB01, 0xF002]);
+        c.set_reg_raw(1, 6);
+        c.set_reg_raw(2, 7);
+        c.step();
+        assert_eq!(c.reg(0), 42);
+        // MLA r0, r1, r2, r3 = 0xFB01 0x3002 → r0 = r3 + r1*r2.
+        let mut c = with_program(&[0xFB01, 0x3002]);
+        c.set_reg_raw(1, 3);
+        c.set_reg_raw(2, 4);
+        c.set_reg_raw(3, 5);
+        c.step();
+        assert_eq!(c.reg(0), 5 + 12);
+    }
+
+    #[test]
+    fn t2_long_multiplies() {
+        // UMULL r0, r1, r2, r3 = 0xFBA2 0x0103.
+        let mut c = with_program(&[0xFBA2, 0x0103]);
+        c.set_reg_raw(2, 0x1_0000);
+        c.set_reg_raw(3, 0x1_0000);
+        c.step();
+        assert_eq!(c.reg(0), 0x0000_0000, "low word");
+        assert_eq!(c.reg(1), 0x0000_0001, "high word");
+        // SMULL r0, r1, r2, r3 = 0xFB82 0x0103 with a negative operand.
+        let mut c = with_program(&[0xFB82, 0x0103]);
+        c.set_reg_raw(2, (-2i32) as u32);
+        c.set_reg_raw(3, 3);
+        c.step();
+        assert_eq!(c.reg(0), (-6i32) as u32, "low word");
+        assert_eq!(c.reg(1), 0xFFFF_FFFF, "sign-extended high word");
+    }
+
+    #[test]
+    fn t2_bitfield_extract_and_insert() {
+        // UBFX r0, r1, #4, #8 = 0xF3C1 0x1007.
+        let mut c = with_program(&[0xF3C1, 0x1007]);
+        c.set_reg_raw(1, 0xABCD);
+        c.step();
+        assert_eq!(c.reg(0), 0xBC);
+        // BFI r0, r1, #4, #8 = 0xF361 0x100B → insert r1[7:0] into r0[11:4].
+        let mut c = with_program(&[0xF361, 0x100B]);
+        c.set_reg_raw(0, 0xFFFF_FFFF);
+        c.set_reg_raw(1, 0x0000_00A5);
+        c.step();
+        assert_eq!(c.reg(0), 0xFFFF_FA5F);
+    }
+
+    #[test]
+    fn t2_movw_movt_build_a_word() {
+        // MOVW r0, #0x1234 ; MOVT r0, #0xABCD → 0xABCD1234.
+        let mut c = with_program(&[0xF241, 0x2034, 0xF6CA, 0x30CD]);
+        c.step();
+        assert_eq!(c.reg(0), 0x1234);
+        c.step();
+        assert_eq!(c.reg(0), 0xABCD_1234);
+    }
+
+    #[test]
+    fn t2_clz_and_rbit() {
+        // CLZ r0, r1 = 0xFAB1 0xF081.
+        let mut c = with_program(&[0xFAB1, 0xF081]);
+        c.set_reg_raw(1, 0x00FF_FFFF);
+        c.step();
+        assert_eq!(c.reg(0), 8);
+        // RBIT r0, r1 = 0xFA91 0xF0A1.
+        let mut c = with_program(&[0xFA91, 0xF0A1]);
+        c.set_reg_raw(1, 1);
+        c.step();
+        assert_eq!(c.reg(0), 0x8000_0000);
+    }
+
+    #[test]
+    fn t2_ldr_str_word_offset() {
+        // STR.W r1, [r0, #0x10] ; LDR.W r2, [r0, #0x10].
+        let mut c = with_program(&[0xF8C0, 0x1010, 0xF8D0, 0x2010]);
+        c.set_reg_raw(0, 0x2000);
+        c.set_reg_raw(1, 0xCAFE);
+        c.step();
+        assert_eq!(c.read_u32(0x2010), 0xCAFE);
+        c.step();
+        assert_eq!(c.reg(2), 0xCAFE);
+    }
+
+    #[test]
+    fn t2_ldrd_strd_round_trip() {
+        // STRD r2, r3, [r0, #8] ; LDRD r4, r5, [r0, #8].
+        let mut c = with_program(&[0xE9C0, 0x2302, 0xE9D0, 0x4502]);
+        c.set_reg_raw(0, 0x3000);
+        c.set_reg_raw(2, 0xAAAA);
+        c.set_reg_raw(3, 0xBBBB);
+        c.step();
+        assert_eq!(c.read_u32(0x3008), 0xAAAA);
+        assert_eq!(c.read_u32(0x300C), 0xBBBB);
+        c.step();
+        assert_eq!(c.reg(4), 0xAAAA);
+        assert_eq!(c.reg(5), 0xBBBB);
+    }
+
+    #[test]
+    fn t2_ldm_stm_wide_round_trip() {
+        // STMIA.W r0!, {r1,r2,r3} = 0xE8A0 0x000E ;
+        // LDMIA.W r4!, {r5,r6,r7} = 0xE8B4 0x00E0.
+        let mut c = with_program(&[0xE8A0, 0x000E, 0xE8B4, 0x00E0]);
+        c.set_reg_raw(0, 0x1000);
+        c.set_reg_raw(1, 0x11);
+        c.set_reg_raw(2, 0x22);
+        c.set_reg_raw(3, 0x33);
+        c.step(); // STMIA.W r0!
+        assert_eq!(c.read_u32(0x1000), 0x11);
+        assert_eq!(c.read_u32(0x1004), 0x22);
+        assert_eq!(c.read_u32(0x1008), 0x33);
+        assert_eq!(c.reg(0), 0x100C, "base written back");
+        c.set_reg_raw(4, 0x1000);
+        c.step(); // LDMIA.W r4!
+        assert_eq!(c.reg(5), 0x11);
+        assert_eq!(c.reg(6), 0x22);
+        assert_eq!(c.reg(7), 0x33);
+        assert_eq!(c.reg(4), 0x100C);
+    }
+
+    #[test]
+    fn t2_it_block_then_and_else() {
+        // MOVS r1,#5 ; CMP r1,#5 ; ITE EQ ; MOVEQ r0,#1 ; MOVNE r0,#2.
+        let prog = [0x2105, 0x2905, 0xBF0C, 0x2001, 0x2002];
+        // Equal path → the THEN instruction runs, r0 = 1.
+        let mut c = with_program(&prog);
+        run(&mut c, 5);
+        assert_eq!(c.reg(0), 1, "EQ taken: THEN ran");
+
+        // Not-equal path → the ELSE instruction runs, r0 = 2.
+        let not_equal = [0x2104, 0x2905, 0xBF0C, 0x2001, 0x2002];
+        let mut c = with_program(&not_equal);
+        run(&mut c, 5);
+        assert_eq!(c.reg(0), 2, "NE taken: ELSE ran");
+    }
+
+    #[test]
+    fn t2_mrs_msr_round_trip_primask() {
+        // MSR PRIMASK, r1 ; MRS r0, PRIMASK.
+        // MSR PRIMASK, r1 = 0xF381 0x8810 ; MRS r0, PRIMASK = 0xF3EF 0x8010.
+        let mut c = with_program(&[0xF381, 0x8810, 0xF3EF, 0x8010]);
+        c.set_reg_raw(1, 1);
+        c.step(); // MSR PRIMASK, r1 → PRIMASK = 1
+        c.step(); // MRS r0, PRIMASK
+        assert_eq!(c.reg(0), 1, "PRIMASK written then read back");
+    }
+
+    #[test]
+    fn t2_small_program_reaches_expected_state() {
+        // MOVW r0,#0x5678 ; MOVT r0,#0x1234 ; RBIT r1,r0 ; CLZ r2,r0 ;
+        // UBFX r3,r0,#4,#8.
+        let prog = [
+            0xF245, 0x6078, // MOVW r0,#0x5678
+            0xF2C1, 0x2034, // MOVT r0,#0x1234
+            0xFA90, 0xF1A0, // RBIT r1,r0
+            0xFAB0, 0xF280, // CLZ  r2,r0
+            0xF3C0, 0x1307, // UBFX r3,r0,#4,#8
+        ];
+        let mut c = with_program(&prog);
+        run(&mut c, 5);
+        assert_eq!(c.reg(0), 0x1234_5678);
+        assert_eq!(c.reg(1), 0x1234_5678u32.reverse_bits());
+        assert_eq!(c.reg(2), 3, "leading zeros of 0x12345678");
+        assert_eq!(c.reg(3), 0x67);
+    }
+
+    #[test]
+    fn t2_bw_wide_branch() {
+        // B.W skips a MOVS, so r0 stays 0.
+        //  0: B.W +4 (to 0x8)   (encoding T4)
+        //  4: MOVS r0,#0xFF     0x20FF  (skipped)
+        //  6: (filler)
+        //  8: MOVS r1,#0x11     0x2111
+        // B.W to PC(0+4)+4 = 8 → offset 4. T4: 0xF000 0xB802.
+        let mut c = with_program(&[0xF000, 0xB802, 0x20FF, 0x0000, 0x2111]);
+        c.step(); // B.W
+        assert_eq!(c.pc_raw(), 8);
+        c.step(); // MOVS r1,#0x11
+        assert_eq!(c.reg(1), 0x11);
+        assert_eq!(c.reg(0), 0, "the skipped MOVS never ran");
     }
 
     #[test]

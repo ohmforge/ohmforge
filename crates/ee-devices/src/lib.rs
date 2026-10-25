@@ -134,12 +134,13 @@ impl BoardDef {
         }
     }
 
-    /// An **STM32** ("Blue Pill", STM32F103) manifest (catalog **stub**).
+    /// An **STM32** ("Blue Pill", STM32F103) manifest.
     ///
     /// The pin map records the port-A/B/C GPIO header (`P<port><bit>`) and the
-    /// on-board LED on PC13. Like [`esp32`](Self::esp32) this is a manifest entry
-    /// only — there is **no runnable STM32 (Cortex-M3) core** wired up here, so the
-    /// board catalogs and pin-maps but does not execute firmware yet.
+    /// on-board LED on PC13. Unlike [`esp32`](Self::esp32), this board is now
+    /// **runnable**: `ee-mcu`'s `cortexm::board::Stm32` executes a Cortex-M3/M4
+    /// Thumb-2 core with an STM32-class GPIO peripheral (the LED port, PC13). The
+    /// catalog records the wider header; the runnable core models GPIOC.
     pub fn stm32() -> Self {
         let mut pins = Vec::new();
         for bit in 0u8..=15 {
@@ -212,7 +213,9 @@ mod tests {
     }
 
     #[test]
-    fn esp32_and_stm32_are_pin_mapped_stubs() {
+    fn esp32_and_stm32_are_pin_mapped() {
+        // ESP32 is still a catalog-only stub; STM32 is now runnable in `ee-mcu`,
+        // but its catalog manifest is unchanged (pin map + onboard LED on PC13).
         let esp = BoardDef::esp32();
         assert_eq!(esp.mcu, "esp32");
         assert!(esp.pins.contains(&"D2=GPIO2".to_string()));
