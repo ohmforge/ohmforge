@@ -124,7 +124,7 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 - [ ] **CP-SIM-M4.3** (sim-core) Multithreaded analyses (MC/sweep), native-gated, deterministic. — *gate:* single- vs multi-threaded identical results + a measured speedup.
 - [ ] **CP-BRD-M4.1** (boards) Cortex-M3/M4 (Thumb-2) STM32-class core. — *gate:* Thumb-2 instruction vectors + an STM32 blink.
 - [ ] **CP-AF-M4.1** (ai-fmt) SPICE `.model` import + a small vendor model library. — *gate:* a `.model`-parameterized device simulates with the given params; the catalog resolves known parts.
-- [ ] **CP-UX-M4.1** (ui-shell) Instrument/block plugin surface + session export. — *gate:* a custom block runs in a patch; a session round-trips identically.
+- [x] **CP-UX-M4.1** (ui-shell) Instrument/block plugin surface + session export. — *gate:* `plugin_block_evaluates_and_composes_with_builtins` (a `ProcessingBlock` trait obj in a patch) + `session_round_trip_is_equivalent` (circuit+probes+checkpoints export→import identical; `save`/`load` commands). ee-shell reuses ee-fmt's project format (acyclic).
 - [x] **CP-WEB.2** (web) Shareable/publishable circuit via a URL fragment. — *gate:* hand-rolled URL-safe base64url `encode`/`decode` round-trips exactly (comments/CRLF/unicode; garbage → clean Err); page reads `location.hash` → loads+runs, "Copy link" sets+copies it; decoded link runs through `run()`. 11 host tests, no dep.
 
 ---
@@ -135,11 +135,11 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 |---|---|---|---|
 | sim-core | 16 | 0 | 19 |
 | boards | 12 | 0 | 13 |
-| ui-shell | 14 | 0 | 15 |
+| ui-shell | 15 | 0 | 15 |
 | ai-fmt | 11 | 0 | 12 |
 | platform | 6 | 0 | 6 |
 | web | 2 | 0 | 2 |
-| **Total** | **61** | **0** | **67** |
+| **Total** | **62** | **0** | **67** |
 
 _**60/60 — M0, M1, M2, and M3 all complete**, tagged **v0.1.0**. M3 added the dataflow patcher, HDL-lite, manifest boards + drop-in modules, behavioral/expression sources, a tutor with graded challenges, Fritzing export, and a **WebAssembly browser front end** (`ee-web`). The roadmap horizon beyond here is M4 (sparse-KLU/multithread, collaborative sessions, plugin API, QEMU full-SBC bridge)._
 
