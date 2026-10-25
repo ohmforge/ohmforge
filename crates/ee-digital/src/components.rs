@@ -50,6 +50,41 @@ pub struct RippleCounter {
     pub q: Vec<Net>,
 }
 
+/// One driver on a tri-state bus: a `data` net gated by an active-high `enable`.
+///
+/// When `enable` is high the driver contributes `data` to the bus; when low it
+/// releases the bus (high-impedance `Z`); an unknown `enable` contributes `X`.
+#[derive(Debug, Clone, Copy)]
+pub struct TriStateDriver {
+    /// The level this driver would put on the bus when enabled.
+    pub data: Net,
+    /// Active-high output-enable.
+    pub enable: Net,
+}
+
+/// Add a **tri-state bus**: wire one [`TriState`](GateKind::TriState) buffer per
+/// `drivers` entry onto a single shared net, each with propagation `delay`, and
+/// return that bus net.
+///
+/// The bus level is the [resolution](Logic::resolve) of every enabled driver, so
+/// it behaves exactly as hardware wired-together tri-state outputs do: with one
+/// driver enabled the bus takes its value; with several enabled it takes their
+/// agreed value, or `X` where they conflict; with none enabled the bus floats
+/// (`Z`). This is the `CP-BRD-M3.1` bus acceptance gate.
+pub fn add_tristate_bus(sim: &mut Sim, drivers: &[TriStateDriver], delay: Femtos) -> Net {
+    let bus = sim.add_net();
+    for d in drivers {
+        sim.add_gate(
+            GateKind::TriState,
+            &[d.data, d.enable],
+            bus,
+            delay,
+            Logic::Z,
+        );
+    }
+    bus
+}
+
 /// Add a `width`-bit ripple counter with per-flip-flop propagation `delay`.
 ///
 /// Each stage is a JK flip-flop with `J = K = 1` (a toggle flip-flop). Stage 0 is
@@ -93,7 +128,7 @@ pub fn add_ripple_counter(sim: &mut Sim, width: usize, delay: Femtos) -> RippleC
 
 #[cfg(test)]
 mod tests {
-    use super::{add_mux2, add_mux4, add_ripple_counter};
+    use super::{add_mux2, add_mux4, add_ripple_counter, add_tristate_bus, TriStateDriver};
     use crate::{Logic, Net, Sim};
 
     const D: u64 = 10; // per-cell propagation delay, in fs
@@ -195,6 +230,58 @@ mod tests {
             // After 2^WIDTH ticks the counter has wrapped back to zero.
             assert_eq!(count(&sim, &c.q), 0, "counter did not wrap (lap {lap})");
         }
+    }
+
+    #[test]
+    fn tristate_bus_resolves_two_drivers() {
+        // Two drivers with opposing data values share a bus via tri-state
+        // buffers. The acceptance gate: one enabled → its value; both enabled →
+        // X (conflict); neither → Z (floating).
+        let mut sim = Sim::new();
+        let (d0, e0) = (sim.add_net(), sim.add_net());
+        let (d1, e1) = (sim.add_net(), sim.add_net());
+        sim.add_input(d0, Logic::High); // driver 0 would drive High
+        sim.add_input(d1, Logic::Low); // driver 1 would drive Low
+        let de0 = sim.add_input(e0, Logic::Low);
+        let de1 = sim.add_input(e1, Logic::Low);
+        let bus = add_tristate_bus(
+            &mut sim,
+            &[
+                TriStateDriver {
+                    data: d0,
+                    enable: e0,
+                },
+                TriStateDriver {
+                    data: d1,
+                    enable: e1,
+                },
+            ],
+            D,
+        );
+
+        // Neither enabled → the bus floats.
+        sim.run_until(2 * D);
+        assert_eq!(sim.value(bus), Logic::Z, "no driver enabled → Z");
+
+        // Enable driver 0 only → bus takes its High.
+        sim.set_input(de0, Logic::High, 10 * D);
+        sim.run_until(12 * D);
+        assert_eq!(sim.value(bus), Logic::High, "driver 0 alone drives High");
+
+        // Enable driver 1 too → High vs Low conflict → X.
+        sim.set_input(de1, Logic::High, 20 * D);
+        sim.run_until(22 * D);
+        assert_eq!(sim.value(bus), Logic::X, "both drivers conflict → X");
+
+        // Disable driver 0, leaving driver 1 → bus takes its Low.
+        sim.set_input(de0, Logic::Low, 30 * D);
+        sim.run_until(32 * D);
+        assert_eq!(sim.value(bus), Logic::Low, "driver 1 alone drives Low");
+
+        // Disable both again → back to floating.
+        sim.set_input(de1, Logic::Low, 40 * D);
+        sim.run_until(42 * D);
+        assert_eq!(sim.value(bus), Logic::Z, "both released → Z");
     }
 
     #[test]

@@ -33,6 +33,7 @@
 //! ```
 
 use crate::event::{EventQueue, Femtos};
+use crate::hdl::{Expr, Ram, Rom, TruthTable};
 use crate::seq::{FlipFlop, SeqElement};
 use crate::Logic;
 
@@ -54,6 +55,11 @@ pub struct GateId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SeqId(pub usize);
 
+/// An HDL-lite block (truth table, expression logic, ROM, or RAM) instance,
+/// addressed by index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BlockId(pub usize);
+
 /// Something that reads a net and must be re-evaluated when that net changes: a
 /// combinational [`Gate`] or a sequential [`SeqElement`]. Stored per-net in
 /// registration order so propagation stays deterministic.
@@ -61,6 +67,7 @@ pub struct SeqId(pub usize);
 enum Sink {
     Gate(GateId),
     Seq(SeqId),
+    Block(BlockId),
 }
 
 /// The built-in combinational gate kinds. Each reduces its input levels with the
@@ -144,6 +151,45 @@ struct Gate {
     last_output: Logic,
 }
 
+/// The behaviour backing an HDL-lite [`Block`]: a data-defined transfer function
+/// from the block's input levels to its output levels.
+#[derive(Debug, Clone)]
+enum BlockKind {
+    /// A combinational truth table.
+    Table(TruthTable),
+    /// One boolean expression per output bit (LSB-first), over the input nets.
+    Exprs(Vec<Expr>),
+    /// A read-only memory: inputs are the address lines, outputs the data word.
+    Rom(Rom),
+    /// A writable RAM: inputs are `[addr.., data_in.., we]`, outputs the word.
+    Ram(Ram),
+}
+
+impl BlockKind {
+    /// Evaluate the block over its inputs' resolved levels, producing one level
+    /// per output. Only [`Ram`] mutates (its stored cells), hence `&mut self`.
+    fn eval(&mut self, inputs: &[Logic]) -> Vec<Logic> {
+        match self {
+            BlockKind::Table(t) => t.eval(inputs),
+            BlockKind::Exprs(es) => es.iter().map(|e| e.eval(inputs)).collect(),
+            BlockKind::Rom(r) => r.eval(inputs),
+            BlockKind::Ram(r) => r.eval(inputs),
+        }
+    }
+}
+
+/// A placed HDL-lite block: reads `inputs`, drives `outputs` a `delay` later.
+#[derive(Debug, Clone)]
+struct Block {
+    kind: BlockKind,
+    inputs: Vec<Net>,
+    outputs: Vec<DriverId>,
+    delay: Femtos,
+    /// The last level each output scheduled (or its reset value), so a
+    /// re-evaluation that does not move an output schedules nothing for it.
+    last_outputs: Vec<Logic>,
+}
+
 /// A net's current resolved level plus its connectivity.
 #[derive(Debug, Clone, Default)]
 struct NetState {
@@ -161,6 +207,7 @@ pub struct Sim {
     drivers: Vec<Driver>,
     gates: Vec<Gate>,
     seq: Vec<SeqElement>,
+    blocks: Vec<Block>,
     queue: EventQueue,
     now: Femtos,
     started: bool,
@@ -218,6 +265,122 @@ impl Sim {
             last_output: initial,
         });
         gid
+    }
+
+    /// Add an HDL-lite block from a [`TruthTable`]: it reads `inputs` (LSB =
+    /// `inputs[0]`) and drives `outputs` (LSB = `outputs[0]`) through `delay`,
+    /// with `initial` as every output's reset level. The table's input/output
+    /// widths must match the net counts.
+    pub fn add_truth_table(
+        &mut self,
+        table: TruthTable,
+        inputs: &[Net],
+        outputs: &[Net],
+        delay: Femtos,
+        initial: Logic,
+    ) -> BlockId {
+        assert_eq!(
+            table.inputs(),
+            inputs.len(),
+            "truth table input width must match the input nets"
+        );
+        assert_eq!(
+            table.outputs(),
+            outputs.len(),
+            "truth table output width must match the output nets"
+        );
+        self.add_block(BlockKind::Table(table), inputs, outputs, delay, initial)
+    }
+
+    /// Add an HDL-lite block whose outputs are each a boolean [`Expr`]ession over
+    /// the `inputs` nets (an expression's `Var(i)` reads `inputs[i]`). One
+    /// expression per output net, LSB first.
+    pub fn add_expr_logic(
+        &mut self,
+        exprs: Vec<Expr>,
+        inputs: &[Net],
+        outputs: &[Net],
+        delay: Femtos,
+        initial: Logic,
+    ) -> BlockId {
+        assert_eq!(
+            exprs.len(),
+            outputs.len(),
+            "need exactly one expression per output net"
+        );
+        self.add_block(BlockKind::Exprs(exprs), inputs, outputs, delay, initial)
+    }
+
+    /// Add a [`Rom`]: `addr` lines in (LSB first), `data` word out. Widths must
+    /// match the ROM's address/data bit counts.
+    pub fn add_rom(
+        &mut self,
+        rom: Rom,
+        addr: &[Net],
+        data: &[Net],
+        delay: Femtos,
+        initial: Logic,
+    ) -> BlockId {
+        assert_eq!(rom.addr_bits(), addr.len(), "ROM address width mismatch");
+        assert_eq!(rom.data_bits(), data.len(), "ROM data width mismatch");
+        self.add_block(BlockKind::Rom(rom), addr, data, delay, initial)
+    }
+
+    /// Add a [`Ram`]: the input nets are wired as `[addr.., data_in.., we]` (all
+    /// LSB first) and `data_out` carries the addressed word. The write is
+    /// level-sensitive on `we` (see [`Ram`]). Widths must match the RAM.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_ram(
+        &mut self,
+        ram: Ram,
+        addr: &[Net],
+        data_in: &[Net],
+        we: Net,
+        data_out: &[Net],
+        delay: Femtos,
+        initial: Logic,
+    ) -> BlockId {
+        assert_eq!(ram.addr_bits(), addr.len(), "RAM address width mismatch");
+        assert_eq!(ram.data_bits(), data_in.len(), "RAM data-in width mismatch");
+        assert_eq!(
+            ram.data_bits(),
+            data_out.len(),
+            "RAM data-out width mismatch"
+        );
+        let mut inputs = Vec::with_capacity(addr.len() + data_in.len() + 1);
+        inputs.extend_from_slice(addr);
+        inputs.extend_from_slice(data_in);
+        inputs.push(we);
+        self.add_block(BlockKind::Ram(ram), &inputs, data_out, delay, initial)
+    }
+
+    /// Shared block wiring: create an output driver per output net, register the
+    /// block in the fan-out of every input net (in order, for determinism), and
+    /// store it.
+    fn add_block(
+        &mut self,
+        kind: BlockKind,
+        inputs: &[Net],
+        outputs: &[Net],
+        delay: Femtos,
+        initial: Logic,
+    ) -> BlockId {
+        let bid = BlockId(self.blocks.len());
+        let out_drivers: Vec<DriverId> = outputs
+            .iter()
+            .map(|&net| self.new_driver(net, initial))
+            .collect();
+        for &net in inputs {
+            self.nets[net.0].fanout.push(Sink::Block(bid));
+        }
+        self.blocks.push(Block {
+            kind,
+            inputs: inputs.to_vec(),
+            outputs: out_drivers,
+            delay,
+            last_outputs: vec![initial; outputs.len()],
+        });
+        bid
     }
 
     /// Add an edge-triggered **D flip-flop**: on each rising edge of `clk`, `q`
@@ -403,6 +566,10 @@ impl Sim {
         for i in 0..self.seq.len() {
             self.reeval_seq(SeqId(i));
         }
+        // Evaluate every block so its outputs settle from their reset level.
+        for i in 0..self.blocks.len() {
+            self.reeval_block(BlockId(i));
+        }
     }
 
     /// Re-evaluate one gate; if its output changed from the last value it
@@ -435,6 +602,30 @@ impl Sim {
         }
     }
 
+    /// Re-evaluate one block over its inputs' current resolved levels; for each
+    /// output that moved since it was last scheduled, schedule the new level
+    /// `delay` into the future. A [`Ram`] block also performs its write here.
+    fn reeval_block(&mut self, bid: BlockId) {
+        let inputs: Vec<Logic> = self.blocks[bid.0]
+            .inputs
+            .iter()
+            .map(|&n| self.nets[n.0].value)
+            .collect();
+        let outs = self.blocks[bid.0].kind.eval(&inputs);
+        let (now, delay) = (self.now, self.blocks[bid.0].delay);
+        for (i, &out) in outs.iter().enumerate() {
+            let driver = {
+                let b = &mut self.blocks[bid.0];
+                if out == b.last_outputs[i] {
+                    continue;
+                }
+                b.last_outputs[i] = out;
+                b.outputs[i]
+            };
+            self.queue.schedule(now + delay, driver, out);
+        }
+    }
+
     /// Apply one event: update its driver, re-resolve the net, and — only if the
     /// net's level actually moved — re-evaluate the gates that read it.
     fn apply(&mut self, driver: DriverId, value: Logic) {
@@ -458,6 +649,7 @@ impl Sim {
             match sink {
                 Sink::Gate(gid) => self.reeval_gate(gid),
                 Sink::Seq(sid) => self.reeval_seq(sid),
+                Sink::Block(bid) => self.reeval_block(bid),
             }
         }
     }
@@ -497,7 +689,7 @@ impl Sim {
 
 #[cfg(test)]
 mod tests {
-    use super::{GateKind, Sim};
+    use super::{DriverId, GateKind, Net, Sim};
     use crate::event::Femtos;
     use crate::Logic;
 
@@ -815,5 +1007,129 @@ mod tests {
         pulse(&mut sim, base);
         assert_eq!(sim.value(q), Logic::Low, "toggle 1→0");
         assert_eq!(sim.value(qbar), Logic::High);
+    }
+
+    use crate::hdl::{Expr, Ram, Rom, TruthTable};
+
+    /// Read a bus of nets as an integer, LSB first; panics on a non-definite bit.
+    fn read_bus(sim: &Sim, nets: &[Net]) -> u64 {
+        let mut v = 0u64;
+        for (bit, &n) in nets.iter().enumerate() {
+            match sim.value(n) {
+                Logic::High => v |= 1 << bit,
+                Logic::Low => {}
+                other => panic!("bus bit {bit} not definite: {other:?}"),
+            }
+        }
+        v
+    }
+
+    /// Drive `addr` nets (LSB first) to `value` at time `at`.
+    fn drive_bus(sim: &mut Sim, drivers: &[DriverId], value: u64, at: Femtos) {
+        for (bit, &d) in drivers.iter().enumerate() {
+            let level = if (value >> bit) & 1 == 1 {
+                Logic::High
+            } else {
+                Logic::Low
+            };
+            sim.set_input(d, level, at);
+        }
+    }
+
+    #[test]
+    fn rom_block_looks_up_the_addressed_word() {
+        // 2-bit address, 4-bit data. This is the CP-BRD-M3.1 ROM acceptance gate.
+        let rom = Rom::new(2, 4, &[0x3, 0x5, 0x9, 0xC]);
+        let mut sim = Sim::new();
+        let addr: Vec<Net> = (0..2).map(|_| sim.add_net()).collect();
+        let data: Vec<Net> = (0..4).map(|_| sim.add_net()).collect();
+        let ad: Vec<DriverId> = addr.iter().map(|&n| sim.add_input(n, Logic::Low)).collect();
+        sim.add_rom(rom, &addr, &data, 5, Logic::X);
+
+        sim.run_until(5);
+        assert_eq!(read_bus(&sim, &data), 0x3, "addr 0 → word 0x3");
+
+        drive_bus(&mut sim, &ad, 2, 10); // address 2
+        sim.run_until(16);
+        assert_eq!(read_bus(&sim, &data), 0x9, "addr 2 → word 0x9");
+
+        drive_bus(&mut sim, &ad, 3, 20); // address 3
+        sim.run_until(26);
+        assert_eq!(read_bus(&sim, &data), 0xC, "addr 3 → word 0xC");
+    }
+
+    #[test]
+    fn truth_table_block_adds_two_bits() {
+        // A 2-bit adder from a truth table: inputs [a0,a1,b0,b1] → [s0,s1,s2].
+        let adder = TruthTable::from_fn(4, 3, |i| {
+            let a = (i & 1) | ((i >> 1) & 1) << 1;
+            let b = ((i >> 2) & 1) | ((i >> 3) & 1) << 1;
+            (a + b) as u64
+        });
+        let mut sim = Sim::new();
+        let ins: Vec<Net> = (0..4).map(|_| sim.add_net()).collect();
+        let outs: Vec<Net> = (0..3).map(|_| sim.add_net()).collect();
+        let ind: Vec<DriverId> = ins.iter().map(|&n| sim.add_input(n, Logic::Low)).collect();
+        sim.add_truth_table(adder, &ins, &outs, 5, Logic::X);
+
+        // a = 3 (bits 0,1), b = 2 (bits 2,3) → packed 0b1011 = 11; sum = 5.
+        drive_bus(&mut sim, &ind, 0b1011, 0);
+        sim.run_until(5);
+        assert_eq!(read_bus(&sim, &outs), 5, "3 + 2 = 5");
+
+        drive_bus(&mut sim, &ind, 0b0101, 10); // a=1, b=1 → 2
+        sim.run_until(16);
+        assert_eq!(read_bus(&sim, &outs), 2, "1 + 1 = 2");
+    }
+
+    #[test]
+    fn expr_block_drives_an_xor_output() {
+        let mut sim = Sim::new();
+        let (a, b, y) = (sim.add_net(), sim.add_net(), sim.add_net());
+        let da = sim.add_input(a, Logic::Low);
+        let db = sim.add_input(b, Logic::Low);
+        let e = Expr::parse("a ^ b", &["a", "b"]).unwrap();
+        sim.add_expr_logic(vec![e], &[a, b], &[y], 5, Logic::X);
+
+        sim.run_until(5);
+        assert_eq!(sim.value(y), Logic::Low, "0 ^ 0 = 0");
+        sim.set_input(da, Logic::High, 10);
+        sim.run_until(16);
+        assert_eq!(sim.value(y), Logic::High, "1 ^ 0 = 1");
+        sim.set_input(db, Logic::High, 20);
+        sim.run_until(26);
+        assert_eq!(sim.value(y), Logic::Low, "1 ^ 1 = 0");
+    }
+
+    #[test]
+    fn ram_block_writes_then_reads_back() {
+        // 2-bit addr, 4-bit data RAM driven through the event kernel.
+        let mut sim = Sim::new();
+        let addr: Vec<Net> = (0..2).map(|_| sim.add_net()).collect();
+        let din: Vec<Net> = (0..4).map(|_| sim.add_net()).collect();
+        let we = sim.add_net();
+        let dout: Vec<Net> = (0..4).map(|_| sim.add_net()).collect();
+        let ad: Vec<DriverId> = addr.iter().map(|&n| sim.add_input(n, Logic::Low)).collect();
+        let dd: Vec<DriverId> = din.iter().map(|&n| sim.add_input(n, Logic::Low)).collect();
+        let dwe = sim.add_input(we, Logic::Low);
+        sim.add_ram(Ram::new(2, 4), &addr, &din, we, &dout, 5, Logic::X);
+
+        // Write 0xA to address 2: set addr+data, pulse we high then low.
+        drive_bus(&mut sim, &ad, 2, 0);
+        drive_bus(&mut sim, &dd, 0xA, 0);
+        sim.set_input(dwe, Logic::High, 10);
+        sim.set_input(dwe, Logic::Low, 20);
+        sim.run_until(30);
+        assert_eq!(read_bus(&sim, &dout), 0xA, "address 2 now holds 0xA");
+
+        // Switch to address 0 (never written) → reads zero.
+        drive_bus(&mut sim, &ad, 0, 40);
+        sim.run_until(50);
+        assert_eq!(read_bus(&sim, &dout), 0, "unwritten address reads 0");
+
+        // Back to address 2 → the stored 0xA is still there.
+        drive_bus(&mut sim, &ad, 2, 60);
+        sim.run_until(70);
+        assert_eq!(read_bus(&sim, &dout), 0xA, "stored value persists");
     }
 }
