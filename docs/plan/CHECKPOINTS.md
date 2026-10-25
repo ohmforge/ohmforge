@@ -106,7 +106,7 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 
 ## M3 — breadth (workstream) + WASM (webstream)  → plan: [`M3-PLAN.md`](M3-PLAN.md)
 
-- [ ] **CP-SIM-M3.1** (sim-core) Behavioral/expression sources + richer device models (tempco). — *gate:* an expression source matches the evaluated waveform; a temp-shifted model moves the op-point as expected.
+- [x] **CP-SIM-M3.1** (sim-core) Behavioral/expression sources + richer device models (tempco). — *gate:* `expr_source_reproduces_a_sine_in_transient` (`sin(2*pi*1000*t)`) + a compound waveform; `resistor_tempco_shifts_a_divider` (5 V at 27 °C → 3.333 V at 127 °C). `Waveform::Expr` (hand-rolled evaluator), `Circuit::set_temperature`/`set_tempco`.
 - [ ] **CP-BRD-M3.1** (boards) HDL-lite: truth-table/expression logic blocks, ROM/RAM, tri-state bus. — *gate:* a ROM-lookup/adder block simulates; a tri-state bus resolves multiple drivers.
 - [ ] **CP-BRD-M3.2** (boards) Custom-board manifests + drop-in modules (7-seg/LED/servo/WS2812). — *gate:* load a manifest board; a module behaves per its inputs.
 - [x] **CP-UX-M3.1** (ui-shell) Dataflow patcher: processing blocks → reusable virtual instruments + pass/fail test sequences. — *gate:* `gain_then_rms_is_twice_input_rms` + topo-eval on a branching patch, cycles reported (no hang); `VirtualInstrument` re-runs; `TestSequence` names the failing check. Blocks: Gain/Offset/Abs/Clamp/Limit/Add/Sub/Mul/Filter/Rms/Mean/Peak/Log.
@@ -121,13 +121,13 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 
 | Track | Done | In progress | Total |
 |---|---|---|---|
-| sim-core | 15 | 0 | 16 |
+| sim-core | 16 | 0 | 16 |
 | boards | 10 | 0 | 12 |
 | ui-shell | 14 | 0 | 14 |
 | ai-fmt | 9 | 0 | 11 |
 | platform | 5 | 0 | 6 |
 | web | 0 | 0 | 1 |
-| **Total** | **53** | **0** | **60** |
+| **Total** | **54** | **0** | **60** |
 
 _M0–M2 + M3 interop = **52/52 done** (the ✅ milestone). **M3 breadth + WASM (8 new checkpoints)** are the current workstream/webstream._
 
