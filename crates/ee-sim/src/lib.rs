@@ -150,36 +150,65 @@ impl fmt::Display for SimError {
 
 impl Error for SimError {}
 
-/// The simulation engine. Stateless; hold one and call [`Engine::run`].
-#[derive(Debug, Default, Clone, Copy)]
-pub struct Engine;
+/// The simulation engine. Holds an optional [`DeviceRegistry`] of plugin device
+/// models (`CP-SIM-M4.1`); [`Engine::new`] starts empty (built-in devices only)
+/// and [`Engine::with_device`] / [`Engine::register_device`] add external models.
+/// Cheap to clone — registered factories are shared behind an `Arc`.
+#[derive(Debug, Default, Clone)]
+pub struct Engine {
+    registry: DeviceRegistry,
+}
 
 impl Engine {
+    /// A new engine with no plugin devices registered — built-ins only.
     pub fn new() -> Self {
-        Engine
+        Self::default()
+    }
+
+    /// Register an external [`NonlinearDevice`] model, matched to parts carrying
+    /// [`PartKind::Other`] with the given `name`, and return the engine
+    /// (builder-style). `Engine::run` then stamps that device in every analysis.
+    pub fn with_device<F>(mut self, name: impl Into<String>, factory: F) -> Self
+    where
+        F: Fn(&Part) -> Result<Box<dyn NonlinearDevice>, SimError> + Send + Sync + 'static,
+    {
+        self.registry.register(name, factory);
+        self
+    }
+
+    /// Register an external [`NonlinearDevice`] model in place. The `name` matches
+    /// parts whose kind is [`PartKind::Other`] carrying that string.
+    pub fn register_device<F>(&mut self, name: impl Into<String>, factory: F)
+    where
+        F: Fn(&Part) -> Result<Box<dyn NonlinearDevice>, SimError> + Send + Sync + 'static,
+    {
+        self.registry.register(name, factory);
     }
 
     /// Run an [`Analysis`] against a circuit, returning one [`Signal`] per node.
     pub fn run(&self, circuit: &Circuit, analysis: &Analysis) -> Result<Vec<Signal>, SimError> {
-        validate(circuit)?;
+        let reg = &self.registry;
+        validate(circuit, reg)?;
         let layout = Layout::build(circuit);
         match analysis {
             Analysis::OperatingPoint => {
-                let x = solve_dc(circuit, &layout)?;
+                let x = solve_dc(circuit, &layout, reg)?;
                 Ok(op_signals(&layout, &x))
             }
-            Analysis::Transient { duration, step } => transient(circuit, &layout, *duration, *step),
+            Analysis::Transient { duration, step } => {
+                transient(circuit, &layout, *duration, *step, reg)
+            }
             Analysis::Ac {
                 f_start,
                 f_stop,
                 points_per_decade,
-            } => ac(circuit, &layout, *f_start, *f_stop, *points_per_decade),
+            } => ac(circuit, &layout, *f_start, *f_stop, *points_per_decade, reg),
             Analysis::DcSweep {
                 source,
                 start,
                 stop,
                 step,
-            } => dc_sweep(circuit, source, *start, *stop, *step),
+            } => dc_sweep(circuit, source, *start, *stop, *step, reg),
             Analysis::Parametric {
                 source,
                 values,
@@ -197,6 +226,7 @@ impl Engine {
                 *f_start,
                 *f_stop,
                 *points_per_decade,
+                reg,
             ),
             Analysis::MonteCarlo {
                 seed,
@@ -209,8 +239,10 @@ impl Engine {
     }
 }
 
-/// Reject devices not modeled at M0 so a part never gets silently dropped.
-fn validate(circuit: &Circuit) -> Result<(), SimError> {
+/// Reject devices not modeled so a part never gets silently dropped. A
+/// [`PartKind::Other`] part is accepted only when `registry` carries a plugin
+/// factory for its name (`CP-SIM-M4.1`); otherwise it is still unsupported.
+fn validate(circuit: &Circuit, registry: &DeviceRegistry) -> Result<(), SimError> {
     for part in circuit.parts() {
         match &part.kind {
             PartKind::Resistor
@@ -225,6 +257,7 @@ fn validate(circuit: &Circuit) -> Result<(), SimError> {
             | PartKind::Vccs(..)
             | PartKind::Ccvs(..)
             | PartKind::Cccs(..) => {}
+            PartKind::Other(name) if registry.contains(name) => {}
             PartKind::Other(_) => {
                 return Err(SimError::Unsupported("nonlinear/unknown device (M1)"))
             }
@@ -695,9 +728,16 @@ const NR_I_TOL: f64 = 1e-12;
 /// running guess and asks it to [`linearize`](NonlinearDevice::linearize): report
 /// the current flowing into every terminal and the Jacobian `∂I_i/∂V_j` of those
 /// currents, bundled with the RHS equivalent-current sources as a [`Companion`]
-/// that [`stamp_companion`] writes into the MNA system. A diode is the
+/// that the engine writes into the MNA system. A diode is the
 /// two-terminal case; a BJT and a MOSFET stamp a 3×3 block. (`CP-SIM-M1.2`.)
-trait NonlinearDevice {
+///
+/// This trait is the **public plugin contract** (`CP-SIM-M4.1`): an external
+/// crate can implement it for its own device and register a factory with
+/// [`Engine::with_device`] / [`DeviceRegistry`], after which [`Engine::run`]
+/// stamps that device in every analysis — operating point, transient, DC/AC —
+/// exactly like a built-in. The built-in `Diode`, `Bjt`, and `Mosfet` are
+/// ordinary implementors of it.
+pub trait NonlinearDevice {
     /// The device's terminal nets, in the order [`linearize`](Self::linearize)
     /// reads voltages and reports currents. The internal controlling/branch
     /// voltages are formed from these inside the model.
@@ -721,20 +761,77 @@ trait NonlinearDevice {
 
 /// A nonlinear device's linearized multiport companion — the output of
 /// [`NonlinearDevice::linearize`]. Every vector is in the device's terminal order.
-struct Companion {
+/// Public so external device models (`CP-SIM-M4.1`) can construct one; the fields
+/// are the same multiport Norton equivalent the built-in devices return.
+pub struct Companion {
     /// Terminal currents `I_i` (the current flowing *from node `i` into the
     /// device*) at the linearization point — the solver's current-convergence
     /// probe.
-    i: Vec<f64>,
+    pub i: Vec<f64>,
     /// RHS equivalent-current sources: `i_eq[a]` is injected into node `a`'s row,
     /// equal to `Σ_j g[a][j]·V*_j − I_a` at the (possibly limited) linearization
     /// point. The model precomputes it so junction limiting stays internal and
     /// the stamped companion is self-consistent — the multiport generalization of
     /// the two-terminal Norton source `I_eq = I(v) − g·v`.
-    i_eq: Vec<f64>,
+    pub i_eq: Vec<f64>,
     /// Jacobian `g[i][j] = ∂I_i/∂V_j`, a dense `n × n` block in terminal order
     /// (possibly asymmetric — a transconductance is not reciprocal).
-    g: Vec<Vec<f64>>,
+    pub g: Vec<Vec<f64>>,
+}
+
+/// A factory that builds a plugin [`NonlinearDevice`] from the [`Part`] that
+/// carries it — the value stored in a [`DeviceRegistry`]. Shared behind an `Arc`
+/// so an [`Engine`] stays cheap to clone and `Send + Sync` (required for the
+/// native `parallel` feature). The factory reads the part's terminals, value, and
+/// any model data, and returns the boxed device (or a [`SimError`] if the part is
+/// malformed — e.g. wrong terminal count).
+pub type DeviceFactory =
+    std::sync::Arc<dyn Fn(&Part) -> Result<Box<dyn NonlinearDevice>, SimError> + Send + Sync>;
+
+/// A registry of plugin nonlinear-device models, keyed by the name a part carries
+/// in [`PartKind::Other`] (`CP-SIM-M4.1`). The engine consults it when it meets an
+/// `Other(name)` part: a registered factory builds the device, which then stamps
+/// in Newton–Raphson / operating-point / transient / AC exactly like a built-in;
+/// an unregistered name is still rejected as [`SimError::Unsupported`]. Cloning is
+/// cheap — the factories are shared behind `Arc`.
+#[derive(Default, Clone)]
+pub struct DeviceRegistry {
+    factories: BTreeMap<String, DeviceFactory>,
+}
+
+impl DeviceRegistry {
+    /// An empty registry — built-in devices only.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register `factory` under `name`; a part of kind [`PartKind::Other`] carrying
+    /// that name is then built and stamped by it. Re-registering a name replaces it.
+    pub fn register<F>(&mut self, name: impl Into<String>, factory: F)
+    where
+        F: Fn(&Part) -> Result<Box<dyn NonlinearDevice>, SimError> + Send + Sync + 'static,
+    {
+        self.factories
+            .insert(name.into(), std::sync::Arc::new(factory));
+    }
+
+    /// The factory registered for `name`, if any.
+    fn get(&self, name: &str) -> Option<&DeviceFactory> {
+        self.factories.get(name)
+    }
+
+    /// Whether a factory is registered for `name`.
+    fn contains(&self, name: &str) -> bool {
+        self.factories.contains_key(name)
+    }
+}
+
+impl fmt::Debug for DeviceRegistry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeviceRegistry")
+            .field("devices", &self.factories.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 /// Stamp an N-terminal device's linearized [`Companion`] into the system: the
@@ -1006,8 +1103,15 @@ fn diode_model(part: &Part) -> DiodeModel {
 }
 
 /// Collect every nonlinear device in the circuit as a boxed [`NonlinearDevice`].
-/// This is the one place a new device kind is wired into the solver.
-fn collect_nonlinear(circuit: &Circuit) -> Result<Vec<Box<dyn NonlinearDevice>>, SimError> {
+/// This is the one place a new device kind is wired into the solver: the built-in
+/// diode / BJT / MOSFET, plus any [`PartKind::Other`] part whose name has a plugin
+/// factory in `registry` (`CP-SIM-M4.1`). An `Other` part with no registered
+/// factory is skipped here — [`validate`] has already rejected it, so this stays a
+/// pure collector.
+fn collect_nonlinear(
+    circuit: &Circuit,
+    registry: &DeviceRegistry,
+) -> Result<Vec<Box<dyn NonlinearDevice>>, SimError> {
     let mut devices: Vec<Box<dyn NonlinearDevice>> = Vec::new();
     for part in circuit.parts() {
         match &part.kind {
@@ -1031,6 +1135,11 @@ fn collect_nonlinear(circuit: &Circuit) -> Result<Vec<Box<dyn NonlinearDevice>>,
                     polarity: *polarity,
                     model: *model,
                 }));
+            }
+            PartKind::Other(name) => {
+                if let Some(factory) = registry.get(name) {
+                    devices.push(factory(part)?);
+                }
             }
             _ => {}
         }
@@ -1202,12 +1311,16 @@ fn solve_aided(
 /// Solve the DC operating point: resistors + sources, capacitors open, inductors
 /// shorted, and any nonlinear device driven to steady state by Newton–Raphson
 /// with the shared convergence-aid ladder ([`solve_aided`]).
-fn solve_dc(circuit: &Circuit, layout: &Layout) -> Result<Vec<f64>, SimError> {
+fn solve_dc(
+    circuit: &Circuit,
+    layout: &Layout,
+    registry: &DeviceRegistry,
+) -> Result<Vec<f64>, SimError> {
     let size = layout.n_nodes()
         + layout.vsources.len()
         + layout.n_controlled_branches()
         + layout.inductors.len();
-    let devices = collect_nonlinear(circuit)?;
+    let devices = collect_nonlinear(circuit, registry)?;
     // The linear stamp at source scale `alpha` (1.0 = the real circuit).
     let stamp_at = |sys: &mut System, alpha: f64| -> Result<(), SimError> {
         stamp_resistors(sys, circuit, layout)?;
@@ -1349,7 +1462,11 @@ struct TransientModel<'a> {
 }
 
 impl<'a> TransientModel<'a> {
-    fn build(circuit: &'a Circuit, layout: &'a Layout) -> Result<Self, SimError> {
+    fn build(
+        circuit: &'a Circuit,
+        layout: &'a Layout,
+        registry: &DeviceRegistry,
+    ) -> Result<Self, SimError> {
         let caps: Vec<(NetId, NetId, f64)> = circuit
             .parts()
             .iter()
@@ -1382,7 +1499,7 @@ impl<'a> TransientModel<'a> {
             })
             .collect::<Result<_, _>>()?;
 
-        let devices = collect_nonlinear(circuit)?;
+        let devices = collect_nonlinear(circuit, registry)?;
         Ok(Self {
             circuit,
             layout,
@@ -1530,11 +1647,12 @@ fn transient(
     layout: &Layout,
     duration: f64,
     step: Option<f64>,
+    registry: &DeviceRegistry,
 ) -> Result<Vec<Signal>, SimError> {
     if duration <= 0.0 {
         return Err(SimError::BadValue("transient duration/step".into()));
     }
-    let model = TransientModel::build(circuit, layout)?;
+    let model = TransientModel::build(circuit, layout, registry)?;
     let (x0, cap_v0) = model.initial()?;
     match step {
         Some(h) if h > 0.0 => fixed_transient(&model, duration, h, x0, cap_v0),
@@ -1699,6 +1817,7 @@ fn ac(
     f_start: f64,
     f_stop: f64,
     points_per_decade: u32,
+    registry: &DeviceRegistry,
 ) -> Result<Vec<Signal>, SimError> {
     if !f_start.is_finite()
         || !f_stop.is_finite()
@@ -1710,7 +1829,7 @@ fn ac(
     }
 
     // Bias point for linearizing nonlinear devices (and verifying the topology).
-    let x_dc = solve_dc(circuit, layout)?;
+    let x_dc = solve_dc(circuit, layout, registry)?;
 
     let n = layout.n_nodes();
     let m = layout.vsources.len();
@@ -1759,7 +1878,7 @@ fn ac(
     // admittance block). A diode reduces to one conductance between its nodes; a
     // BJT / MOSFET contributes its full multiport transadmittance matrix. Flatten
     // every entry to `(row, col, g)` so each stamps as a raw complex matrix entry.
-    let devices = collect_nonlinear(circuit)?;
+    let devices = collect_nonlinear(circuit, registry)?;
     let mut device_g: Vec<(Option<usize>, Option<usize>, f64)> = Vec::new();
     for dev in &devices {
         let nodes: Vec<Option<usize>> = dev
@@ -1892,6 +2011,7 @@ fn noise(
     f_start: f64,
     f_stop: f64,
     points_per_decade: u32,
+    registry: &DeviceRegistry,
 ) -> Result<Vec<Signal>, SimError> {
     if !f_start.is_finite()
         || !f_stop.is_finite()
@@ -1903,7 +2023,7 @@ fn noise(
     }
 
     // DC bias, to linearize any nonlinear device (and verify the topology).
-    let x_dc = solve_dc(circuit, layout)?;
+    let x_dc = solve_dc(circuit, layout, registry)?;
 
     let n = layout.n_nodes();
     let m = layout.vsources.len();
@@ -1948,7 +2068,7 @@ fn noise(
     }
 
     // Nonlinear devices → small-signal Jacobian at the DC bias (purely real), as AC.
-    let devices = collect_nonlinear(circuit)?;
+    let devices = collect_nonlinear(circuit, registry)?;
     let mut device_g: Vec<(Option<usize>, Option<usize>, f64)> = Vec::new();
     for dev in &devices {
         let nodes: Vec<Option<usize>> = dev
@@ -2206,6 +2326,7 @@ fn dc_sweep(
     start: f64,
     stop: f64,
     step: f64,
+    registry: &DeviceRegistry,
 ) -> Result<Vec<Signal>, SimError> {
     let unit = sweep_source_unit(circuit, source)?;
     let values = sweep_values(start, stop, step)?;
@@ -2217,7 +2338,7 @@ fn dc_sweep(
     let mut traces: Vec<Vec<f64>> = vec![Vec::with_capacity(values.len()); n];
     for &val in &values {
         work.set_value(source, Value::new(val, unit));
-        let x = solve_dc(&work, &layout)?;
+        let x = solve_dc(&work, &layout, registry)?;
         for (d, trace) in traces.iter_mut().enumerate() {
             trace.push(x[d]);
         }
@@ -2319,6 +2440,20 @@ mod tests {
 
     fn v(s: &str, u: Unit) -> Option<Value> {
         Some(Value::parse(s, u).unwrap())
+    }
+
+    // Built-ins-only shims: the engine-internal `solve_dc` / `collect_nonlinear`
+    // now take a `&DeviceRegistry` (`CP-SIM-M4.1`), but every pre-M4 test exercises
+    // only built-in devices. These local wrappers (which shadow the glob-imported
+    // originals) forward an empty registry, so the existing call sites stay
+    // unchanged and keep their exact behavior. Plugin devices are covered by
+    // `plugin_square_law_device_matches_hand_analysis`, which drives a real
+    // `Engine` registry instead.
+    fn solve_dc(circuit: &Circuit, layout: &Layout) -> Result<Vec<f64>, SimError> {
+        super::solve_dc(circuit, layout, &DeviceRegistry::new())
+    }
+    fn collect_nonlinear(circuit: &Circuit) -> Result<Vec<Box<dyn NonlinearDevice>>, SimError> {
+        super::collect_nonlinear(circuit, &DeviceRegistry::new())
     }
     // --- Convergence aids — CP-SIM-M1.3 ------------------------------------
 
@@ -4895,6 +5030,151 @@ mod tests {
             assert_eq!(got, dense[idx], "node {net:?}: sparse engine != dense");
             assert!(got > 0.0 && got < last, "ladder not monotone at {net:?}");
             last = got;
+        }
+    }
+
+    // --- Plugin device-model API — CP-SIM-M4.1 -----------------------------
+
+    /// A custom two-terminal nonlinear device living *outside* the engine's
+    /// built-ins — the plugin gate. Its current law is `I(V) = k·V²` for the
+    /// branch voltage `V = v(a) − v(b)`, flowing a → b. A real external crate would
+    /// define exactly this: a type implementing the public [`NonlinearDevice`]
+    /// contract, registered with [`Engine::with_device`].
+    struct SquareLaw {
+        nets: [NetId; 2],
+        k: f64,
+    }
+
+    impl NonlinearDevice for SquareLaw {
+        fn terminals(&self) -> &[NetId] {
+            &self.nets
+        }
+
+        fn state_len(&self) -> usize {
+            0 // smooth polynomial law — no junction limiting needed
+        }
+
+        fn linearize(&self, v: &[f64], _state: &mut [f64], _limit: bool) -> Companion {
+            let vd = v[0] - v[1];
+            let i = self.k * vd * vd; // I = k·V²
+            let g = 2.0 * self.k * vd; // dI/dV
+                                       // Multiport Norton source, exactly as a built-in device forms it.
+            let i_eq = g * vd - i;
+            Companion {
+                i: vec![i, -i],
+                i_eq: vec![i_eq, -i_eq],
+                g: vec![vec![g, -g], vec![-g, g]],
+            }
+        }
+    }
+
+    /// The `CP-SIM-M4.1` acceptance gate: a device defined entirely in this test
+    /// module (not an engine built-in) participates in a real operating-point
+    /// solve through the public registry, and the result matches hand analysis.
+    ///
+    /// Circuit: `V1 = 2 V — R1(1 kΩ) — n — XSQ(k = 1e-3) — gnd`, XSQ a
+    /// [`SquareLaw`]. KCL at `n`: `(2 − Vn)/1000 = 1e-3·Vn²`, i.e.
+    /// `Vn² + Vn − 2 = 0`, whose positive root is exactly `Vn = 1 V`. The node
+    /// always has a resistive path, so the plain Newton path cracks it.
+    #[test]
+    fn plugin_square_law_device_matches_hand_analysis() {
+        let mut c = Circuit::new("plugin_sqlaw");
+        let vin = c.new_net();
+        let n = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("2", Unit::Volt),
+            vec![vin, NetId::GROUND],
+        );
+        c.add_part("R1", PartKind::Resistor, v("1k", Unit::Ohm), vec![vin, n]);
+        // The plugin device: PartKind::Other("sqlaw"), its value carrying k.
+        c.add_part(
+            "XSQ",
+            PartKind::Other("sqlaw".into()),
+            Some(Value::new(1e-3, Unit::Ampere)),
+            vec![n, NetId::GROUND],
+        );
+
+        // An unregistered "sqlaw" is rejected — the registry is the only way in.
+        assert!(matches!(
+            Engine::new()
+                .run(&c, &Analysis::OperatingPoint)
+                .unwrap_err(),
+            SimError::Unsupported(_)
+        ));
+
+        // Register the plugin factory and solve the real operating point.
+        let engine = Engine::new().with_device("sqlaw", |part: &Part| {
+            let (a, b) = terminals2(part)?;
+            let k = part.value.map(|v| v.magnitude).unwrap_or(1e-3);
+            Ok(Box::new(SquareLaw { nets: [a, b], k }) as Box<dyn NonlinearDevice>)
+        });
+        let sigs = engine.run(&c, &Analysis::OperatingPoint).unwrap();
+
+        let name = format!("v(n{})", c.resolve(n).0);
+        let vn = sigs
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap()
+            .real()
+            .unwrap()[0];
+        assert!(
+            (vn - 1.0).abs() <= 1e-9,
+            "plugin device op-point Vn = {vn} V, expected exactly 1 V"
+        );
+        // KCL closes with the device's own law: the resistor current equals k·Vn².
+        let i_r = (2.0 - vn) / 1000.0;
+        let i_dev = 1e-3 * vn * vn;
+        assert!(
+            (i_r - i_dev).abs() <= 1e-12,
+            "KCL mismatch: I_R = {i_r} A vs I_dev = {i_dev} A"
+        );
+    }
+
+    /// The plugin device also flows through the other analyses the registry threads
+    /// — here a transient to the same steady state (every sample at the op-point
+    /// `Vn = 1 V`, since the sources are DC) — proving `Engine::run` stamps it in
+    /// NR / transient, not only the bare operating point.
+    #[test]
+    fn plugin_device_flows_through_transient() {
+        let mut c = Circuit::new("plugin_sqlaw_tran");
+        let vin = c.new_net();
+        let n = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("2", Unit::Volt),
+            vec![vin, NetId::GROUND],
+        );
+        c.add_part("R1", PartKind::Resistor, v("1k", Unit::Ohm), vec![vin, n]);
+        c.add_part(
+            "XSQ",
+            PartKind::Other("sqlaw".into()),
+            Some(Value::new(1e-3, Unit::Ampere)),
+            vec![n, NetId::GROUND],
+        );
+        let engine = Engine::new().with_device("sqlaw", |part: &Part| {
+            let (a, b) = terminals2(part)?;
+            let k = part.value.map(|v| v.magnitude).unwrap_or(1e-3);
+            Ok(Box::new(SquareLaw { nets: [a, b], k }) as Box<dyn NonlinearDevice>)
+        });
+        let sigs = engine
+            .run(
+                &c,
+                &Analysis::Transient {
+                    duration: 1e-3,
+                    step: Some(1e-4),
+                },
+            )
+            .expect("plugin device must stamp in the transient path");
+        let name = format!("v(n{})", c.resolve(n).0);
+        let sig = sigs.iter().find(|s| s.name == name).unwrap();
+        for &vn in sig.real().unwrap() {
+            assert!(
+                (vn - 1.0).abs() <= 1e-9,
+                "plugin transient Vn = {vn} V, expected the op-point 1 V"
+            );
         }
     }
 
