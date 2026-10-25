@@ -216,6 +216,21 @@ pub fn reject(patch: ProposedPatch) {
     let _ = patch;
 }
 
+/// Grade an **already-built** circuit against `spec` by measuring it on a real
+/// operating-point solve — the deterministic core the tutor's graded challenges
+/// reuse ([`crate::tutor`]).
+///
+/// Where [`verify`] scratch-applies a patch *before* measuring, `grade` measures
+/// a circuit the user has already assembled. Like `verify` it clones the shell
+/// and drives only the clone, so grading never mutates the caller's circuit, and
+/// it returns the same measured [`Verdict`] (per-criterion pass/fail citing the
+/// real numbers) — or an [`AiError::Patch`] if a criterion named a node/part the
+/// circuit does not have, or the solve failed.
+pub fn grade(built: &Shell, spec: &Spec) -> Result<Verdict, AiError> {
+    let mut scratch = built.clone();
+    measure(&mut scratch, spec)
+}
+
 /// Replay a patch's commands on `shell`, mapping any shell error into an
 /// [`AiError::Patch`] that names the offending line.
 fn apply_commands(shell: &mut Shell, commands: &[String]) -> Result<(), AiError> {
