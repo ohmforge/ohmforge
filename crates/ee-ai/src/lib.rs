@@ -71,6 +71,19 @@
 //!   resistor), and a static [`parts`](offline::parts) catalog with keyword
 //!   search. It depends on `ee_core` alone — no [`Transport`], no
 //!   [`Client`], no key.
+//!
+//! ## This checkpoint (CP-AF-M3.3): tutor mode — lessons, graded challenges, glossary
+//!
+//! The teaching surface, graded **deterministically** by the real simulator:
+//!
+//! * [`tutor`] — a [`Challenge`] pairs a brief with a [`Spec`]; [`Challenge::grade`]
+//!   runs the learner's circuit through [`grade`] (the M2 measurement path) and
+//!   returns a [`Verdict`] that is PASS against a correct circuit and FAIL,
+//!   **naming the miss**, against a wrong one. A [`Lesson`] is ordered [`Step`]s
+//!   walked by a [`LessonRunner`] that advances as the circuit meets each step's
+//!   goal, and [`define_term`]/[`glossary`] are the contextual term lookup. All
+//!   offline; [`coach`] optionally layers the model for prose hints, but the
+//!   grade never depends on it.
 
 pub mod client;
 pub mod config;
@@ -80,6 +93,7 @@ pub mod modes;
 pub mod offline;
 pub mod tools;
 pub mod transport;
+pub mod tutor;
 pub mod verify;
 
 pub use client::{Client, RunResult, ToolHandler, DEFAULT_MAX_TOKENS, DEFAULT_MAX_TOOL_TURNS};
@@ -99,9 +113,13 @@ pub use offline::{
 };
 pub use tools::{ask, CircuitTools, EESH_TOOL, READ_OP_TOOL};
 pub use transport::{MockTransport, Transport};
+pub use tutor::{
+    coach, define as define_term, glossary, search_terms, Challenge, Lesson, LessonRunner, Step,
+    StepGoal, StepReport, Term,
+};
 pub use verify::{
-    apply, design, reject, verify, Criterion, DesignOutcome, Designer, Measurement, Outcome, Spec,
-    Verdict, PROPOSE_PATCH_TOOL,
+    apply, design, grade, reject, verify, Criterion, DesignOutcome, Designer, Measurement, Outcome,
+    Spec, Verdict, PROPOSE_PATCH_TOOL,
 };
 
 /// A change the AI proposes. Staged — never auto-applied; the user runs

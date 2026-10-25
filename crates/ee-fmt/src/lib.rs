@@ -9,8 +9,13 @@
 //! A format-by-format guide with runnable examples (incl. the SPICE `m`-vs-`meg`
 //! gotcha) lives in `docs/guide/formats.md`, and real files in
 //! `examples/formats/` are checked by `cargo test -p ee-fmt --test examples`.
+//!
+//! At M3 the ecosystem reach widens: KiCad netlist import and BOM export
+//! (`CP-AF-M3.1`) and a Fritzing-style sketch exporter ([`fritzing`],
+//! `CP-AF-M3.4`) that writes the `.fz` XML describing parts and their wiring.
 
 pub mod bom;
+pub mod fritzing;
 pub mod kicad;
 pub mod netlist;
 pub mod project;
@@ -18,6 +23,7 @@ pub mod spice;
 pub mod waveform;
 
 pub use bom::to_csv as to_bom_csv;
+pub use fritzing::export as export_fritzing;
 pub use kicad::{import as import_kicad, KicadError};
 pub use netlist::{parse as parse_netlist, NetlistError};
 pub use project::{load as load_project, save as save_project, ProjectError};
