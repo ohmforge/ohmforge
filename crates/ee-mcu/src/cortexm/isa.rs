@@ -1,5 +1,5 @@
-//! The decoded-instruction type for the ARMv6-M (Thumb) subset, and its operand
-//! shapes.
+//! The decoded-instruction type for the ARMv6-M / ARMv7-M (Thumb / Thumb-2)
+//! subset, and its operand shapes.
 //!
 //! [`Instr`] is what [`decode`](super::decode::decode) produces and
 //! [`CortexM`](super::core::CortexM) executes. Register operands are plain
@@ -10,7 +10,11 @@
 //!
 //! ARMv6-M is the Thumb subset the Cortex-M0/M0+ implements: almost every
 //! instruction is a single 16-bit halfword, the exception being the 32-bit
-//! `BL` (and a handful of system encodings this core does not model).
+//! `BL`. The Cortex-M3/M4 add the **Thumb-2** 32-bit encodings — the variants
+//! after [`Instr::Nop`] below — for data-processing with modified immediates and
+//! shifted registers, the long/accumulating multiplies, bitfield operations,
+//! `MOVW`/`MOVT`, `CLZ`/`RBIT`, `LDRD`/`STRD`, wide `LDM`/`STM`, `MRS`/`MSR`,
+//! and the wider branch ranges, plus the 16-bit `IT` block.
 
 /// The width of a memory access.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,6 +186,110 @@ pub enum Instr {
 
     /// `NOP` (and the other hint instructions, treated as no-ops).
     Nop,
+
+    // --- Thumb-2 (ARMv7-M) 32-bit encodings ---
+    /// Data-processing with a *modified immediate* (`ThumbExpandImm`). `op` is the
+    /// 4-bit opcode (`0000`=AND, `0001`=BIC, `0010`=ORR/MOV, `0011`=ORN/MVN,
+    /// `0100`=EOR, `1000`=ADD/CMN, `1010`=ADC, `1011`=SBC, `1101`=SUB/CMP,
+    /// `1110`=RSB). `rn == 15` with ORR/ORN is MOV/MVN; `rd == 15` with S and a
+    /// comparison opcode is TST/TEQ/CMN/CMP. `carry` is the shifter carry-out of
+    /// the immediate expansion (`None` = leave `C` unchanged), used by the logical
+    /// forms when they set flags.
+    DpImm {
+        op: u8,
+        rd: u8,
+        rn: u8,
+        imm: u32,
+        setflags: bool,
+        carry: Option<bool>,
+    },
+    /// Data-processing with a *shifted register*. Same `op` map as [`Instr::DpImm`];
+    /// `stype`/`samt` are the shift type (`0`=LSL,`1`=LSR,`2`=ASR,`3`=ROR/RRX) and
+    /// decoded amount applied to `rm`.
+    DpShiftReg {
+        op: u8,
+        rd: u8,
+        rn: u8,
+        rm: u8,
+        stype: u8,
+        samt: u8,
+        setflags: bool,
+    },
+    /// Register-controlled shift (`LSL`/`LSR`/`ASR`/`ROR rd, rn, rm`), `stype` as
+    /// above.
+    ShiftReg {
+        rd: u8,
+        rn: u8,
+        rm: u8,
+        stype: u8,
+        setflags: bool,
+    },
+
+    /// `MOVW rd, #imm16` — zero-extended 16-bit immediate.
+    Movw { rd: u8, imm: u32 },
+    /// `MOVT rd, #imm16` — set the top halfword, keep the low halfword.
+    Movt { rd: u8, imm: u32 },
+
+    /// `UBFX rd, rn, #lsb, #width` — unsigned bitfield extract.
+    Ubfx { rd: u8, rn: u8, lsb: u8, width: u8 },
+    /// `SBFX rd, rn, #lsb, #width` — signed bitfield extract.
+    Sbfx { rd: u8, rn: u8, lsb: u8, width: u8 },
+    /// `BFI rd, rn, #lsb, #width` — bitfield insert.
+    Bfi { rd: u8, rn: u8, lsb: u8, width: u8 },
+    /// `BFC rd, #lsb, #width` — bitfield clear.
+    Bfc { rd: u8, lsb: u8, width: u8 },
+
+    /// `MUL rd, rn, rm` (32-bit, never sets flags).
+    Mul32 { rd: u8, rn: u8, rm: u8 },
+    /// `MLA rd, rn, rm, ra` — `rd = ra + rn*rm`.
+    Mla { rd: u8, rn: u8, rm: u8, ra: u8 },
+    /// `MLS rd, rn, rm, ra` — `rd = ra - rn*rm`.
+    Mls { rd: u8, rn: u8, rm: u8, ra: u8 },
+    /// `UMULL rdlo, rdhi, rn, rm` — unsigned 32×32→64 multiply.
+    Umull { rdlo: u8, rdhi: u8, rn: u8, rm: u8 },
+    /// `SMULL rdlo, rdhi, rn, rm` — signed 32×32→64 multiply.
+    Smull { rdlo: u8, rdhi: u8, rn: u8, rm: u8 },
+
+    /// `CLZ rd, rm` — count leading zeros.
+    Clz { rd: u8, rm: u8 },
+    /// `RBIT rd, rm` — reverse the bit order.
+    Rbit { rd: u8, rm: u8 },
+
+    /// `LDRD`/`STRD rt, rt2, [rn, #±imm]{!}` — load/store two words.
+    MemD {
+        load: bool,
+        rt: u8,
+        rt2: u8,
+        rn: u8,
+        imm: u32,
+        add: bool,
+        index: bool,
+        wback: bool,
+    },
+    /// Wide `STM`/`LDM` (`regs` is the full 16-bit register list). `db` selects the
+    /// decrement-before form (`STMDB`/`LDMDB`, and thus `PUSH.W`/`POP.W`).
+    StmW {
+        rn: u8,
+        regs: u16,
+        wback: bool,
+        db: bool,
+    },
+    /// Wide `LDM` — see [`StmW`](Instr::StmW).
+    LdmW {
+        rn: u8,
+        regs: u16,
+        wback: bool,
+        db: bool,
+    },
+
+    /// `MRS rd, <sysm>` — read a special register.
+    Mrs { rd: u8, sysm: u8 },
+    /// `MSR <sysm>, rn` — write a special register.
+    Msr { rn: u8, sysm: u8 },
+
+    /// `IT{x{y{z}}} <firstcond>` — begin an If-Then block (`mask != 0`).
+    It { firstcond: u8, mask: u8 },
+
     /// An encoding outside the modelled subset; executes as a no-op under debug
     /// assertion. See [`decode`](mod@super::decode) for the documented TODOs.
     Unknown(u16),

@@ -1,12 +1,21 @@
-//! A table-driven decoder from Thumb halfwords to [`Instr`].
+//! A table-driven decoder from Thumb / Thumb-2 halfwords to [`Instr`].
 //!
-//! ARMv6-M instructions are almost all a single 16-bit halfword; the one 32-bit
-//! form this core decodes is `BL`. [`decode`] takes the opcode halfword `w0`
-//! and the following halfword `w1` (used only by `BL`) and returns the decoded
-//! [`Instr`] together with how many **bytes** it occupies (`2` or `4`).
+//! [`decode`] takes the opcode halfword `w0` and the following halfword `w1` and
+//! returns the decoded [`Instr`] together with how many **bytes** it occupies
+//! (`2` or `4`).
 //!
-//! The decode is structured by the top bits of `w0`, mirroring the ARMv6-M ARM's
-//! Thumb encoding map:
+//! # 16- vs 32-bit
+//!
+//! The width is settled by the top five bits of the first halfword, exactly as
+//! the ARM ARM defines: `w0[15:11]` in `{0b11101, 0b11110, 0b11111}` marks a
+//! 32-bit Thumb-2 instruction (4 bytes, consuming `w1`); everything else is a
+//! 16-bit Thumb instruction (2 bytes). (`0b11100` — the plain 16-bit `B` — is
+//! deliberately *not* in that set.) The 16-bit path is the ARMv6-M decoder the
+//! Cortex-M0+ uses; the 32-bit path (`decode_thumb32`) adds the ARMv7-M
+//! Thumb-2 encodings the Cortex-M3/M4 bring.
+//!
+//! The 16-bit decode is structured by the top bits of `w0`, mirroring the
+//! ARMv6-M ARM's Thumb encoding map:
 //!
 //! - `00xxxx` — shift by immediate, add/subtract, move/compare immediate.
 //! - `010000` — data-processing (register).
@@ -19,22 +28,39 @@
 //! - `1100xx` — `STMIA` / `LDMIA`.
 //! - `1101xx` — conditional branch, `SVC`.
 //! - `11100x` — unconditional branch.
-//! - `11110x` — `BL` (32-bit).
+//! - `1011 1111` — `IT` blocks (and the hint space, as `NOP`).
+//! - `11101x`/`11110x`/`11111x` — the 32-bit Thumb-2 space (`decode_thumb32`).
 //!
 //! # Coverage
 //!
-//! Implemented: the full data-processing register group (`AND EOR LSL LSR ASR
-//! ADC SBC ROR TST RSB CMP CMN ORR MUL BIC MVN`); `MOV`/`ADD`/`SUB`/`CMP` in
-//! their immediate, register and high-register forms; the shift-by-immediate
-//! moves; `LDR`/`STR` (+ halfword/byte, signed loads) in literal, immediate,
-//! register and SP-relative forms; `ADR`; `ADD`/`SUB SP`; `PUSH`/`POP`;
-//! `STMIA`/`LDMIA`; `SXT*`/`UXT*`; `REV*`; `B`/`B<cond>`/`BL`/`BX`/`BLX`;
-//! `SVC`; and `NOP`/hints.
+//! ## ARMv6-M (16-bit)
+//!
+//! The full data-processing register group (`AND EOR LSL LSR ASR ADC SBC ROR TST
+//! RSB CMP CMN ORR MUL BIC MVN`); `MOV`/`ADD`/`SUB`/`CMP` in their immediate,
+//! register and high-register forms; the shift-by-immediate moves; `LDR`/`STR`
+//! (+ halfword/byte, signed loads) in literal, immediate, register and
+//! SP-relative forms; `ADR`; `ADD`/`SUB SP`; `PUSH`/`POP`; `STMIA`/`LDMIA`;
+//! `SXT*`/`UXT*`; `REV*`; `B`/`B<cond>`/`BL`/`BX`/`BLX`; `SVC`; `IT`; and
+//! `NOP`/hints.
+//!
+//! ## ARMv7-M / Thumb-2 (32-bit, Cortex-M3/M4)
+//!
+//! Data-processing with a *modified immediate* and with a *shifted register*
+//! (`AND BIC ORR ORN EOR ADD ADC SBC SUB RSB`, plus the `MOV`/`MVN` and
+//! `TST`/`TEQ`/`CMN`/`CMP` aliases); register-controlled shifts
+//! (`LSL`/`LSR`/`ASR`/`ROR`); the plain-binary-immediate `ADDW`/`SUBW`,
+//! `MOVW`/`MOVT`, and the bitfield ops `UBFX`/`SBFX`/`BFI`/`BFC`; the multiplies
+//! `MUL`/`MLA`/`MLS`/`UMULL`/`SMULL`; `CLZ`/`RBIT` and the wide byte-reversals;
+//! `LDR`/`STR` (+ byte/half, signed) with 12-bit and register offsets;
+//! `LDRD`/`STRD`; wide `LDM`/`STM` (IA/DB, i.e. `PUSH.W`/`POP.W`); the wide
+//! branches `B.W`/`B<cond>.W`/`BL`; and `MRS`/`MSR`.
 //!
 //! Not yet implemented (decode to [`Instr::Unknown`], a documented TODO): the
-//! system register access `MRS`/`MSR`, the barriers `DSB`/`DMB`/`ISB`, `CPS`,
-//! `BKPT`, `UDF`, and `WFI`/`WFE`/`SEV`/`YIELD` beyond treating the hint space
-//! as `NOP`.
+//! saturating `SSAT`/`USAT`, `SDIV`/`UDIV`, the DSP `SMLAL`/`SMLALxy` family,
+//! load/store with pre/post-index + writeback or a scaled register offset,
+//! `TBB`/`TBH`, `LDREX`/`STREX`, `CBZ`/`CBNZ`, all coprocessor / floating-point
+//! encodings, and (as on the M0+) the barriers `DSB`/`DMB`/`ISB`, `CPS`,
+//! `BKPT`, and `UDF`.
 
 use super::isa::{AddrMode, Instr, Mem, Size};
 
@@ -62,15 +88,15 @@ pub fn decode(w0: u16, w1: u16) -> (Instr, u8) {
         0b110000..=0b110011 => (decode_load_store_multiple(w0), 2),
         // 1101xx: conditional branch + SVC.
         0b110100..=0b110111 => (decode_cond_branch(w0), 2),
-        // 11100x: unconditional branch.
+        // 11100x: unconditional branch (16-bit).
         0b111000 | 0b111001 => (
             Instr::B {
                 offset: imm11_offset(w0),
             },
             2,
         ),
-        // 11110x: BL (32-bit) and other 32-bit encodings.
-        0b111100 | 0b111101 => (decode_bl(w0, w1), 4),
+        // 11101x / 11110x / 11111x: the 32-bit Thumb-2 (ARMv7-M) encodings.
+        0b111010..=0b111111 => (decode_thumb32(w0, w1), 4),
         _ => (Instr::Unknown(w0), 2),
     }
 }
@@ -379,8 +405,20 @@ fn decode_misc(w: u16) -> Instr {
             regs: (w & 0xFF) as u8,
             pc: w & (1 << 8) != 0,
         },
-        // 1111xxxx: hints (NOP/WFI/…). Treated as NOP; bits 7:4 pick the hint.
-        0b111100..=0b111111 => Instr::Nop,
+        // 1011 1111: IT blocks and hints (NOP/WFI/…). `mask` (bits 3:0) selects:
+        // zero is a hint (treated as NOP), non-zero begins an IT block with
+        // `firstcond` in bits 7:4.
+        0b111100..=0b111111 => {
+            let mask = (w & 0xF) as u8;
+            if mask == 0 {
+                Instr::Nop
+            } else {
+                Instr::It {
+                    firstcond: ((w >> 4) & 0xF) as u8,
+                    mask,
+                }
+            }
+        }
         _ => Instr::Unknown(w),
     }
 }
@@ -422,26 +460,406 @@ fn imm11_offset(w: u16) -> i32 {
     signed * 2
 }
 
-// --- 11110x: BL (32-bit) ---
+// --- 11101x / 11110x / 11111x: the 32-bit Thumb-2 space ---
 
-fn decode_bl(w0: u16, w1: u16) -> Instr {
-    // Only the BL form (w1's bits 15:14 = 11) is modelled; other 32-bit
-    // encodings (MRS/MSR/DSB/…) decode to Unknown.
-    if (w1 >> 14) & 0x3 != 0b11 {
-        return Instr::Unknown(w0);
+/// Decode a 32-bit Thumb-2 instruction from its two halfwords. Dispatch follows
+/// the ARMv7-M ARM §A5.3 top-level split on `w0[12:11]` (and `w1[15]` for the
+/// `11110` group), mirroring the structure the 16-bit decoder uses.
+fn decode_thumb32(w0: u16, w1: u16) -> Instr {
+    match (w0 >> 11) & 0x3 {
+        // 11101: load/store multiple & dual, and data-processing (shifted reg).
+        0b01 => decode_t32_11101(w0, w1),
+        // 11110: data-processing (immediate) and branches / misc control.
+        0b10 => {
+            if w1 & 0x8000 != 0 {
+                decode_t32_branch_misc(w0, w1)
+            } else if w0 & (1 << 9) == 0 {
+                decode_t32_data_mod_imm(w0, w1)
+            } else {
+                decode_t32_data_plain_imm(w0, w1)
+            }
+        }
+        // 11111: load/store single, data-processing (register), multiply.
+        0b11 => decode_t32_11111(w0, w1),
+        _ => Instr::Unknown(w0),
     }
+}
+
+/// `ThumbExpandImm_C`: expand a 12-bit modified immediate, returning the value
+/// and the shifter carry-out (`None` when the expansion leaves carry unchanged).
+fn thumb_expand_imm_c(val12: u32) -> (u32, Option<bool>) {
+    if (val12 >> 10) & 0x3 == 0 {
+        let imm8 = val12 & 0xFF;
+        let result = match (val12 >> 8) & 0x3 {
+            0b00 => imm8,
+            0b01 => (imm8 << 16) | imm8,
+            0b10 => (imm8 << 24) | (imm8 << 8),
+            _ => (imm8 << 24) | (imm8 << 16) | (imm8 << 8) | imm8,
+        };
+        (result, None)
+    } else {
+        let unrotated = 0x80 | (val12 & 0x7F);
+        let rot = (val12 >> 7) & 0x1F;
+        let result = unrotated.rotate_right(rot);
+        (result, Some(result >> 31 != 0))
+    }
+}
+
+// --- 11110 i 0: data-processing (modified immediate) ---
+
+fn decode_t32_data_mod_imm(w0: u16, w1: u16) -> Instr {
+    let op = ((w0 >> 5) & 0xF) as u8;
+    let rn = (w0 & 0xF) as u8;
+    let setflags = w0 & (1 << 4) != 0;
+    let rd = ((w1 >> 8) & 0xF) as u8;
+    let i = ((w0 >> 10) & 0x1) as u32;
+    let imm3 = ((w1 >> 12) & 0x7) as u32;
+    let imm8 = (w1 & 0xFF) as u32;
+    let (imm, carry) = thumb_expand_imm_c((i << 11) | (imm3 << 8) | imm8);
+    Instr::DpImm {
+        op,
+        rd,
+        rn,
+        imm,
+        setflags,
+        carry,
+    }
+}
+
+// --- 11110 i 1: data-processing (plain binary immediate) ---
+
+fn decode_t32_data_plain_imm(w0: u16, w1: u16) -> Instr {
+    let op = ((w0 >> 4) & 0x1F) as u8;
+    let rn = (w0 & 0xF) as u8;
+    let rd = ((w1 >> 8) & 0xF) as u8;
+    let i = ((w0 >> 10) & 0x1) as u32;
+    let imm3 = ((w1 >> 12) & 0x7) as u32;
+    let imm8 = (w1 & 0xFF) as u32;
+    let imm12 = (i << 11) | (imm3 << 8) | imm8;
+    // lsb/width share the imm3:imm2 / bits layout for the bitfield ops.
+    let imm2 = ((w1 >> 6) & 0x3) as u8;
+    let lsb = ((imm3 as u8) << 2) | imm2;
+    let widthm1 = (w1 & 0x1F) as u8;
+    match op {
+        // ADDW rd, rn, #imm12 (ADR if rn == 15).
+        0b00000 => Instr::AddImm {
+            rd,
+            rn,
+            imm: imm12,
+            setflags: false,
+        },
+        // SUBW rd, rn, #imm12.
+        0b01010 => Instr::SubImm {
+            rd,
+            rn,
+            imm: imm12,
+            setflags: false,
+        },
+        // MOVW rd, #imm16 (imm4 = rn field).
+        0b00100 => Instr::Movw {
+            rd,
+            imm: ((rn as u32) << 12) | imm12,
+        },
+        // MOVT rd, #imm16.
+        0b01100 => Instr::Movt {
+            rd,
+            imm: ((rn as u32) << 12) | imm12,
+        },
+        // SBFX rd, rn, #lsb, #width.
+        0b10100 => Instr::Sbfx {
+            rd,
+            rn,
+            lsb,
+            width: widthm1 + 1,
+        },
+        // UBFX rd, rn, #lsb, #width.
+        0b11100 => Instr::Ubfx {
+            rd,
+            rn,
+            lsb,
+            width: widthm1 + 1,
+        },
+        // BFI rd, rn, #lsb, #width (BFC if rn == 15); `widthm1` here is `msb`.
+        0b10110 => {
+            let width = widthm1.wrapping_sub(lsb).wrapping_add(1);
+            if rn == 15 {
+                Instr::Bfc { rd, lsb, width }
+            } else {
+                Instr::Bfi { rd, rn, lsb, width }
+            }
+        }
+        _ => Instr::Unknown(w0), // SSAT/USAT and the rest: TODO.
+    }
+}
+
+// --- 11110 ... (w1[15]=1): branches and miscellaneous control ---
+
+fn decode_t32_branch_misc(w0: u16, w1: u16) -> Instr {
+    let op1 = ((w1 >> 12) & 0x7) as u8; // w1 bits 14:12
     let s = ((w0 >> 10) & 0x1) as u32;
-    let imm10 = (w0 & 0x3FF) as u32;
-    let j1 = ((w1 >> 13) & 0x1) as u32;
-    let j2 = ((w1 >> 11) & 0x1) as u32;
     let imm11 = (w1 & 0x7FF) as u32;
-    // I1 = NOT(J1 EOR S), I2 = NOT(J2 EOR S).
-    let i1 = 1 - (j1 ^ s);
-    let i2 = 1 - (j2 ^ s);
-    // offset[24:0] = S:I1:I2:imm10:imm11:0, sign-extended from bit 24.
-    let imm = (s << 24) | (i1 << 23) | (i2 << 22) | (imm10 << 12) | (imm11 << 1);
-    let offset = ((imm << 7) as i32) >> 7;
-    Instr::Bl { offset }
+    // op1 x1x → BL / BLX (the link forms use w1[14]=1).
+    if w1 & (1 << 14) != 0 {
+        let imm10 = (w0 & 0x3FF) as u32;
+        let j1 = ((w1 >> 13) & 0x1) as u32;
+        let j2 = ((w1 >> 11) & 0x1) as u32;
+        let i1 = 1 - (j1 ^ s);
+        let i2 = 1 - (j2 ^ s);
+        let imm = (s << 24) | (i1 << 23) | (i2 << 22) | (imm10 << 12) | (imm11 << 1);
+        let offset = ((imm << 7) as i32) >> 7;
+        return Instr::Bl { offset };
+    }
+    // op1 == 0b010 with w0[10:4] == 0111 0xx → MSR/MRS/hints/barriers.
+    let op = (w0 >> 4) & 0x7F;
+    if (0b0111000..=0b0111111).contains(&op) {
+        // MSR (op=0111000x) and MRS (op=0111111x), plus hint/barrier space.
+        if op >> 1 == 0b011100 {
+            // MSR <spec>, Rn.
+            return Instr::Msr {
+                rn: (w0 & 0xF) as u8,
+                sysm: (w1 & 0xFF) as u8,
+            };
+        }
+        if op >> 1 == 0b011111 {
+            // MRS Rd, <spec>.
+            return Instr::Mrs {
+                rd: ((w1 >> 8) & 0xF) as u8,
+                sysm: (w1 & 0xFF) as u8,
+            };
+        }
+        // DSB/DMB/ISB/NOP.W and friends: treat as NOP.
+        return Instr::Nop;
+    }
+    // B.W: encoding T4 (unconditional, w1[12]=1) or T3 (conditional, w1[12]=0).
+    if w1 & (1 << 12) != 0 {
+        let imm10 = (w0 & 0x3FF) as u32;
+        let j1 = ((w1 >> 13) & 0x1) as u32;
+        let j2 = ((w1 >> 11) & 0x1) as u32;
+        let i1 = 1 - (j1 ^ s);
+        let i2 = 1 - (j2 ^ s);
+        let imm = (s << 24) | (i1 << 23) | (i2 << 22) | (imm10 << 12) | (imm11 << 1);
+        let offset = ((imm << 7) as i32) >> 7;
+        Instr::B { offset }
+    } else {
+        let cond = ((w0 >> 6) & 0xF) as u8;
+        let imm6 = (w0 & 0x3F) as u32;
+        let j1 = ((w1 >> 13) & 0x1) as u32;
+        let j2 = ((w1 >> 11) & 0x1) as u32;
+        // offset[20:0] = S:J2:J1:imm6:imm11:0, sign-extended from bit 20.
+        let imm = (s << 20) | (j2 << 19) | (j1 << 18) | (imm6 << 12) | (imm11 << 1);
+        let offset = ((imm << 11) as i32) >> 11;
+        let _ = op1;
+        Instr::Bcond { cond, offset }
+    }
+}
+
+// --- 11101: load/store multiple & dual, data-processing (shifted register) ---
+
+fn decode_t32_11101(w0: u16, w1: u16) -> Instr {
+    match (w0 >> 9) & 0x3 {
+        // 1110100: load/store multiple (w0[6]=0) or dual (w0[6]=1).
+        0b00 => {
+            if w0 & (1 << 6) == 0 {
+                decode_t32_ldm_stm(w0, w1)
+            } else {
+                decode_t32_ldrd_strd(w0, w1)
+            }
+        }
+        // 1110101: data-processing (shifted register).
+        0b01 => decode_t32_data_shift_reg(w0, w1),
+        // 111011x: coprocessor — not modelled.
+        _ => Instr::Unknown(w0),
+    }
+}
+
+fn decode_t32_ldm_stm(w0: u16, w1: u16) -> Instr {
+    let rn = (w0 & 0xF) as u8;
+    let wback = w0 & (1 << 5) != 0;
+    let load = w0 & (1 << 4) != 0;
+    // w0[8:7]: 01 = increment-after (IA), 10 = decrement-before (DB).
+    let db = (w0 >> 7) & 0x3 == 0b10;
+    let regs = w1;
+    if load {
+        Instr::LdmW {
+            rn,
+            regs,
+            wback,
+            db,
+        }
+    } else {
+        Instr::StmW {
+            rn,
+            regs,
+            wback,
+            db,
+        }
+    }
+}
+
+fn decode_t32_ldrd_strd(w0: u16, w1: u16) -> Instr {
+    let rn = (w0 & 0xF) as u8;
+    let index = w0 & (1 << 8) != 0; // P
+    let add = w0 & (1 << 7) != 0; // U
+    let wback = w0 & (1 << 5) != 0; // W
+    let load = w0 & (1 << 4) != 0; // L
+    let rt = ((w1 >> 12) & 0xF) as u8;
+    let rt2 = ((w1 >> 8) & 0xF) as u8;
+    let imm = (w1 & 0xFF) as u32 * 4;
+    Instr::MemD {
+        load,
+        rt,
+        rt2,
+        rn,
+        imm,
+        add,
+        index,
+        wback,
+    }
+}
+
+fn decode_t32_data_shift_reg(w0: u16, w1: u16) -> Instr {
+    let op = ((w0 >> 5) & 0xF) as u8;
+    let rn = (w0 & 0xF) as u8;
+    let setflags = w0 & (1 << 4) != 0;
+    let rd = ((w1 >> 8) & 0xF) as u8;
+    let rm = (w1 & 0xF) as u8;
+    let stype = ((w1 >> 4) & 0x3) as u8;
+    let imm3 = ((w1 >> 12) & 0x7) as u8;
+    let imm2 = ((w1 >> 6) & 0x3) as u8;
+    let (stype, samt) = decode_imm_shift(stype, (imm3 << 2) | imm2);
+    Instr::DpShiftReg {
+        op,
+        rd,
+        rn,
+        rm,
+        stype,
+        samt,
+        setflags,
+    }
+}
+
+/// Decode an immediate shift field (`DecodeImmShift`): LSR/ASR of `#0` means 32,
+/// and ROR of `#0` is RRX (signalled as `(3, 0)`).
+fn decode_imm_shift(stype: u8, amt: u8) -> (u8, u8) {
+    match stype {
+        0 => (0, amt),
+        1 => (1, if amt == 0 { 32 } else { amt }),
+        2 => (2, if amt == 0 { 32 } else { amt }),
+        _ => (3, amt), // ROR, or RRX when amt == 0.
+    }
+}
+
+// --- 11111: load/store single, data-processing (register), multiply ---
+
+fn decode_t32_11111(w0: u16, w1: u16) -> Instr {
+    match (w0 >> 9) & 0x3 {
+        // 1111100: load/store single word/halfword/byte.
+        0b00 => decode_t32_load_store_single(w0, w1),
+        // 1111101: data-processing (register) & multiply.
+        0b01 => decode_t32_dp_reg_mul(w0, w1),
+        // 111111x: coprocessor / floating-point — not modelled.
+        _ => Instr::Unknown(w0),
+    }
+}
+
+fn decode_t32_load_store_single(w0: u16, w1: u16) -> Instr {
+    let rn = (w0 & 0xF) as u8;
+    let rt = ((w1 >> 12) & 0xF) as u8;
+    let signed = w0 & (1 << 8) != 0;
+    let size = match (w0 >> 5) & 0x3 {
+        0b00 => Size::Byte,
+        0b01 => Size::Half,
+        0b10 => Size::Word,
+        _ => return Instr::Unknown(w0),
+    };
+    let load = w0 & (1 << 4) != 0;
+    // w0[7]=1 → unsigned 12-bit positive offset; else imm8 index / register.
+    let addr = if w0 & (1 << 7) != 0 {
+        AddrMode::Imm((w1 & 0xFFF) as u32)
+    } else if w1 & (1 << 11) != 0 {
+        // imm8 form with P/U/W: model only the common P=1,U=1,W=0 (positive,
+        // no writeback) case; otherwise leave it unmodelled.
+        let p = w1 & (1 << 10) != 0;
+        let u = w1 & (1 << 9) != 0;
+        let wb = w1 & (1 << 8) != 0;
+        if p && u && !wb {
+            AddrMode::Imm((w1 & 0xFF) as u32)
+        } else {
+            return Instr::Unknown(w0);
+        }
+    } else if (w1 >> 6) & 0x3F == 0 {
+        // Register offset, LSL #imm2. Model the shift-by-0 case.
+        if (w1 >> 4) & 0x3 == 0 {
+            AddrMode::Reg((w1 & 0xF) as u8)
+        } else {
+            return Instr::Unknown(w0);
+        }
+    } else {
+        return Instr::Unknown(w0);
+    };
+    Instr::Mem(Mem {
+        load,
+        size,
+        signed,
+        rt,
+        rn,
+        addr,
+    })
+}
+
+fn decode_t32_dp_reg_mul(w0: u16, w1: u16) -> Instr {
+    let rn = (w0 & 0xF) as u8;
+    let rm = (w1 & 0xF) as u8;
+    let rd = ((w1 >> 8) & 0xF) as u8;
+    match (w0 >> 4) & 0x1F {
+        // 11111 0100 xxx: register-controlled shift (LSL/LSR/ASR/ROR).
+        0b00000..=0b00111 if w1 & 0xF000 == 0xF000 => {
+            let stype = ((w0 >> 5) & 0x3) as u8;
+            let setflags = w0 & (1 << 4) != 0;
+            Instr::ShiftReg {
+                rd,
+                rn,
+                rm,
+                stype,
+                setflags,
+            }
+        }
+        // 11111 0101 001x (bits[8:4]=01001): REV/REV16/RBIT/REVSH, op2 = w1[5:4].
+        0b01001 => match (w1 >> 4) & 0x3 {
+            0b00 => Instr::Rev { rd, rm, op: 0 },
+            0b01 => Instr::Rev { rd, rm, op: 1 },
+            0b10 => Instr::Rbit { rd, rm },
+            _ => Instr::Rev { rd, rm, op: 2 },
+        },
+        // 11111 0101 011x (bits[8:4]=01011): CLZ over Rm (Rn == Rm).
+        0b01011 if (w1 >> 4) & 0x3 == 0 => Instr::Clz { rd, rm },
+        // 11111 0110 xxx: 32-bit multiply (MUL/MLA/MLS).
+        0b10000..=0b10111 => {
+            let ra = ((w1 >> 12) & 0xF) as u8;
+            if (w0 >> 4) & 0x7 == 0 {
+                // op1 = 000: MUL (Ra=1111) or MLA, MLS (op2 selects).
+                match (w1 >> 4) & 0x3 {
+                    0b00 if ra == 0b1111 => Instr::Mul32 { rd, rn, rm },
+                    0b00 => Instr::Mla { rd, rn, rm, ra },
+                    0b01 => Instr::Mls { rd, rn, rm, ra },
+                    _ => Instr::Unknown(w0),
+                }
+            } else {
+                Instr::Unknown(w0)
+            }
+        }
+        // 11111 0111 xxx: 64-bit multiply (UMULL/SMULL).
+        0b11000..=0b11111 => {
+            let rdlo = ((w1 >> 12) & 0xF) as u8;
+            let rdhi = ((w1 >> 8) & 0xF) as u8;
+            match (w0 >> 4) & 0x7 {
+                0b000 if w1 & 0xF0 == 0 => Instr::Smull { rdlo, rdhi, rn, rm },
+                0b010 if w1 & 0xF0 == 0 => Instr::Umull { rdlo, rdhi, rn, rm },
+                _ => Instr::Unknown(w0),
+            }
+        }
+        _ => Instr::Unknown(w0),
+    }
 }
 
 #[cfg(test)]
@@ -541,7 +959,69 @@ mod tests {
 
     #[test]
     fn unknown_for_unmodelled_encoding() {
-        // An MRS (32-bit, w1 top bits != 11) is not modelled.
-        assert_eq!(decode(0xF3EF, 0x8000).0, Instr::Unknown(0xF3EF));
+        // A VFP/coprocessor encoding (w0[15:11]=11101, w0[10:9]=10) is not
+        // modelled and still decodes to Unknown.
+        assert_eq!(decode(0xEC00, 0x0A10).0, Instr::Unknown(0xEC00));
+    }
+
+    #[test]
+    fn decodes_movw_movt() {
+        // MOVW r0, #0x1234 = 0xF241 0x2034 (imm4=1,i=0,imm3=2,imm8=0x34).
+        assert_eq!(
+            decode(0xF241, 0x2034),
+            (Instr::Movw { rd: 0, imm: 0x1234 }, 4)
+        );
+        // MOVT r0, #0xABCD = 0xF6CA 0x30CD.
+        assert_eq!(
+            decode(0xF6CA, 0x30CD),
+            (Instr::Movt { rd: 0, imm: 0xABCD }, 4)
+        );
+    }
+
+    #[test]
+    fn decodes_mul_wide() {
+        // MUL r0, r1, r2 = 0xFB01 0xF002 (Ra=1111).
+        assert_eq!(
+            decode(0xFB01, 0xF002),
+            (
+                Instr::Mul32 {
+                    rd: 0,
+                    rn: 1,
+                    rm: 2
+                },
+                4
+            )
+        );
+    }
+
+    #[test]
+    fn decodes_ubfx() {
+        // UBFX r0, r1, #4, #8 = 0xF3C1 0x1007 (lsb=4 → imm3:imm2=00100, widthm1=7).
+        assert_eq!(
+            decode(0xF3C1, 0x1007),
+            (
+                Instr::Ubfx {
+                    rd: 0,
+                    rn: 1,
+                    lsb: 4,
+                    width: 8
+                },
+                4
+            )
+        );
+    }
+
+    #[test]
+    fn decodes_it_block() {
+        // ITE EQ = 0xBF0C (firstcond=0b0000, mask=0b1100).
+        assert_eq!(
+            decode(0xBF0C, 0).0,
+            Instr::It {
+                firstcond: 0b0000,
+                mask: 0b1100,
+            }
+        );
+        // A bare NOP in the same encoding group (mask == 0) stays a NOP.
+        assert_eq!(decode(0xBF00, 0).0, Instr::Nop);
     }
 }
