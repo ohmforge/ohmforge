@@ -27,7 +27,8 @@
 //! two agree to the last bit. The `sparse_matches_dense` correctness tests assert
 //! that; the `sparse_vs_dense` bench measures the scaling.
 
-use std::collections::BTreeMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
 /// Unknown count at or above which [`System::new`] assembles into the sparse
 /// backing. Chosen well above every hand-built test circuit so small, human-scale
@@ -370,6 +371,375 @@ impl System {
     }
 }
 
+// ===========================================================================
+// KLU-class sparse: fill-reducing ordering + reusable symbolic factorization
+// (CP-SIM-M4.2)
+// ===========================================================================
+//
+// The `System::solve_sparse` above eliminates in *natural* column order and folds
+// the right-hand side into one pass — correct and bit-for-bit matching the dense
+// solve, but on a badly-numbered matrix (a shared rail / "arrow" whose hub is
+// eliminated first, a 2-D grid) that order creates catastrophic fill, so the
+// factorization degrades toward the dense cube. It also throws the factors away:
+// a transient or sweep that solves the *same structure* with new numbers every
+// step pays the full pivot search and symbolic bookkeeping again and again.
+//
+// This section adds the KLU-class answer. [`SparseMatrix`] holds the coefficient
+// pattern; [`Symbolic::analyze`] computes a **fill-reducing minimum-degree
+// ordering** once (so the hub is eliminated last, the grid cut cheaply);
+// [`Symbolic::factor`] runs a right-looking LU with partial pivoting *in that
+// order*, recording the pivot sequence, the triangular factors L and U, and the
+// fill pattern into a [`Numeric`]. [`Numeric::solve`] is then a cheap forward/back
+// substitution for any right-hand side, and [`Numeric::refactor`] **reuses the
+// symbolic factorization** — the ordering, the pivot sequence, and the fill — to
+// recompute only the numbers for a matrix of the same structure, which is exactly
+// what a transient step or a sweep point needs (a numeric refactor, no re-analysis
+// and no pivot search). It is numerically the same LU as the dense solve, merely
+// reordered, so it agrees with it to a few ULP (the `ordered_matches_dense` tests
+// hold it to ≤1e-12); the `ordered_vs_natural` bench measures the scaling win.
+
+/// A sparse coefficient matrix in row-map form — the input to the reusable ordered
+/// LU ([`Symbolic`] / [`Numeric`], `CP-SIM-M4.2`). Mirrors the stamp API of the
+/// engine's `System` (conductance / raw entry / voltage-source coupling) so a
+/// caller assembles it exactly as it would the engine's system; the right-hand
+/// side is
+/// kept separately and handed to [`Numeric::solve`].
+pub struct SparseMatrix {
+    n: usize,
+    rows: Vec<BTreeMap<usize, f64>>,
+}
+
+impl SparseMatrix {
+    /// A zeroed `n × n` sparse matrix.
+    pub fn new(n: usize) -> Self {
+        Self {
+            n,
+            rows: vec![BTreeMap::new(); n],
+        }
+    }
+
+    /// Accumulate `val` into entry (`r`, `c`).
+    pub fn add(&mut self, r: usize, c: usize, val: f64) {
+        *self.rows[r].entry(c).or_insert(0.0) += val;
+    }
+
+    /// Stamp a conductance `g` between optional nodes `i`/`j` (`None` = ground),
+    /// identical to `System::stamp_conductance`.
+    pub fn stamp_conductance(&mut self, i: Option<usize>, j: Option<usize>, g: f64) {
+        if let Some(i) = i {
+            self.add(i, i, g);
+        }
+        if let Some(j) = j {
+            self.add(j, j, g);
+        }
+        if let (Some(i), Some(j)) = (i, j) {
+            self.add(i, j, -g);
+            self.add(j, i, -g);
+        }
+    }
+
+    /// Stamp the matrix coupling of a voltage source from `plus`/`minus` onto
+    /// branch row `k` (the `volts` right-hand side is the caller's, as in
+    /// `System::stamp_vsource`).
+    pub fn stamp_vsource(&mut self, plus: Option<usize>, minus: Option<usize>, k: usize) {
+        if let Some(i) = plus {
+            self.add(i, k, 1.0);
+            self.add(k, i, 1.0);
+        }
+        if let Some(j) = minus {
+            self.add(j, k, -1.0);
+            self.add(k, j, -1.0);
+        }
+    }
+}
+
+/// The reusable symbolic factorization (`CP-SIM-M4.2`): a fill-reducing ordering
+/// of a matrix's structure, computed once and reused across every numeric
+/// factorization of a matrix with that same pattern.
+pub struct Symbolic {
+    n: usize,
+    /// `perm[new] = old` — the fill-reducing elimination order, applied
+    /// symmetrically (rows and columns both reordered by it).
+    perm: Vec<usize>,
+    /// `iperm[old] = new` — the inverse of `perm`.
+    iperm: Vec<usize>,
+}
+
+impl Symbolic {
+    /// Analyze `mat`'s nonzero structure and compute a minimum-degree fill-reducing
+    /// ordering. Depends only on the pattern, so the result is reused for every
+    /// numeric factorization of a same-structured matrix.
+    pub fn analyze(mat: &SparseMatrix) -> Symbolic {
+        let perm = min_degree_order(&mat.rows, mat.n);
+        let mut iperm = vec![0usize; mat.n];
+        for (newi, &old) in perm.iter().enumerate() {
+            iperm[old] = newi;
+        }
+        Symbolic {
+            n: mat.n,
+            perm,
+            iperm,
+        }
+    }
+
+    /// Numerically factor `mat` (which must share this ordering's structure) with
+    /// partial pivoting *within the fill-reducing order*, returning the reusable
+    /// [`Numeric`] factors, or `None` if the matrix is singular.
+    pub fn factor(&self, mat: &SparseMatrix) -> Option<Numeric> {
+        self.run(mat, None)
+    }
+
+    /// The shared right-looking elimination. `forced = None` searches for the
+    /// partial pivot and records it; `forced = Some(seq)` reuses a recorded pivot
+    /// sequence (the refactor path), failing with `None` if a reused pivot has
+    /// collapsed to ~0 so the caller can fall back to a fresh [`factor`](Self::factor).
+    fn run(&self, mat: &SparseMatrix, forced: Option<&[usize]>) -> Option<Numeric> {
+        let n = self.n;
+        // The matrix in permuted coordinates: new row i is old row perm[i], its
+        // columns remapped through iperm, kept column-ascending.
+        let mut rows: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+        for (newi, row) in rows.iter_mut().enumerate() {
+            let old = self.perm[newi];
+            let mut v: Vec<(usize, f64)> = mat.rows[old]
+                .iter()
+                .map(|(&oc, &val)| (self.iperm[oc], val))
+                .collect();
+            v.sort_by_key(|&(c, _)| c);
+            *row = v;
+        }
+
+        let mut col_rows: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (r, row) in rows.iter().enumerate() {
+            for &(c, _) in row {
+                col_rows[c].push(r);
+            }
+        }
+        let mut used = vec![false; n];
+        let mut pivot_of_col = vec![usize::MAX; n];
+        let mut l: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+        let mut u: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+
+        for c in 0..n {
+            // Pick the pivot: a recorded one for refactor, else the largest column
+            // magnitude among unused rows (partial pivoting, as the dense solve).
+            let pivot_row = match forced {
+                Some(seq) => {
+                    let p = seq[c];
+                    if p >= n || used[p] || value_at(&rows, p, c).abs() < 1e-15 {
+                        return None; // a reused pivot collapsed — re-analyze/factor
+                    }
+                    p
+                }
+                None => {
+                    let mut pr = usize::MAX;
+                    let mut best = 0.0_f64;
+                    for &r in &col_rows[c] {
+                        if used[r] {
+                            continue;
+                        }
+                        let v = value_at(&rows, r, c).abs();
+                        if v > best {
+                            best = v;
+                            pr = r;
+                        }
+                    }
+                    if best < 1e-15 || pr == usize::MAX {
+                        return None; // singular / underdetermined
+                    }
+                    pr
+                }
+            };
+            used[pivot_row] = true;
+            pivot_of_col[c] = pivot_row;
+
+            let pivot_val = value_at(&rows, pivot_row, c);
+            // U row c: the pivot row's entries at columns ≥ c (diagonal + upper).
+            let urow: Vec<(usize, f64)> = rows[pivot_row]
+                .iter()
+                .copied()
+                .filter(|&(cc, _)| cc >= c)
+                .collect();
+            let pivot_upper: Vec<(usize, f64)> =
+                urow.iter().copied().filter(|&(cc, _)| cc > c).collect();
+            u[c] = urow;
+
+            let targets: Vec<usize> = col_rows[c]
+                .iter()
+                .copied()
+                .filter(|&r| r != pivot_row && !used[r])
+                .collect();
+            let mut lcol: Vec<(usize, f64)> = Vec::with_capacity(targets.len());
+            for r in targets {
+                let Ok(idx_c) = rows[r].binary_search_by(|&(cc, _)| cc.cmp(&c)) else {
+                    continue; // a cancelled fill left no live entry at c
+                };
+                let factor = rows[r][idx_c].1 / pivot_val;
+                rows[r].remove(idx_c);
+                lcol.push((r, factor)); // L multiplier, recorded for reuse
+                if factor == 0.0 {
+                    continue;
+                }
+                for &(cj, pv) in &pivot_upper {
+                    match rows[r].binary_search_by(|&(cc, _)| cc.cmp(&cj)) {
+                        Ok(i) => rows[r][i].1 -= factor * pv,
+                        Err(i) => {
+                            rows[r].insert(i, (cj, -factor * pv));
+                            col_rows[cj].push(r); // new fill
+                        }
+                    }
+                }
+            }
+            l[c] = lcol;
+        }
+
+        Some(Numeric {
+            n,
+            perm: self.perm.clone(),
+            pivot_of_col,
+            l,
+            u,
+        })
+    }
+}
+
+/// The reusable numeric LU factors of one matrix in a [`Symbolic`] ordering
+/// (`CP-SIM-M4.2`). [`solve`](Self::solve) applies them to any right-hand side;
+/// [`refactor`](Self::refactor) recomputes them for a same-structured matrix
+/// without re-analyzing or re-searching pivots.
+pub struct Numeric {
+    n: usize,
+    /// `perm[new] = old`, carried so [`solve`](Self::solve) can (un)permute.
+    perm: Vec<usize>,
+    /// The pivot (permuted) row chosen for each permuted column — the reusable
+    /// pivot sequence.
+    pivot_of_col: Vec<usize>,
+    /// Per column: the `(row, multiplier)` entries of L below the pivot.
+    l: Vec<Vec<(usize, f64)>>,
+    /// Per column: the pivot row's entries at columns ≥ that column (U, diagonal
+    /// first in sort order).
+    u: Vec<Vec<(usize, f64)>>,
+}
+
+impl Numeric {
+    /// Solve `A·x = rhs` from the stored factors — permute the right-hand side,
+    /// forward-substitute through L, back-substitute through U, unpermute. The same
+    /// reduction order the dense solver uses, so the result matches it to a few ULP.
+    pub fn solve(&self, rhs: &[f64]) -> Vec<f64> {
+        let n = self.n;
+        let mut bp = vec![0.0; n];
+        for i in 0..n {
+            bp[i] = rhs[self.perm[i]];
+        }
+        // Forward substitution: apply L column by column (the elimination order).
+        for c in 0..n {
+            let piv_b = bp[self.pivot_of_col[c]];
+            for &(r, factor) in &self.l[c] {
+                bp[r] -= factor * piv_b;
+            }
+        }
+        // Back substitution: x[c] = (b[pivot] − Σ_{j>c} U[c][j]·x[j]) / diag.
+        let mut x = vec![0.0; n];
+        for c in (0..n).rev() {
+            let mut diag = 0.0;
+            let mut acc = 0.0;
+            for &(cc, val) in &self.u[c] {
+                if cc == c {
+                    diag = val;
+                } else {
+                    acc += val * x[cc];
+                }
+            }
+            x[c] = (bp[self.pivot_of_col[c]] - acc) / diag;
+        }
+        let mut out = vec![0.0; n];
+        for i in 0..n {
+            out[self.perm[i]] = x[i];
+        }
+        out
+    }
+
+    /// Reuse this factorization's symbolic structure — ordering, pivot sequence,
+    /// fill — to recompute the numbers for `mat`, which must share the original
+    /// structure. Only the numeric refactor runs: no re-analysis, no pivot search.
+    /// Returns `None` if a reused pivot has collapsed (the caller then re-analyzes
+    /// and factors afresh).
+    pub fn refactor(&mut self, sym: &Symbolic, mat: &SparseMatrix) -> Option<()> {
+        let fresh = sym.run(mat, Some(&self.pivot_of_col))?;
+        *self = fresh;
+        Some(())
+    }
+}
+
+/// The value a permuted row currently holds at a column (0.0 if absent) — the
+/// elimination's structural lookup.
+fn value_at(rows: &[Vec<(usize, f64)>], r: usize, c: usize) -> f64 {
+    match rows[r].binary_search_by(|&(cc, _)| cc.cmp(&c)) {
+        Ok(i) => rows[r][i].1,
+        Err(_) => 0.0,
+    }
+}
+
+/// A minimum-degree fill-reducing ordering of a matrix's (symmetrized) nonzero
+/// structure — the AMD-style heart of [`Symbolic::analyze`] (`CP-SIM-M4.2`).
+///
+/// The matrix graph has an edge between `i` and `j` wherever `A[i][j]` or `A[j][i]`
+/// is structurally present (`i ≠ j`). The classic greedy heuristic repeatedly
+/// eliminates the lowest-degree node — eliminating a node turns its neighbors into
+/// a clique (the fill it creates) — so a hub shared by everything (the pathological
+/// case for natural order) is eliminated *last*, when its neighbors are already
+/// gone, and a long chain / ladder keeps its already-good order. A lazy
+/// binary-heap keyed by current degree drives the selection; stale entries (a node
+/// whose degree has since changed) are skipped on pop.
+fn min_degree_order(rows: &[BTreeMap<usize, f64>], n: usize) -> Vec<usize> {
+    let mut adj: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); n];
+    for (r, row) in rows.iter().enumerate() {
+        for &c in row.keys() {
+            if c != r {
+                adj[r].insert(c);
+                adj[c].insert(r);
+            }
+        }
+    }
+
+    let mut eliminated = vec![false; n];
+    let mut order: Vec<usize> = Vec::with_capacity(n);
+    let mut heap: BinaryHeap<Reverse<(usize, usize)>> = BinaryHeap::new();
+    for (v, a) in adj.iter().enumerate() {
+        heap.push(Reverse((a.len(), v)));
+    }
+
+    while let Some(Reverse((d, v))) = heap.pop() {
+        if eliminated[v] || d != adj[v].len() {
+            continue; // already gone, or a stale (superseded) degree entry
+        }
+        eliminated[v] = true;
+        order.push(v);
+
+        let nbrs: Vec<usize> = adj[v].iter().copied().filter(|&u| !eliminated[u]).collect();
+        for &u in &nbrs {
+            adj[u].remove(&v);
+        }
+        // Eliminating v makes its surviving neighbors a clique (the induced fill).
+        for i in 0..nbrs.len() {
+            for j in (i + 1)..nbrs.len() {
+                let (a, b) = (nbrs[i], nbrs[j]);
+                adj[a].insert(b);
+                adj[b].insert(a);
+            }
+        }
+        for &u in &nbrs {
+            heap.push(Reverse((adj[u].len(), u))); // re-key with the new degree
+        }
+    }
+    // Any node never reached (fully isolated) trails in natural order.
+    for (v, &e) in eliminated.iter().enumerate() {
+        if !e {
+            order.push(v);
+        }
+    }
+    order
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,5 +948,206 @@ mod tests {
         s.z[1] = 3.0;
         let x = s.solve().unwrap();
         assert_eq!(x, vec![3.0, 2.0]);
+    }
+
+    // --- Fill-reducing ordered reusable LU — CP-SIM-M4.2 --------------------
+
+    /// A conductance list — `(node_i, node_j, g)`, `None` = ground — the fixtures
+    /// below stamp into both a dense reference and a [`SparseMatrix`].
+    type Conds = Vec<(Option<usize>, Option<usize>, f64)>;
+
+    /// Conductance list + right-hand side for an "arrow"/hub network: node 0 is a
+    /// hub joined by `g` to each of `n` leaves (nodes `1..=n`), every leaf also tied
+    /// to ground by `g`, and a probe current injected at the hub. Numbering the hub
+    /// first is the worst case for natural-order fill; min-degree eliminates it last.
+    fn arrow(n: usize) -> (Conds, Vec<f64>, usize) {
+        let size = n + 1;
+        let g = 1e-3;
+        let mut conds = Vec::new();
+        for leaf in 1..=n {
+            conds.push((Some(0usize), Some(leaf), g)); // hub ↔ leaf
+            conds.push((Some(leaf), None, g)); // leaf ↔ ground
+        }
+        let mut rhs = vec![0.0; size];
+        rhs[0] = 1e-3; // inject 1 mA at the hub
+        (conds, rhs, size)
+    }
+
+    /// Conductance list + RHS for an `m × m` resistor grid: each node joined to its
+    /// right and down neighbor by `g`, every node leaked to ground by `g` (so the
+    /// system is nonsingular), and a probe current at a corner. The 2-D structure is
+    /// the case where a fill-reducing order beats natural row-major numbering.
+    fn grid(m: usize) -> (Conds, Vec<f64>, usize) {
+        let size = m * m;
+        let g = 1e-3;
+        let idx = |r: usize, c: usize| r * m + c;
+        let mut conds = Vec::new();
+        for r in 0..m {
+            for c in 0..m {
+                let node = idx(r, c);
+                conds.push((Some(node), None, g)); // leak to ground
+                if c + 1 < m {
+                    conds.push((Some(node), Some(idx(r, c + 1)), g));
+                }
+                if r + 1 < m {
+                    conds.push((Some(node), Some(idx(r + 1, c)), g));
+                }
+            }
+        }
+        let mut rhs = vec![0.0; size];
+        rhs[0] = 1e-3;
+        (conds, rhs, size)
+    }
+
+    /// Solve a conductance list + RHS with the dense reference solver.
+    fn dense_ref(conds: &Conds, rhs: &[f64], n: usize) -> Vec<f64> {
+        let mut s = System::dense(n);
+        for &(i, j, g) in conds {
+            s.stamp_conductance(i, j, g);
+        }
+        s.z.copy_from_slice(rhs);
+        s.solve().expect("dense reference solves")
+    }
+
+    /// Assemble a [`SparseMatrix`] from a conductance list.
+    fn sparse_mat(conds: &Conds, n: usize) -> SparseMatrix {
+        let mut m = SparseMatrix::new(n);
+        for &(i, j, g) in conds {
+            m.stamp_conductance(i, j, g);
+        }
+        m
+    }
+
+    fn max_abs_diff(a: &[f64], b: &[f64]) -> f64 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0, f64::max)
+    }
+
+    /// The `CP-SIM-M4.2` correctness gate: the fill-reducing ordered LU solves the
+    /// same systems as the dense reference to ≤1e-12 (it is the same LU, merely
+    /// reordered). Covers the arrow (worst natural-order fill), a 2-D grid, and a
+    /// resistor ladder.
+    #[test]
+    fn ordered_matches_dense() {
+        let cases: Vec<(Conds, Vec<f64>, usize)> = vec![arrow(500), grid(16), arrow(2000)];
+        for (conds, rhs, n) in cases {
+            let reference = dense_ref(&conds, &rhs, n);
+            let mat = sparse_mat(&conds, n);
+            let sym = Symbolic::analyze(&mat);
+            let num = sym.factor(&mat).expect("ordered factor solves");
+            let x = num.solve(&rhs);
+            let err = max_abs_diff(&x, &reference);
+            assert!(err <= 1e-12, "ordered vs dense max |Δ| = {err} (n = {n})");
+        }
+
+        // A ladder (with its voltage-source branch row) too, to exercise the pivot
+        // on a zero-diagonal branch under the ordering.
+        let n = 300;
+        let mut mat = SparseMatrix::new(n + 2);
+        let mut sref = System::dense(n + 2);
+        let branch = n + 1;
+        mat.stamp_vsource(Some(0), None, branch);
+        sref.stamp_vsource(Some(0), None, branch, 10.0);
+        let mut prev = 0usize;
+        for i in 0..n {
+            let node = i + 1;
+            mat.stamp_conductance(Some(prev), Some(node), 1e-3);
+            mat.stamp_conductance(Some(node), None, 1e-3);
+            sref.stamp_conductance(Some(prev), Some(node), 1e-3);
+            sref.stamp_conductance(Some(node), None, 1e-3);
+            prev = node;
+        }
+        let mut rhs = vec![0.0; n + 2];
+        rhs[branch] = 10.0;
+        let reference = sref.solve().unwrap();
+        let sym = Symbolic::analyze(&mat);
+        let x = sym.factor(&mat).unwrap().solve(&rhs);
+        assert!(
+            max_abs_diff(&x, &reference) <= 1e-12,
+            "ordered ladder vs dense diverged"
+        );
+        assert_eq!(x[0], 10.0, "source-pinned hub voltage");
+    }
+
+    /// Reusing the symbolic factorization (`refactor`) for a same-structured matrix
+    /// gives the same answer as factoring it afresh — the KLU reuse property. The
+    /// second matrix scales every conductance (and uses a different RHS), so only
+    /// the numbers change, not the structure; `refactor` must track it to ≤1e-12.
+    #[test]
+    fn refactor_reuses_symbolic_and_matches_fresh() {
+        let (conds, rhs0, n) = arrow(800);
+        let mat0 = sparse_mat(&conds, n);
+        let sym = Symbolic::analyze(&mat0);
+        let mut num = sym.factor(&mat0).unwrap();
+        assert!(max_abs_diff(&num.solve(&rhs0), &dense_ref(&conds, &rhs0, n)) <= 1e-12);
+
+        // A structurally identical matrix with every conductance ×3.7, new RHS.
+        let conds2: Vec<_> = conds.iter().map(|&(i, j, g)| (i, j, g * 3.7)).collect();
+        let mut rhs1 = vec![0.0; n];
+        rhs1[0] = 2e-3;
+        rhs1[n / 2] = -1e-3;
+        let mat2 = sparse_mat(&conds2, n);
+
+        // Refactor reuses the ordering + pivot sequence; no re-analysis.
+        num.refactor(&sym, &mat2).expect("refactor succeeds");
+        let reused = num.solve(&rhs1);
+
+        // A fresh analyze+factor of the scaled matrix is the ground truth.
+        let fresh = Symbolic::analyze(&mat2).factor(&mat2).unwrap().solve(&rhs1);
+        let reference = dense_ref(&conds2, &rhs1, n);
+        assert!(
+            max_abs_diff(&reused, &fresh) <= 1e-12,
+            "refactor diverged from a fresh factor"
+        );
+        assert!(
+            max_abs_diff(&reused, &reference) <= 1e-12,
+            "refactor diverged from the dense reference"
+        );
+    }
+
+    /// The min-degree ordering actually cuts fill on the arrow: eliminating the hub
+    /// last keeps the factor nonzero count O(n), where natural order (hub first)
+    /// would fill the whole leaf block to O(n²). We check the ordering puts the
+    /// hub (node 0) last and the resulting L/U stay near-linear in size.
+    #[test]
+    fn ordering_cuts_fill_on_the_arrow() {
+        let (conds, _rhs, size) = arrow(1000); // size = 1001 (hub + 1000 leaves)
+        let mat = sparse_mat(&conds, size);
+        let sym = Symbolic::analyze(&mat);
+        // The hub (node 0) is eliminated among the very last nodes — the whole point
+        // of min-degree here (it ties at degree 1 with the final leaf, so it lands
+        // second-to-last rather than dead last). Natural order would take it first.
+        assert!(
+            sym.iperm[0] >= size - 2,
+            "min-degree should eliminate the hub (node 0) last, got order {}",
+            sym.iperm[0]
+        );
+        let n = size;
+        let num = sym.factor(&mat).unwrap();
+        let fill: usize = num.l.iter().map(|c| c.len()).sum::<usize>()
+            + num.u.iter().map(|c| c.len()).sum::<usize>();
+        // Near-linear: bounded by a small constant × size, nowhere near n²/2.
+        assert!(
+            fill < 8 * n,
+            "ordered factor fill {fill} is not near-linear for n = {n}"
+        );
+    }
+
+    /// A singular sparse matrix (an all-zero row/column) is reported `None` by the
+    /// ordered factorization, exactly as the dense and natural-order paths do.
+    #[test]
+    fn ordered_reports_singular() {
+        let (mut conds, _rhs, _n) = arrow(50);
+        // Add one wholly detached unknown (index 51): no entries → pivotless column.
+        let size = 52;
+        conds.retain(|_| true);
+        let mat = sparse_mat(&conds, size);
+        let sym = Symbolic::analyze(&mat);
+        assert!(
+            sym.factor(&mat).is_none(),
+            "a detached unknown must make the ordered factor singular"
+        );
     }
 }

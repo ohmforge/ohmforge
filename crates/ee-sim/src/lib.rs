@@ -2431,6 +2431,50 @@ pub mod bench_support {
     pub fn dc_solve_sparse(circuit: &Circuit) -> Option<Vec<f64>> {
         linear_dc_system(circuit, System::sparse).solve()
     }
+
+    // --- CP-SIM-M4.2: fill-reducing ordered reusable sparse LU -------------
+
+    pub use crate::mna::{Numeric, SparseMatrix, Symbolic};
+
+    /// Build the `CP-SIM-M4.2` "arrow" benchmark matrix: a hub (node 0) joined by a
+    /// conductance to each of `leaves` leaf nodes, each leaf also tied to ground,
+    /// with a probe current injected at the hub — returned as a [`SparseMatrix`]
+    /// plus its right-hand side. The hub is numbered first, so natural-order
+    /// elimination fills the whole leaf block (`O(leaves²)`) while the fill-reducing
+    /// order eliminates it last (`O(leaves)`): the scaling the bench measures.
+    pub fn arrow_matrix(leaves: usize) -> (SparseMatrix, Vec<f64>) {
+        let size = leaves + 1;
+        let g = 1e-3;
+        let mut m = SparseMatrix::new(size);
+        for leaf in 1..=leaves {
+            m.stamp_conductance(Some(0), Some(leaf), g);
+            m.stamp_conductance(Some(leaf), None, g);
+        }
+        let mut rhs = vec![0.0; size];
+        rhs[0] = 1e-3;
+        (m, rhs)
+    }
+
+    /// Solve the arrow via **today's natural-order sparse path** (`System::sparse`)
+    /// — the baseline the ordered solver is raced against.
+    pub fn arrow_natural_solve(leaves: usize) -> Option<Vec<f64>> {
+        let size = leaves + 1;
+        let g = 1e-3;
+        let mut s = System::sparse(size);
+        for leaf in 1..=leaves {
+            s.stamp_conductance(Some(0), Some(leaf), g);
+            s.stamp_conductance(Some(leaf), None, g);
+        }
+        s.stamp_current(Some(0), None, 1e-3);
+        s.solve()
+    }
+
+    /// Solve the arrow via the fill-reducing ordered LU: analyze + factor + solve.
+    pub fn arrow_ordered_solve(leaves: usize) -> Option<Vec<f64>> {
+        let (m, rhs) = arrow_matrix(leaves);
+        let sym = Symbolic::analyze(&m);
+        Some(sym.factor(&m)?.solve(&rhs))
+    }
 }
 
 #[cfg(test)]
