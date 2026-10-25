@@ -281,6 +281,24 @@ fn bench_refactor_reuse(c: &mut Criterion) {
     group.finish();
 }
 
+/// The `CP-SIM-M4.3` speedup gate: a many-run Monte-Carlo, sequential vs the
+/// public (threaded under `--features parallel`) path. Each run is a nonlinear
+/// Newton solve, so with the feature on `parallel` pulls markedly ahead of
+/// `sequential` as the cores engage; without it the two coincide (same code).
+/// Both produce identical samples — the determinism gate lives in the unit tests.
+fn bench_monte_carlo(c: &mut Criterion) {
+    let mut group = c.benchmark_group("monte_carlo");
+    for runs in [2000usize, 8000] {
+        group.bench_with_input(BenchmarkId::new("sequential", runs), &runs, |b, &n| {
+            b.iter(|| bench_support::monte_carlo_sequential(black_box(n)))
+        });
+        group.bench_with_input(BenchmarkId::new("parallel", runs), &runs, |b, &n| {
+            b.iter(|| bench_support::monte_carlo_parallel(black_box(n)))
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_op_point,
@@ -289,6 +307,7 @@ criterion_group!(
     bench_sparse_vs_dense,
     bench_sparse_scaling,
     bench_ordered_vs_natural,
-    bench_refactor_reuse
+    bench_refactor_reuse,
+    bench_monte_carlo
 );
 criterion_main!(benches);

@@ -2165,14 +2165,28 @@ struct SplitMix64 {
     state: u64,
 }
 
+/// SplitMix64's golden-ratio increment. Because each draw adds exactly this to the
+/// state, the state after `k` draws from `new(seed)` is `seed + k·γ` — which is
+/// what [`SplitMix64::at_offset`] exploits to seek into the stream.
+const SPLITMIX_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
+
 impl SplitMix64 {
-    fn new(seed: u64) -> Self {
-        Self { state: seed }
+    /// A generator positioned so its first draw is draw number `offset` of the
+    /// `seed` stream (`at_offset(seed, 0)` is the plain seeding). Since the state
+    /// advances by a fixed `γ` per draw, this is an exact `O(1)` seek:
+    /// `at_offset(seed, k)` reproduces the stream from draw `k` onward, bit-for-bit.
+    /// It lets each Monte-Carlo run own a fixed slice of the single seeded stream,
+    /// so a run's perturbations depend only on its index — never on how runs are
+    /// scheduled across threads.
+    fn at_offset(seed: u64, offset: u64) -> Self {
+        Self {
+            state: seed.wrapping_add(offset.wrapping_mul(SPLITMIX_GAMMA)),
+        }
     }
 
     /// The next 64 raw bits.
     fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        self.state = self.state.wrapping_add(SPLITMIX_GAMMA);
         let mut z = self.state;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
@@ -2196,14 +2210,18 @@ impl Engine {
     /// circuit whose toleranced parts are perturbed within their ±band, and record
     /// the `output` node's value at `sample` from every run.
     ///
-    /// **Determinism.** One [`SplitMix64`] is seeded from `seed` and advanced once
-    /// per toleranced part, in part-index order, across the whole run sequence. The
-    /// set of toleranced parts, their order, and the draw count are all fixed by the
-    /// circuit, so the same seed replays the identical stream of perturbations and
-    /// therefore the identical samples — bit for bit. Each run perturbs from the
-    /// original nominal values (it clones the untouched circuit), so draws never
-    /// compound. A part with tolerance `t` and nominal value `v` becomes
-    /// `v·(1 + t·u)`, `u` uniform in `[-1, 1)`.
+    /// **Determinism.** The single [`SplitMix64`] stream seeded from `seed` is
+    /// partitioned by run: run `k` owns draws `[k·P, (k+1)·P)` (`P` = the number of
+    /// toleranced parts), reached in `O(1)` by [`SplitMix64::at_offset`]. The set of
+    /// toleranced parts, their order, and the per-run draw count are all fixed by
+    /// the circuit, so the same seed replays the identical perturbations and
+    /// therefore the identical samples — bit for bit, and *independently of how the
+    /// runs are scheduled*. Each run perturbs from the original nominal values (it
+    /// clones the untouched circuit), so draws never compound. A part with
+    /// tolerance `t` and nominal value `v` becomes `v·(1 + t·u)`, `u` uniform in
+    /// `[-1, 1)`. This per-run independence is exactly what lets the native
+    /// `parallel` feature fan the runs across threads with no change in output
+    /// (`CP-SIM-M4.3`).
     fn monte_carlo(
         &self,
         circuit: &Circuit,
@@ -2212,6 +2230,43 @@ impl Engine {
         output: NetId,
         sample: usize,
         inner: &Analysis,
+    ) -> Result<Vec<Signal>, SimError> {
+        // The public entry allows the parallel executor when the feature is on;
+        // the forced-sequential twin (tests) shares every bit of the per-run work.
+        self.monte_carlo_impl(circuit, seed, runs, output, sample, inner, true)
+    }
+
+    /// Always-sequential Monte-Carlo, for the single-vs-multi determinism gate — it
+    /// runs the identical per-run computation through the plain sequential loop
+    /// regardless of the `parallel` feature, so a test can compare it against the
+    /// (possibly threaded) public [`monte_carlo`](Self::monte_carlo).
+    #[cfg(test)]
+    fn monte_carlo_sequential(
+        &self,
+        circuit: &Circuit,
+        seed: u64,
+        runs: usize,
+        output: NetId,
+        sample: usize,
+        inner: &Analysis,
+    ) -> Result<Vec<Signal>, SimError> {
+        self.monte_carlo_impl(circuit, seed, runs, output, sample, inner, false)
+    }
+
+    /// The shared Monte-Carlo core. `parallel_ok` selects the executor: the native
+    /// `parallel` feature fans the independent runs across OS threads, else (or on
+    /// wasm, or when `parallel_ok` is false) it is the plain sequential loop. Both
+    /// assemble the samples in run-index order, so the output is identical.
+    #[allow(clippy::too_many_arguments)] // mirrors Analysis::MonteCarlo's fields + an executor flag
+    fn monte_carlo_impl(
+        &self,
+        circuit: &Circuit,
+        seed: u64,
+        runs: usize,
+        output: NetId,
+        sample: usize,
+        inner: &Analysis,
+        parallel_ok: bool,
     ) -> Result<Vec<Signal>, SimError> {
         if runs == 0 {
             return Err(SimError::BadValue("monte-carlo run count".into()));
@@ -2228,12 +2283,13 @@ impl Engine {
                 Some((i, tol, value.magnitude, value.unit))
             })
             .collect();
-
         let out_name = format!("v(n{})", circuit.resolve(output).0);
-        let mut rng = SplitMix64::new(seed);
-        let mut samples: Vec<f64> = Vec::with_capacity(runs);
-        let mut unit = Unit::Volt;
-        for _ in 0..runs {
+        let per_run = toleranced.len() as u64;
+
+        // One run: seed a generator at this run's fixed slice of the stream, perturb
+        // a fresh clone, solve the inner analysis, read back the sample + its unit.
+        let run_one = |k: usize| -> Result<(f64, Unit), SimError> {
+            let mut rng = SplitMix64::at_offset(seed, k as u64 * per_run);
             let mut work = circuit.clone();
             for &(pi, tol, nominal, part_unit) in &toleranced {
                 let factor = 1.0 + tol * rng.next_signed();
@@ -2245,14 +2301,21 @@ impl Engine {
                 .iter()
                 .find(|s| s.name == out_name)
                 .ok_or_else(|| SimError::UnknownPart(out_name.clone()))?;
-            unit = sig.unit;
             let value = match &sig.y {
                 SignalData::Real(v) => v.get(sample).copied(),
                 SignalData::Complex(v) => v.get(sample).map(|z| z.magnitude()),
             }
             .ok_or_else(|| SimError::BadValue("monte-carlo sample index".into()))?;
-            samples.push(value);
-        }
+            Ok((value, sig.unit))
+        };
+
+        let results = if parallel_ok {
+            run_indexed(runs, &run_one)?
+        } else {
+            (0..runs).map(&run_one).collect::<Result<Vec<_>, _>>()?
+        };
+        let unit = results.first().map(|&(_, u)| u).unwrap_or(Unit::Volt);
+        let samples: Vec<f64> = results.into_iter().map(|(v, _)| v).collect();
 
         Ok(vec![Signal::time(
             format!("mc(n{})", circuit.resolve(output).0),
@@ -2261,6 +2324,75 @@ impl Engine {
             samples,
         )])
     }
+}
+
+// ---------------------------------------------------------------------------
+// Parallel execution of independent analyses (CP-SIM-M4.3)
+// ---------------------------------------------------------------------------
+
+/// Run `n` independent, index-addressed jobs and collect their results **in index
+/// order** — the executor behind parallel Monte-Carlo and sweeps (`CP-SIM-M4.3`).
+///
+/// With the native `parallel` feature on (and off wasm) the index range is split
+/// into contiguous per-thread chunks run on OS threads via [`std::thread::scope`]
+/// (no dependencies); otherwise it is a plain sequential loop. Either way the
+/// output is assembled strictly by job index and each job is a pure function of
+/// its index, so the result is **identical regardless of thread scheduling** — the
+/// determinism the gate requires. The first error in index order is returned.
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+fn run_indexed<T, F>(n: usize, f: &F) -> Result<Vec<T>, SimError>
+where
+    T: Send,
+    F: Fn(usize) -> Result<T, SimError> + Sync,
+{
+    let threads = parallel_threads(n);
+    if threads <= 1 {
+        return (0..n).map(f).collect();
+    }
+    let chunk = n.div_ceil(threads);
+    // Each thread owns a contiguous index range and returns its results in order.
+    let per_thread: Vec<Result<Vec<T>, SimError>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let start = (t * chunk).min(n);
+                let end = ((t + 1) * chunk).min(n);
+                scope.spawn(move || (start..end).map(f).collect::<Result<Vec<T>, SimError>>())
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("a parallel analysis thread panicked"))
+            .collect()
+    });
+    // Concatenate the chunks in thread order (= ascending index order).
+    let mut out = Vec::with_capacity(n);
+    for chunk in per_thread {
+        out.extend(chunk?);
+    }
+    Ok(out)
+}
+
+/// Sequential executor — the default build, and any wasm / feature-off build. Same
+/// signature and semantics as the threaded [`run_indexed`], so callers are
+/// identical; the bounds match it too (harmless here) to keep one call site.
+#[cfg(not(all(feature = "parallel", not(target_arch = "wasm32"))))]
+fn run_indexed<T, F>(n: usize, f: &F) -> Result<Vec<T>, SimError>
+where
+    T: Send,
+    F: Fn(usize) -> Result<T, SimError> + Sync,
+{
+    (0..n).map(f).collect()
+}
+
+/// The number of worker threads to use for `n` independent jobs: the hardware
+/// parallelism, capped at `n` (never more threads than jobs) and at least 1.
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+fn parallel_threads(n: usize) -> usize {
+    std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .min(n)
+        .max(1)
 }
 
 /// Operating-point node voltages as single-sample signals.
@@ -2331,14 +2463,27 @@ fn dc_sweep(
     let unit = sweep_source_unit(circuit, source)?;
     let values = sweep_values(start, stop, step)?;
 
-    let mut work = circuit.clone();
-    work.set_waveform(source, Waveform::Dc); // sweep the DC level, ignore any waveform
-    let layout = Layout::build(&work);
+    // The topology is fixed across the sweep, so build the base circuit (any
+    // waveform dropped) and its MNA layout once; each point only retargets the
+    // swept source's level. The points are independent operating-point solves, so
+    // the native `parallel` feature fans them across threads (`CP-SIM-M4.3`); the
+    // results are assembled in sweep order either way.
+    let base = {
+        let mut w = circuit.clone();
+        w.set_waveform(source, Waveform::Dc); // sweep the DC level, ignore any waveform
+        w
+    };
+    let layout = Layout::build(&base);
     let n = layout.n_nodes();
+    let solve_point = |k: usize| -> Result<Vec<f64>, SimError> {
+        let mut work = base.clone();
+        work.set_value(source, Value::new(values[k], unit));
+        solve_dc(&work, &layout, registry)
+    };
+    let points = run_indexed(values.len(), &solve_point)?;
+
     let mut traces: Vec<Vec<f64>> = vec![Vec::with_capacity(values.len()); n];
-    for &val in &values {
-        work.set_value(source, Value::new(val, unit));
-        let x = solve_dc(&work, &layout, registry)?;
+    for x in &points {
         for (d, trace) in traces.iter_mut().enumerate() {
             trace.push(x[d]);
         }
@@ -2378,17 +2523,29 @@ impl Engine {
         // Validate the target up front so an empty `values` list still rejects a typo.
         let unit = sweep_source_unit(circuit, source)?;
 
-        let mut work = circuit.clone();
-        work.set_waveform(source, Waveform::Dc);
-        let mut out = Vec::new();
-        for &val in values {
+        let base = {
+            let mut w = circuit.clone();
+            w.set_waveform(source, Waveform::Dc);
+            w
+        };
+        // Each value's inner run is independent, so the native `parallel` feature
+        // fans them across threads (`CP-SIM-M4.3`); the tagged signal families are
+        // concatenated in value order, matching the sequential result exactly.
+        let one = |k: usize| -> Result<Vec<Signal>, SimError> {
+            let val = values[k];
+            let mut work = base.clone();
             work.set_value(source, Value::new(val, unit));
-            for mut sig in self.run(&work, inner)? {
-                sig.name = format!("{} @ {source}={val}", sig.name);
-                out.push(sig);
-            }
-        }
-        Ok(out)
+            let sigs = self.run(&work, inner)?;
+            Ok(sigs
+                .into_iter()
+                .map(|mut sig| {
+                    sig.name = format!("{} @ {source}={val}", sig.name);
+                    sig
+                })
+                .collect())
+        };
+        let groups = run_indexed(values.len(), &one)?;
+        Ok(groups.into_iter().flatten().collect())
     }
 }
 
@@ -2474,6 +2631,52 @@ pub mod bench_support {
         let (m, rhs) = arrow_matrix(leaves);
         let sym = Symbolic::analyze(&m);
         Some(sym.factor(&m)?.solve(&rhs))
+    }
+
+    // --- CP-SIM-M4.3: parallel Monte-Carlo ---------------------------------
+
+    /// The Monte-Carlo speedup fixture: a 5 V source into a ±5 %-toleranced 1 kΩ
+    /// resistor feeding a diode to ground. Each run is a nonlinear Newton solve, so
+    /// the per-run work is real (not swamped by the circuit clone) and the thread
+    /// fan-out shows a clear speedup.
+    fn mc_fixture() -> (Circuit, NetId) {
+        let mut c = Circuit::new("mc_bench");
+        let vin = c.new_net();
+        let mid = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            Value::parse("5", Unit::Volt).ok(),
+            vec![vin, NetId::GROUND],
+        );
+        c.add_part(
+            "R1",
+            PartKind::Resistor,
+            Value::parse("1k", Unit::Ohm).ok(),
+            vec![vin, mid],
+        );
+        c.add_part("D1", PartKind::Diode, None, vec![mid, NetId::GROUND]);
+        c.set_tolerance("R1", 0.05);
+        (c, mid)
+    }
+
+    /// Run the Monte-Carlo fixture `runs` times through the **forced-sequential**
+    /// path — the `CP-SIM-M4.3` bench baseline.
+    pub fn monte_carlo_sequential(runs: usize) -> Vec<Signal> {
+        let (c, mid) = mc_fixture();
+        Engine::new()
+            .monte_carlo_impl(&c, 0xC0FFEE, runs, mid, 0, &Analysis::OperatingPoint, false)
+            .expect("mc bench solves")
+    }
+
+    /// Run the Monte-Carlo fixture `runs` times through the public path — threaded
+    /// when the `parallel` feature is on, so timing it against
+    /// [`monte_carlo_sequential`] shows the speedup.
+    pub fn monte_carlo_parallel(runs: usize) -> Vec<Signal> {
+        let (c, mid) = mc_fixture();
+        Engine::new()
+            .monte_carlo_impl(&c, 0xC0FFEE, runs, mid, 0, &Analysis::OperatingPoint, true)
+            .expect("mc bench solves")
     }
 }
 
@@ -4689,6 +4892,112 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, SimError::BadValue(_)), "got {err:?}");
+    }
+
+    // --- Parallel analyses — CP-SIM-M4.3 -----------------------------------
+
+    /// The `CP-SIM-M4.3` determinism gate: the public Monte-Carlo (fanned across
+    /// threads when the `parallel` feature is on) returns **exactly** the same
+    /// `Signal` as the forced-sequential path, bit for bit, independently of thread
+    /// scheduling. Run it with `--features parallel` to exercise the threaded path;
+    /// without it both sides are sequential and the equality still holds. A healthy
+    /// run count (512) spans several thread chunks.
+    #[test]
+    fn parallel_monte_carlo_matches_sequential() {
+        let (c, mid) = mc_divider();
+        let engine = Engine::new();
+        let (seed, runs) = (0x5EED_1234_u64, 512usize);
+
+        // Public path: threaded under `--features parallel`, else sequential.
+        let parallel = engine
+            .run(
+                &c,
+                &Analysis::MonteCarlo {
+                    seed,
+                    runs,
+                    output: mid,
+                    sample: 0,
+                    inner: Box::new(Analysis::OperatingPoint),
+                },
+            )
+            .unwrap();
+        // Forced-sequential reference (the plain loop, always).
+        let sequential = engine
+            .monte_carlo_sequential(&c, seed, runs, mid, 0, &Analysis::OperatingPoint)
+            .unwrap();
+
+        assert_eq!(
+            parallel, sequential,
+            "parallel Monte-Carlo diverged from the sequential path"
+        );
+        assert_eq!(parallel[0].real().unwrap().len(), runs);
+    }
+
+    /// A parallel DC sweep (many independent operating-point solves) is
+    /// bit-for-bit reproducible across runs — the index-ordered executor means the
+    /// thread schedule can never reorder or perturb the result. A 60-point diode
+    /// sweep spans several chunks.
+    #[test]
+    fn parallel_dc_sweep_is_reproducible() {
+        let mut c = Circuit::new("diode_sweep");
+        let node = c.new_net();
+        c.add_part(
+            "I1",
+            PartKind::CurrentSource,
+            v("1m", Unit::Ampere),
+            vec![NetId::GROUND, node],
+        );
+        c.add_part("D1", PartKind::Diode, None, vec![node, NetId::GROUND]);
+        let sweep = Analysis::DcSweep {
+            source: "I1".into(),
+            start: 1e-3,
+            stop: 60e-3,
+            step: 1e-3,
+        };
+        let a = Engine::new().run(&c, &sweep).unwrap();
+        let b = Engine::new().run(&c, &sweep).unwrap();
+        assert_eq!(a, b, "parallel DC sweep is not reproducible");
+        assert_eq!(a[0].x.len(), 60);
+    }
+
+    /// A parallel parametric sweep (an inner transient per value) is reproducible
+    /// and preserves value order in the tagged signal families.
+    #[test]
+    fn parallel_parametric_is_reproducible() {
+        let mut c = Circuit::new("rc");
+        let vin = c.new_net();
+        let out = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("1", Unit::Volt),
+            vec![vin, NetId::GROUND],
+        );
+        c.add_part("R1", PartKind::Resistor, v("1k", Unit::Ohm), vec![vin, out]);
+        c.add_part(
+            "C1",
+            PartKind::Capacitor,
+            v("1u", Unit::Farad),
+            vec![out, NetId::GROUND],
+        );
+        let values: Vec<f64> = (1..=16).map(|i| i as f64).collect();
+        let param = Analysis::Parametric {
+            source: "V1".into(),
+            values: values.clone(),
+            inner: Box::new(Analysis::Transient {
+                duration: 2e-3,
+                step: Some(5e-4),
+            }),
+        };
+        let a = Engine::new().run(&c, &param).unwrap();
+        let b = Engine::new().run(&c, &param).unwrap();
+        assert_eq!(a, b, "parallel parametric sweep is not reproducible");
+        // The value families stay in order: the last signal carries the last value.
+        assert!(a
+            .last()
+            .unwrap()
+            .name
+            .ends_with(&format!("@ V1={}", values.last().unwrap())));
     }
 
     #[test]
