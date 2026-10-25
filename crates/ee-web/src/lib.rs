@@ -187,6 +187,78 @@ fn push_json_nums(out: &mut String, xs: &[f64]) {
     out.push(']');
 }
 
+// --- Shareable circuit links (CP-WEB.2) ------------------------------------
+//
+// A circuit *is* its netlist text, so a shareable link is just that text packed
+// into a URL fragment. We pack it with hand-rolled **base64url** (RFC 4648 §5):
+// the alphabet is `A–Z a–z 0–9 - _`, i.e. the standard base64 set with `+`→`-`
+// and `/`→`_`, and we emit **no `=` padding**. That matters because a URL
+// fragment is copy-pasted whole: `+`, `/` and `=` are all reserved or
+// ambiguous in a fragment (`+` can read as a space, `/` splits paths, `=` reads as a
+// key/value separator), whereas `-` and `_` are unreserved and padding-free
+// output never introduces an `=`. So `encode` output drops straight into
+// `location.hash` and survives a round-trip through copy-paste and the browser.
+//
+// This lives in plain host Rust (no dep, ~40 lines) so it is unit-tested in CI
+// without a browser; the wasm layer is a thin wrapper, exactly like `simulate`.
+
+const B64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+/// Encode a netlist into a URL-fragment-safe string: base64url of its UTF-8
+/// bytes, no padding. Round-trips exactly through [`decode`].
+pub fn encode(netlist: &str) -> String {
+    let bytes = netlist.as_bytes();
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(B64URL[(n >> 18 & 63) as usize] as char);
+        out.push(B64URL[(n >> 12 & 63) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(B64URL[(n >> 6 & 63) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(B64URL[(n & 63) as usize] as char);
+        }
+    }
+    out
+}
+
+/// Decode a fragment produced by [`encode`] back into the netlist text.
+///
+/// Tolerant of a single leading `#` (so you can hand it `location.hash` as-is)
+/// and of any trailing `=` padding (in case a link was produced elsewhere), but
+/// otherwise strict: any character outside the base64url alphabet, or a byte
+/// sequence that is not valid UTF-8, is a clean `Err` — never a panic.
+pub fn decode(fragment: &str) -> Result<String, String> {
+    let s = fragment.strip_prefix('#').unwrap_or(fragment);
+    let mut bytes = Vec::with_capacity(s.len() / 4 * 3 + 2);
+    let mut buf = 0u32;
+    let mut bits = 0u32;
+    for ch in s.chars() {
+        if ch == '=' {
+            continue; // tolerate (ignore) any padding
+        }
+        let val = match ch {
+            'A'..='Z' => ch as u32 - 'A' as u32,
+            'a'..='z' => ch as u32 - 'a' as u32 + 26,
+            '0'..='9' => ch as u32 - '0' as u32 + 52,
+            '-' => 62,
+            '_' => 63,
+            _ => return Err(format!("invalid base64url character: {ch:?}")),
+        };
+        buf = (buf << 6) | val;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            bytes.push((buf >> bits) as u8);
+        }
+    }
+    String::from_utf8(bytes).map_err(|e| format!("decoded bytes are not valid UTF-8: {e}"))
+}
+
 /// The browser-facing API — a thin `#[wasm_bindgen]` shell over [`run`]. Compiled
 /// only for `wasm32`, so `wasm-bindgen` never enters the host build.
 #[cfg(target_arch = "wasm32")]
@@ -212,6 +284,21 @@ mod wasm {
         super::run(netlist, duration, step)
             .map(|r| r.scope)
             .map_err(|e| JsValue::from_str(&e))
+    }
+
+    /// Encode a netlist into a URL-fragment-safe share token (base64url, no
+    /// padding). Drop the result into `location.hash` to make a shareable link.
+    #[wasm_bindgen]
+    pub fn encode_share(netlist: &str) -> String {
+        super::encode(netlist)
+    }
+
+    /// Decode a share token (the value from `location.hash`, with or without its
+    /// leading `#`) back into netlist text. Returns `""` when the fragment is
+    /// empty or not a valid token, so the page can simply ignore a bad hash.
+    #[wasm_bindgen]
+    pub fn decode_share(fragment: &str) -> String {
+        super::decode(fragment).unwrap_or_default()
     }
 }
 
@@ -301,5 +388,77 @@ C1 out gnd 1u
         // A zero-ohm resistor is a bad value the solver rejects.
         let err = run("V1 in gnd 5\nR1 in gnd 0", 1e-3, None).unwrap_err();
         assert!(!err.is_empty(), "solver error surfaced as a message");
+    }
+
+    // --- share-link encode/decode -----------------------------------------
+
+    #[test]
+    fn encode_decode_round_trips_exactly() {
+        // Comments, blank lines, trailing newline, CRLF, tabs, and unicode all
+        // survive a byte-exact round trip.
+        let cases = [
+            RC,
+            "",
+            "V1 in gnd 5\n",
+            "# comment only\n",
+            "line1\r\nline2\twith\ttabs\r\n",
+            ".title café-π\n# Ω resistor, 5µF cap — 漢字\nV1 in gnd 5\n",
+            "no trailing newline",
+            "a",
+            "ab",
+            "abc",
+            "abcd",
+        ];
+        for netlist in cases {
+            let enc = encode(netlist);
+            let dec = decode(&enc).expect("valid token decodes");
+            assert_eq!(dec, netlist, "round trip must be exact for {netlist:?}");
+        }
+    }
+
+    #[test]
+    fn encoding_is_url_fragment_safe() {
+        // Over a byte range that exercises every 6-bit group, the output must
+        // never contain a character that breaks a URL fragment.
+        let raw: String = (0u8..=255).map(|b| b as char).collect();
+        let enc = encode(&raw);
+        assert!(
+            enc.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "token must be pure base64url: {enc}"
+        );
+        assert!(
+            !enc.contains('+') && !enc.contains('/') && !enc.contains('='),
+            "token must not contain +, / or = (all unsafe/ambiguous in a fragment)"
+        );
+    }
+
+    #[test]
+    fn decode_tolerates_leading_hash_and_padding() {
+        let enc = encode(RC);
+        assert_eq!(decode(&format!("#{enc}")).unwrap(), RC, "leading # ignored");
+        // base64url of "foob" is "Zm9vYg"; standard base64 pads it to "Zm9vYg==".
+        assert_eq!(decode("Zm9vYg==").unwrap(), "foob", "= padding tolerated");
+    }
+
+    #[test]
+    fn decode_of_garbage_is_a_clean_error() {
+        for junk in ["!!!!", "has spaces", "plus+sign", "slash/here", "@#$%"] {
+            let err = decode(junk);
+            assert!(
+                err.is_err(),
+                "garbage {junk:?} must be a clean Err, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decoded_link_runs_through_the_pipeline() {
+        // The whole point: a shared link decodes back to a netlist that runs.
+        let token = encode(RC);
+        let netlist = decode(&token).unwrap();
+        let r = run(&netlist, 5e-3, Some(5e-6)).expect("decoded netlist simulates");
+        assert_eq!(r.title, "rc-lowpass");
+        assert_eq!(r.nodes.len(), 2);
     }
 }
