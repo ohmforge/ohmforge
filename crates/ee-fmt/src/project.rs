@@ -59,7 +59,7 @@ use std::error::Error;
 use std::fmt::{self, Write as _};
 
 use ee_core::graph::{
-    BjtModel, Circuit, MosfetModel, NetId, PartKind, Polarity, Waveform, NOMINAL_TEMP_C,
+    BjtModel, Circuit, DiodeModel, MosfetModel, NetId, PartKind, Polarity, Waveform, NOMINAL_TEMP_C,
 };
 use ee_core::units::Unit;
 use ee_core::value::{ParseError, Value};
@@ -556,7 +556,9 @@ fn take_kind(rest: &str) -> Result<(PartKind, &str), ErrorKind> {
         "L" => PartKind::Inductor,
         "V" => PartKind::VoltageSource,
         "I" => PartKind::CurrentSource,
-        "D" => PartKind::Diode,
+        // Diode model params default on load (custom-param round-trip is a
+        // documented follow-up, same as transistors).
+        "D" => PartKind::Diode(DiodeModel::default()),
         // Transistors: polarity preserved; model params default on load
         // (custom-param round-trip is a documented follow-up).
         "QN" => PartKind::Bjt(Polarity::N, BjtModel::default()),
@@ -616,7 +618,7 @@ fn write_kind(kind: &PartKind) -> String {
         PartKind::Inductor => "L".to_string(),
         PartKind::VoltageSource => "V".to_string(),
         PartKind::CurrentSource => "I".to_string(),
-        PartKind::Diode => "D".to_string(),
+        PartKind::Diode(_) => "D".to_string(),
         PartKind::Bjt(pol, _) => format!("Q{}", polarity_letter(*pol)),
         PartKind::Mosfet(pol, _) => format!("M{}", polarity_letter(*pol)),
         PartKind::Vcvs(e) => format!("vcvs({e})"),
@@ -1117,7 +1119,7 @@ R3 R 1k a ground
             PartKind::Inductor => "L".into(),
             PartKind::VoltageSource => "V".into(),
             PartKind::CurrentSource => "I".into(),
-            PartKind::Diode => "D".into(),
+            PartKind::Diode(_) => "D".into(),
             PartKind::Bjt(..) => "Q".into(),
             PartKind::Mosfet(..) => "M".into(),
             PartKind::Vcvs(_) => "E".into(),

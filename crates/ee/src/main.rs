@@ -10,7 +10,7 @@
 use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
 
-use ee_core::graph::PartKind;
+use ee_core::graph::{DiodeModel, PartKind};
 use ee_core::units::Unit;
 use ee_core::value::Value;
 use ee_core::{BjtModel, Circuit, Polarity, Waveform};
@@ -267,7 +267,12 @@ fn demo_cosim() {
         val("220", Unit::Ohm),
         vec![pin, anode],
     );
-    c.add_part("D1", PartKind::Diode, None, vec![anode, gnd]);
+    c.add_part(
+        "D1",
+        PartKind::Diode(DiodeModel::default()),
+        None,
+        vec![anode, gnd],
+    );
 
     println!("Co-simulation: AVR firmware drives D13 → a simulated LED.\n");
     let engine = Engine::new();

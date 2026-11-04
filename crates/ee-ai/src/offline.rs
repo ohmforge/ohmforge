@@ -236,7 +236,7 @@ pub mod drc {
 
         let mut out = Vec::new();
         for part in circuit.parts() {
-            if !matches!(part.kind, PartKind::Diode) {
+            if !matches!(part.kind, PartKind::Diode(_)) {
                 continue;
             }
             let has_series_r = part
@@ -577,7 +577,7 @@ pub mod parts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ee_core::graph::{Circuit, NetId, PartKind};
+    use ee_core::graph::{Circuit, DiodeModel, NetId, PartKind};
     use ee_core::units::Unit;
     use ee_core::value::Value;
 
@@ -664,7 +664,12 @@ mod tests {
             Some(Value::new(5.0, Unit::Volt)),
             vec![n, NetId::GROUND],
         );
-        bad.add_part("D1", PartKind::Diode, None, vec![n, NetId::GROUND]);
+        bad.add_part(
+            "D1",
+            PartKind::Diode(DiodeModel::default()),
+            None,
+            vec![n, NetId::GROUND],
+        );
         let fs = check(&bad);
         assert!(
             fs.iter()
@@ -683,7 +688,12 @@ mod tests {
             vec![n_in, NetId::GROUND],
         );
         good.add_part("R1", PartKind::Resistor, r(330.0), vec![n_in, mid]);
-        good.add_part("D1", PartKind::Diode, None, vec![mid, NetId::GROUND]);
+        good.add_part(
+            "D1",
+            PartKind::Diode(DiodeModel::default()),
+            None,
+            vec![mid, NetId::GROUND],
+        );
         assert!(
             !check(&good)
                 .iter()
@@ -741,7 +751,12 @@ mod tests {
         let a = c.new_net();
         let b = c.new_net();
         c.add_part("R1", PartKind::Resistor, r(1000.0), vec![a, b]);
-        c.add_part("D1", PartKind::Diode, None, vec![a, b]);
+        c.add_part(
+            "D1",
+            PartKind::Diode(DiodeModel::default()),
+            None,
+            vec![a, b],
+        );
         assert_eq!(check(&c), check(&c));
     }
 
@@ -837,7 +852,12 @@ mod tests {
             Some(Value::new(5.0, Unit::Volt)),
             vec![n, NetId::GROUND],
         );
-        c.add_part("D1", PartKind::Diode, None, vec![n, NetId::GROUND]);
+        c.add_part(
+            "D1",
+            PartKind::Diode(DiodeModel::default()),
+            None,
+            vec![n, NetId::GROUND],
+        );
 
         // Rule checks fire, a calculator computes, the catalog answers — all with
         // no model in sight.

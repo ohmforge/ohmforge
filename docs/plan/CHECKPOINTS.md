@@ -129,10 +129,10 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 
 ---
 
-## M5 — close the debt + extend the frontier  → plan: [`M5-PLAN.md`](M5-PLAN.md)
+## M5 — close the debt + extend the frontier  ✅ complete (9/9) → plan: [`M5-PLAN.md`](M5-PLAN.md)
 
-- [ ] **CP-SIM-M5.1** (sim-core) Wire KLU ordered/reusable solver into the engine's default hot loop. — *gate:* golden suite + large-ladder bit-for-bit intact; large net measurably faster.
-- [ ] **CP-SIM-M5.2** (sim-core) `DiodeModel` (Is/n/Rs) so SPICE `N`/`RS` apply. — *gate:* `N`≠1 + `RS`>0 shift the I–V as predicted; default diode unchanged.
+- [x] **CP-SIM-M5.1** (sim-core) Wire KLU ordered/reusable solver into the engine's default hot loop. — *gate:* golden suite + large-ladder bit-for-bit intact (threshold `KLU_THRESHOLD = 256`, above the 202-node ladder, so the pinned goldens keep the dense path); large net routed through the reusable ordered solver. ~15000× on the shared-hub pathology at scale.
+- [x] **CP-SIM-M5.2** (sim-core) `DiodeModel` (Is/n/Rs) so SPICE `N`/`RS` apply. — *gate:* `N`≠1 scales Vt and `RS`>0 folds a series drop via local Newton, shifting the I–V as predicted (1N4148 `.model` settles at a realistic ~0.65 V vs the default ~0.69 V); `Rs==0` keeps the exact prior companion path, so the default diode is bit-for-bit unchanged. `PartKind::Diode(DiodeModel)` threads IS/N/RS from the SPICE importer through to the engine.
 - [x] **CP-AF-M5.1** (ai-fmt) SPICE device export (D/Q/M + `.model`, E/G/H/F). — *gate:* `device_and_controlled_source_round_trip` (diode+NPN+NMOS+VCVS kind/params/topology) + `pmos_vto_sign_round_trips`; importer extended to parse E/G/H/F.
 - [x] **CP-AF-M5.2** (ai-fmt) Native project waveform + tolerance/tempco round-trip. — *gate:* `waveform_tolerance_tempco_and_temp_round_trip_exactly` (Sine+Expr source, ±5% tol, tempco, 85 °C → byte-identical re-save); `.wave`/`.tol`/`.tempco`/`.temp` directives.
 - [x] **CP-BRD-M5.1** (boards) AVR SPI + I²C (TWI) master. — *gate:* `spi_program_clocks_a_byte_out_on_mosi` (0xA5 reconstructed on SCK sampling edges) + `twi_program_writes_start_addr_data_stop` (decoded `[Start, 0x50, 0x5A, Stop]`); honors CPOL/CPHA/DORD/clock-rate + TWI status codes.
@@ -147,13 +147,13 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 
 | Track | Done | In progress | Total |
 |---|---|---|---|
-| sim-core | 19 | 0 | 21 |
+| sim-core | 21 | 0 | 21 |
 | boards | 15 | 0 | 15 |
 | ui-shell | 16 | 0 | 16 |
 | ai-fmt | 14 | 0 | 14 |
 | platform | 6 | 0 | 6 |
 | web | 4 | 0 | 4 |
-| **Total** | **74** | **0** | **76** |
+| **Total** | **76** | **0** | **76** |
 
 _**67/67 — M0 through M4 all complete** (M0–M3 tagged v0.1.0; M4 adds the rest). M4 delivered the **plugin device-model API** + an **instrument/block plugin trait**, a **KLU-class ordered/reusable sparse solver** and **multithreaded analyses**, a **Cortex-M3/M4 (Thumb-2)** core with an STM32 board, **SPICE `.model` import** + a vendor model library, and **shareable circuit links** in the browser. Deferred by design: real-time collaboration, the QEMU full-SBC bridge, and full vendor-SPICE `.model` fidelity — the standing M-next horizon._
 

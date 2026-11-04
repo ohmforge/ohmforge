@@ -45,7 +45,7 @@ let vin = c.new_net();
 let out = c.new_net();
 c.add_part("V1", PartKind::VoltageSource, None, vec![vin, NetId::GROUND]);
 c.set_waveform("V1", Waveform::Sine { amplitude: 5.0, freq: 1_000.0, offset: 0.0, phase_deg: 0.0 });
-c.add_part("D1", PartKind::Diode, None, vec![vin, out]);                 // anode=in, cathode=out
+c.add_part("D1", PartKind::Diode(DiodeModel::default()), None, vec![vin, out]); // anode=in, cathode=out
 c.add_part("R1", PartKind::Resistor, Some(Value::new(10_000.0, Unit::Ohm)), vec![out, NetId::GROUND]);
 let sigs = Engine::new()
     .run(&c, &Analysis::Transient { duration: 3e-3, step: Some(2e-6) })

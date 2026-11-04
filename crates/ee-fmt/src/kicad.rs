@@ -61,7 +61,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 
-use ee_core::graph::{Circuit, NetId, PartKind};
+use ee_core::graph::{Circuit, DiodeModel, NetId, PartKind};
 use ee_core::units::Unit;
 use ee_core::value::Value;
 
@@ -172,7 +172,7 @@ fn classify(reference: &str) -> (PartKind, Unit) {
         Some('L') => (PartKind::Inductor, Unit::Henry),
         Some('V') => (PartKind::VoltageSource, Unit::Volt),
         Some('I') => (PartKind::CurrentSource, Unit::Ampere),
-        Some('D') => (PartKind::Diode, Unit::Ampere),
+        Some('D') => (PartKind::Diode(DiodeModel::default()), Unit::Ampere),
         // Transistors, ICs, connectors, … aren't modeled natively; keep the name.
         _ => (PartKind::Other(String::new()), Unit::None),
     }
@@ -187,7 +187,7 @@ fn parse_value(kind: &PartKind, unit: Unit, raw: &str) -> Option<Value> {
     }
     match kind {
         // A diode's value is a part number ("LED", "1N4148"), never a magnitude.
-        PartKind::Diode | PartKind::Other(_) => None,
+        PartKind::Diode(_) | PartKind::Other(_) => None,
         PartKind::VoltageSource | PartKind::CurrentSource => {
             // Sources may carry a leading `DC`/`AC` keyword (`DC 10`).
             let tok = raw
@@ -509,7 +509,10 @@ mod tests {
         let q1 = &c.part_by_ref("Q1").unwrap().kind;
         assert!(matches!(q1, PartKind::Other(n) if n == "2N3904"), "{q1:?}");
         // A diode is modeled as a Diode with no magnitude value.
-        assert!(matches!(c.part_by_ref("D1").unwrap().kind, PartKind::Diode));
+        assert!(matches!(
+            c.part_by_ref("D1").unwrap().kind,
+            PartKind::Diode(_)
+        ));
         assert_eq!(c.part_by_ref("D1").unwrap().value, None);
     }
 

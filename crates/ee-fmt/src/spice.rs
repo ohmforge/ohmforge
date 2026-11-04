@@ -101,7 +101,7 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{self, Write as _};
 
-use ee_core::graph::{BjtModel, Circuit, MosfetModel, NetId, PartKind, Polarity};
+use ee_core::graph::{BjtModel, Circuit, DiodeModel, MosfetModel, NetId, PartKind, Polarity};
 use ee_core::units::Unit;
 use ee_core::value::Value;
 
@@ -672,7 +672,7 @@ fn build_device(
             if model.model_type != ModelType::Diode {
                 return Err(mismatch(reference, model, "diode (D)"));
             }
-            Ok((PartKind::Diode, apply_diode(model, notes, line)))
+            Ok((PartKind::Diode(apply_diode(model, notes, line)), None))
         }
         'Q' => {
             let polarity = match model.model_type {
@@ -717,26 +717,24 @@ fn note_ignored(notes: &mut Vec<Note>, line: usize, model: &str, key: &str) {
 /// amperes). `N` is parsed but can't be applied — the engine's diode has no
 /// per-part emission coefficient and uses `n = 1` — so it is noted. Everything
 /// else is noted as ignored.
-fn apply_diode(model: &SpiceModel, notes: &mut Vec<Note>, line: usize) -> Option<Value> {
-    let mut is = None;
+fn apply_diode(model: &SpiceModel, notes: &mut Vec<Note>, line: usize) -> DiodeModel {
+    let mut m = DiodeModel::default();
     for (key, val) in &model.params {
         match key.as_str() {
-            "IS" if *val > 0.0 && val.is_finite() => is = Some(*val),
-            "IS" => notes.push(Note {
-                line,
-                message: format!("model {}: IS={val} is not a positive magnitude; ignored", model.name),
-            }),
-            "N" => notes.push(Note {
+            "IS" if *val > 0.0 && val.is_finite() => m.is = *val,
+            "N" if *val > 0.0 && val.is_finite() => m.n = *val,
+            "RS" if *val >= 0.0 && val.is_finite() => m.rs = *val,
+            "IS" | "N" | "RS" => notes.push(Note {
                 line,
                 message: format!(
-                    "model {}: emission coefficient N={val} parsed but not applied (the engine's diode uses n=1)",
+                    "model {}: {key}={val} is not usable; left at default",
                     model.name
                 ),
             }),
             other => note_ignored(notes, line, &model.name, other),
         }
     }
-    is.map(|v| Value::new(v, Unit::Ampere))
+    m
 }
 
 /// BJT: `IS`/`BF`/`BR` → the Ebers–Moll `is`/`βF`/`βR`. Other parameters (`VAF`,
@@ -975,11 +973,11 @@ pub fn export(circuit: &Circuit) -> String {
                 write_nodes(&mut out, reference, &part.terminals, circuit);
                 let _ = writeln!(out, " {}", export_value(part.value.as_ref()));
             }
-            PartKind::Diode => {
+            PartKind::Diode(m) => {
                 let model = format!("Dmod_{reference}");
                 write_nodes(&mut out, reference, &part.terminals, circuit);
                 let _ = writeln!(out, " {model}");
-                emit_diode_model(&mut models, &model, part.value.as_ref());
+                emit_diode_model(&mut models, &model, m);
             }
             PartKind::Bjt(polarity, m) => {
                 let model = format!("Qmod_{reference}");
@@ -1043,19 +1041,15 @@ fn write_nodes(out: &mut String, reference: &str, terminals: &[NetId], circuit: 
     }
 }
 
-/// Emit a diode's `.model` card. The engine's only per-part diode parameter is
-/// its saturation current `IS` (the part's value, in amperes); a valueless diode
-/// writes an empty card so [`import`] still resolves the model (and reads back a
-/// default diode).
-fn emit_diode_model(out: &mut String, name: &str, value: Option<&Value>) {
-    match value {
-        Some(v) => {
-            let _ = writeln!(out, ".model {name} D (IS={})", v.magnitude);
-        }
-        None => {
-            let _ = writeln!(out, ".model {name} D ()");
-        }
-    }
+/// Emit a diode's `.model` card from its [`DiodeModel`]: the saturation current
+/// `IS` (amperes), the emission coefficient `N`, and the series resistance `RS`
+/// (ohms). A round-trip through [`import`] recovers the same model.
+fn emit_diode_model(out: &mut String, name: &str, model: &DiodeModel) {
+    let _ = writeln!(
+        out,
+        ".model {name} D (IS={} N={} RS={})",
+        model.is, model.n, model.rs
+    );
 }
 
 /// The node name for a resolved net: `0` for ground, else `n<id>`.
@@ -1357,8 +1351,11 @@ R2 mid 0   1k
 
         c.add_part(
             "D1",
-            PartKind::Diode,
-            Some(Value::new(2.52e-9, Unit::Ampere)),
+            PartKind::Diode(DiodeModel {
+                is: 2.52e-9,
+                ..DiodeModel::default()
+            }),
+            None,
             vec![a, NetId::GROUND],
         );
         c.add_part(
@@ -1393,10 +1390,12 @@ R2 mid 0   1k
         let deck = export(&c);
         let back = import(&deck).unwrap();
 
-        // Diode: IS carried as the part value (amperes).
+        // Diode: IS carried in the model (amperes).
         let d1 = back.part_by_ref("D1").unwrap();
-        assert!(matches!(d1.kind, PartKind::Diode));
-        assert_eq!(d1.value, Some(Value::new(2.52e-9, Unit::Ampere)));
+        match &d1.kind {
+            PartKind::Diode(m) => assert_eq!(m.is, 2.52e-9),
+            other => panic!("expected diode, got {other:?}"),
+        }
 
         // NPN BJT: IS/BF/BR survive exactly; VT stays the engine default.
         match &back.part_by_ref("Q1").unwrap().kind {
@@ -1544,7 +1543,7 @@ R2 mid 0   1k
             PartKind::Inductor => "L".into(),
             PartKind::VoltageSource => "V".into(),
             PartKind::CurrentSource => "I".into(),
-            PartKind::Diode => "D".into(),
+            PartKind::Diode(_) => "D".into(),
             PartKind::Bjt(..) => "Q".into(),
             PartKind::Mosfet(..) => "M".into(),
             PartKind::Vcvs(_) => "E".into(),
@@ -1600,10 +1599,12 @@ D1 a 0 BIGD
 .end
 ";
         let modeled = import(deck).unwrap();
-        // The model's IS landed on the part (in amperes), not the default.
+        // The model's IS landed on the diode model (in amperes), not the default.
         let d1 = modeled.part_by_ref("D1").unwrap();
-        assert!(matches!(d1.kind, PartKind::Diode));
-        assert!((d1.value.as_ref().unwrap().magnitude - 1e-9).abs() < 1e-18);
+        match &d1.kind {
+            PartKind::Diode(m) => assert!((m.is - 1e-9).abs() < 1e-18),
+            other => panic!("expected diode, got {other:?}"),
+        }
 
         // The same topology built with a *default* diode (no value → engine's
         // IS = 1e-14) for a head-to-head comparison.
@@ -1615,7 +1616,12 @@ D1 a 0 BIGD
             Some(Value::new(1e-3, Unit::Ampere)),
             vec![NetId::GROUND, a],
         );
-        dflt.add_part("D1", PartKind::Diode, None, vec![a, NetId::GROUND]);
+        dflt.add_part(
+            "D1",
+            PartKind::Diode(DiodeModel::default()),
+            None,
+            vec![a, NetId::GROUND],
+        );
 
         let v_model = anode_volts(&modeled);
         let v_default = anode_volts(&dflt);
@@ -1684,8 +1690,9 @@ M1 d g s PCH
 
     #[test]
     fn unknown_params_are_noted_not_errors() {
-        // A diode with recognized IS, an un-appliable N, and ignored RS/CJO still
-        // imports; each unhandled parameter yields a Note, never an error.
+        // A diode with recognized IS/N/RS and an unknown CJO still imports: the
+        // three Shockley parameters land on the model, and the unhandled CJO
+        // yields a Note, never an error.
         let deck = "\
 noted params
 D1 a 0 DM
@@ -1693,28 +1700,20 @@ D1 a 0 DM
 .end
 ";
         let (c, notes) = import_with_notes(deck).unwrap();
-        assert!(
-            (c.part_by_ref("D1")
-                .unwrap()
-                .value
-                .as_ref()
-                .unwrap()
-                .magnitude
-                - 2e-9)
-                .abs()
-                < 1e-18
-        );
+        match &c.part_by_ref("D1").unwrap().kind {
+            PartKind::Diode(m) => {
+                assert!((m.is - 2e-9).abs() < 1e-18, "IS applied");
+                assert!((m.n - 1.8).abs() < 1e-12, "N applied");
+                assert!((m.rs - 0.5).abs() < 1e-12, "RS applied");
+            }
+            other => panic!("expected diode, got {other:?}"),
+        }
         let text = notes
             .iter()
             .map(|n| n.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("RS"), "RS should be noted ignored:\n{text}");
         assert!(text.contains("CJO"), "CJO should be noted ignored:\n{text}");
-        assert!(
-            text.contains("N="),
-            "N should be noted not-applied:\n{text}"
-        );
         // Notes are tagged with the element's line — where the model is applied
         // (the `D1` line, line 2) — not the `.model` card's.
         assert!(notes.iter().all(|n| n.line == 2), "{text}");
@@ -1725,8 +1724,10 @@ D1 a 0 DM
         // No `.model 1N4148` in the deck ⇒ the built-in vendor catalog supplies it.
         let c = import("catalog fallback\nD1 a 0 1N4148\n.end").unwrap();
         let d1 = c.part_by_ref("D1").unwrap();
-        assert!(matches!(d1.kind, PartKind::Diode));
-        assert!((d1.value.as_ref().unwrap().magnitude - 2.52e-9).abs() < 1e-18);
+        match &d1.kind {
+            PartKind::Diode(m) => assert!((m.is - 2.52e-9).abs() < 1e-18),
+            other => panic!("expected diode, got {other:?}"),
+        }
 
         // A catalogued NPN resolves to its polarity + gain, too.
         let c = import("catalog npn\nQ1 c b e 2N3904\n.end").unwrap();
@@ -1740,17 +1741,10 @@ D1 a 0 DM
     fn deck_model_shadows_the_catalog() {
         // A `.model` with a catalogued name wins over the built-in entry.
         let c = import("shadow\nD1 a 0 1N4148\n.model 1N4148 D (IS=9n)\n.end").unwrap();
-        assert!(
-            (c.part_by_ref("D1")
-                .unwrap()
-                .value
-                .as_ref()
-                .unwrap()
-                .magnitude
-                - 9e-9)
-                .abs()
-                < 1e-18
-        );
+        match &c.part_by_ref("D1").unwrap().kind {
+            PartKind::Diode(m) => assert!((m.is - 9e-9).abs() < 1e-18),
+            other => panic!("expected diode, got {other:?}"),
+        }
     }
 
     #[test]

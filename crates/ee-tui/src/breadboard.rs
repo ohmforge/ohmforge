@@ -270,7 +270,7 @@ fn designator(kind: &PartKind) -> char {
         PartKind::Inductor => 'L',
         PartKind::VoltageSource => 'V',
         PartKind::CurrentSource => 'I',
-        PartKind::Diode => 'D',
+        PartKind::Diode(_) => 'D',
         PartKind::Bjt(..) => 'Q',
         PartKind::Mosfet(..) => 'M',
         PartKind::Vcvs(_) => 'E',

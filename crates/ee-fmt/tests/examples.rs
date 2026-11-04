@@ -4,7 +4,7 @@
 //! midpoint, and the native project round-trips byte-for-byte and simulates. If
 //! an example drifts from the code, this test fails.
 
-use ee_core::graph::{NetId, PartKind};
+use ee_core::graph::{DiodeModel, NetId, PartKind};
 use ee_core::units::Unit;
 use ee_core::value::Value;
 use ee_fmt::{import_kicad, import_spice, load_project, save_project, to_bom_csv};
@@ -99,13 +99,15 @@ fn example_spice_model_deck_applies_params_and_simulates() {
     let circuit = import_spice(DIODE_CLAMP).expect("the diode `.model` deck imports");
     assert_eq!(circuit.parts().len(), 3, "V1, R1, D1");
 
-    // The SPICE IS parameter landed on the diode part (amperes).
+    // The SPICE IS parameter landed on the diode model (amperes).
     let d1 = circuit.part_by_ref("D1").unwrap();
-    assert!(matches!(d1.kind, PartKind::Diode));
-    assert!(
-        (d1.value.as_ref().unwrap().magnitude - 2.52e-9).abs() < 1e-18,
-        "IS=2.52n mapped onto the diode"
-    );
+    match &d1.kind {
+        PartKind::Diode(m) => assert!(
+            (m.is - 2.52e-9).abs() < 1e-18,
+            "IS=2.52n mapped onto the diode"
+        ),
+        other => panic!("expected diode, got {other:?}"),
+    }
 
     // The junction node (D1's anode = R1's far end) settles at a real forward
     // drop in the silicon window.
@@ -117,8 +119,10 @@ fn example_spice_model_deck_applies_params_and_simulates() {
     );
 
     // Proof the params *matter*: the identical topology with a *default* diode
-    // (engine IS = 1e-14) sits at a visibly higher drop. The specified, larger
-    // IS lowers the forward voltage.
+    // (engine IS = 1e-14, N = 1, RS = 0) settles at a different operating point.
+    // The 1N4148's larger IS pulls the drop down while its N = 1.752 scales Vt
+    // back up, netting a realistic ~0.65 V junction a measurable step off the
+    // default's ~0.69 V.
     let mut dflt = ee_core::graph::Circuit::new("default-diode clamp");
     let n_in = dflt.new_net();
     let n_d = dflt.new_net();
@@ -134,10 +138,16 @@ fn example_spice_model_deck_applies_params_and_simulates() {
         Some(Value::new(1000.0, Unit::Ohm)),
         vec![n_in, n_d],
     );
-    dflt.add_part("D1", PartKind::Diode, None, vec![n_d, NetId::GROUND]);
+    dflt.add_part(
+        "D1",
+        PartKind::Diode(DiodeModel::default()),
+        None,
+        vec![n_d, NetId::GROUND],
+    );
     let v_default = node_volts(&dflt, dflt.part_by_ref("D1").unwrap().terminals[0]);
     assert!(
-        v_default - v_modeled > 0.1,
-        "model IS should lower the drop: modeled {v_modeled} V vs default {v_default} V"
+        v_default > v_modeled && v_default - v_modeled > 0.02,
+        "the IS/N/RS model should move the operating point off the default: \
+         modeled {v_modeled} V vs default {v_default} V"
     );
 }

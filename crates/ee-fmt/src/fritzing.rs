@@ -169,7 +169,7 @@ fn module_id_ref(kind: &PartKind) -> String {
         PartKind::Inductor => "inductor",
         PartKind::VoltageSource => "voltage-source",
         PartKind::CurrentSource => "current-source",
-        PartKind::Diode => "diode",
+        PartKind::Diode(_) => "diode",
         PartKind::Bjt(..) => "bjt",
         PartKind::Mosfet(..) => "mosfet",
         PartKind::Vcvs(_) => "vcvs",
@@ -189,7 +189,7 @@ fn family(kind: &PartKind) -> &str {
         PartKind::Inductor => "inductor",
         PartKind::VoltageSource => "voltage source",
         PartKind::CurrentSource => "current source",
-        PartKind::Diode => "diode",
+        PartKind::Diode(_) => "diode",
         PartKind::Bjt(..) => "transistor (bjt)",
         PartKind::Mosfet(..) => "transistor (mosfet)",
         PartKind::Vcvs(_) | PartKind::Vccs(_) | PartKind::Ccvs(..) | PartKind::Cccs(..) => {

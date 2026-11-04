@@ -41,7 +41,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 
-use ee_core::graph::{Circuit, NetId, PartKind, Waveform};
+use ee_core::graph::{Circuit, DiodeModel, NetId, PartKind, Waveform};
 use ee_core::units::Unit;
 use ee_core::value::{ParseError, Value};
 use ee_sim::{Analysis, Engine, SimError};
@@ -704,7 +704,7 @@ fn classify(reference: &str) -> Result<(PartKind, Unit), ShellError> {
         'L' => (PartKind::Inductor, Unit::Henry),
         'V' => (PartKind::VoltageSource, Unit::Volt),
         'I' => (PartKind::CurrentSource, Unit::Ampere),
-        'D' => (PartKind::Diode, Unit::Ampere), // value (if given) = saturation current Is
+        'D' => (PartKind::Diode(DiodeModel::default()), Unit::Ampere), // Is from the diode model
         other => return Err(ShellError::UnknownPartKind(other)),
     })
 }
@@ -722,7 +722,7 @@ fn kind_label(kind: &PartKind) -> &str {
         PartKind::Inductor => "inductor",
         PartKind::VoltageSource => "source",
         PartKind::CurrentSource => "current source",
-        PartKind::Diode => "diode",
+        PartKind::Diode(_) => "diode",
         PartKind::Bjt(..) => "BJT",
         PartKind::Mosfet(..) => "MOSFET",
         PartKind::Vcvs(_) => "VCVS",
