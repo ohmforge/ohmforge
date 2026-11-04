@@ -259,6 +259,217 @@ pub fn decode(fragment: &str) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|e| format!("decoded bytes are not valid UTF-8: {e}"))
 }
 
+// --- Structured circuit edit model (CP-WEB.3) ------------------------------
+//
+// The page lets you *build* a circuit, not just paste one: a parts form adds a
+// part (by ref / nodes / value), lists the parts, and removes one. The real
+// logic is this pure, host-tested model — a title plus an ordered list of
+// [`Part`]s — that round-trips to netlist text. `from_netlist` lifts the
+// textarea into the model (preserving the raw node names and engineering-
+// notation value strings that `ee_fmt`'s `Circuit` discards once it resolves
+// them to `NetId`s), and `to_netlist` emits a clean, canonical netlist that
+// `run` parses and simulates. The `#[wasm_bindgen]` layer stays thin: it takes
+// netlist text in and hands netlist text (or a JSON part list) back out, so the
+// page keeps the textarea as the single source of truth and just transforms it.
+
+/// One editable part line: `REF  NODE_A  NODE_B  VALUE`.
+///
+/// The value is kept as its raw string (e.g. `"1k"`, `"100n"`) so a round trip
+/// through the model never rewrites the engineering notation the user typed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Part {
+    /// Reference designator; its first letter fixes the kind (`R`/`C`/`L`/`V`).
+    pub reference: String,
+    /// First terminal's node name.
+    pub node_a: String,
+    /// Second terminal's node name.
+    pub node_b: String,
+    /// Raw value field, verbatim (`"1k"`, `"100n"`, `"5"`).
+    pub value: String,
+}
+
+/// A circuit as the editor sees it: an optional title and an ordered part list.
+/// Round-trips to netlist text via [`CircuitModel::from_netlist`] /
+/// [`CircuitModel::to_netlist`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CircuitModel {
+    /// The `.title` directive's text, if any.
+    pub title: Option<String>,
+    /// The parts, in the order they should be emitted.
+    pub parts: Vec<Part>,
+}
+
+/// Map a reference's leading letter to a human-readable kind, rejecting anything
+/// the netlist grammar (and thus the engine) does not accept.
+fn kind_label(reference: &str) -> Result<&'static str, String> {
+    let c = reference
+        .chars()
+        .next()
+        .ok_or_else(|| "empty part reference".to_string())?;
+    Ok(match c.to_ascii_uppercase() {
+        'R' => "resistor",
+        'C' => "capacitor",
+        'L' => "inductor",
+        'V' => "voltage source",
+        other => {
+            return Err(format!(
+                "unknown part type '{other}' (expected R, C, L, or V)"
+            ))
+        }
+    })
+}
+
+/// Everything on a line before the first `#` or `//` comment marker.
+fn strip_netlist_comment(line: &str) -> &str {
+    let hash = line.find('#').unwrap_or(line.len());
+    let slashes = line.find("//").unwrap_or(line.len());
+    &line[..hash.min(slashes)]
+}
+
+impl CircuitModel {
+    /// Lift netlist text into the edit model. Comments and blank lines are
+    /// dropped, `.title` is captured, and each `REF A B VALUE` line becomes a
+    /// [`Part`] with its node names and value string preserved verbatim. A
+    /// malformed line (wrong field count, unknown part type, unknown directive)
+    /// is a clean `Err` carrying the 1-based source line — never a panic.
+    pub fn from_netlist(src: &str) -> Result<CircuitModel, String> {
+        let mut model = CircuitModel::default();
+        for (i, raw) in src.lines().enumerate() {
+            let line = i + 1;
+            let text = strip_netlist_comment(raw).trim();
+            if text.is_empty() {
+                continue;
+            }
+            if let Some(rest) = text.strip_prefix('.') {
+                let mut it = rest.splitn(2, char::is_whitespace);
+                let name = it.next().unwrap_or("");
+                let arg = it.next().unwrap_or("").trim();
+                if name.eq_ignore_ascii_case("title") {
+                    model.title = Some(arg.to_string());
+                } else {
+                    return Err(format!("line {line}: unknown directive .{name}"));
+                }
+                continue;
+            }
+            let fields: Vec<&str> = text.split_whitespace().collect();
+            if fields.len() != 4 {
+                return Err(format!(
+                    "line {line}: expected 4 fields (REF A B VALUE), found {}",
+                    fields.len()
+                ));
+            }
+            kind_label(fields[0]).map_err(|e| format!("line {line}: {e}"))?;
+            model.parts.push(Part {
+                reference: fields[0].to_string(),
+                node_a: fields[1].to_string(),
+                node_b: fields[2].to_string(),
+                value: fields[3].to_string(),
+            });
+        }
+        Ok(model)
+    }
+
+    /// Emit a clean, canonical netlist: a `.title` line (if set) followed by one
+    /// `REF A B VALUE` line per part. The result parses and simulates via [`run`].
+    pub fn to_netlist(&self) -> String {
+        let mut out = String::new();
+        if let Some(title) = &self.title {
+            out.push_str(".title ");
+            out.push_str(title);
+            out.push('\n');
+        }
+        for p in &self.parts {
+            out.push_str(&p.reference);
+            out.push(' ');
+            out.push_str(&p.node_a);
+            out.push(' ');
+            out.push_str(&p.node_b);
+            out.push(' ');
+            out.push_str(&p.value);
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Add a part. Validates that the reference is a known kind, that nothing is
+    /// empty or carries embedded whitespace (the netlist is whitespace-delimited),
+    /// and that the reference is not already used. Returns a message on any of
+    /// those, leaving the model unchanged.
+    pub fn add_part(
+        &mut self,
+        reference: &str,
+        node_a: &str,
+        node_b: &str,
+        value: &str,
+    ) -> Result<(), String> {
+        let reference = reference.trim();
+        let node_a = node_a.trim();
+        let node_b = node_b.trim();
+        let value = value.trim();
+        kind_label(reference)?;
+        for (what, tok) in [
+            ("reference", reference),
+            ("first node", node_a),
+            ("second node", node_b),
+            ("value", value),
+        ] {
+            if tok.is_empty() {
+                return Err(format!("{what} must not be empty"));
+            }
+            if tok.split_whitespace().count() != 1 {
+                return Err(format!("{what} {tok:?} must not contain whitespace"));
+            }
+        }
+        if self.parts.iter().any(|p| p.reference == reference) {
+            return Err(format!("duplicate part reference {reference:?}"));
+        }
+        self.parts.push(Part {
+            reference: reference.to_string(),
+            node_a: node_a.to_string(),
+            node_b: node_b.to_string(),
+            value: value.to_string(),
+        });
+        Ok(())
+    }
+
+    /// Remove every part with this reference. Returns whether anything was removed.
+    pub fn remove_part(&mut self, reference: &str) -> bool {
+        let before = self.parts.len();
+        self.parts.retain(|p| p.reference != reference);
+        self.parts.len() != before
+    }
+
+    /// Serialize the model to JSON for the parts form:
+    /// `{title, parts:[{reference,kind,node_a,node_b,value}]}`. Hand-rolled (no
+    /// `serde`) to match the rest of this crate and keep the wasm bundle small.
+    pub fn to_json(&self) -> String {
+        let mut s = String::from("{\"title\":");
+        match &self.title {
+            Some(t) => push_json_str(&mut s, t),
+            None => s.push_str("null"),
+        }
+        s.push_str(",\"parts\":[");
+        for (i, p) in self.parts.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str("{\"reference\":");
+            push_json_str(&mut s, &p.reference);
+            s.push_str(",\"kind\":");
+            push_json_str(&mut s, kind_label(&p.reference).unwrap_or("?"));
+            s.push_str(",\"node_a\":");
+            push_json_str(&mut s, &p.node_a);
+            s.push_str(",\"node_b\":");
+            push_json_str(&mut s, &p.node_b);
+            s.push_str(",\"value\":");
+            push_json_str(&mut s, &p.value);
+            s.push('}');
+        }
+        s.push_str("]}");
+        s
+    }
+}
+
 /// The browser-facing API — a thin `#[wasm_bindgen]` shell over [`run`]. Compiled
 /// only for `wasm32`, so `wasm-bindgen` never enters the host build.
 #[cfg(target_arch = "wasm32")]
@@ -299,6 +510,46 @@ mod wasm {
     #[wasm_bindgen]
     pub fn decode_share(fragment: &str) -> String {
         super::decode(fragment).unwrap_or_default()
+    }
+
+    // --- Structured editing (CP-WEB.3) -------------------------------------
+
+    /// List the parts of a netlist as JSON for the editor form:
+    /// `{title, parts:[{reference,kind,node_a,node_b,value}]}`. A malformed
+    /// netlist throws its error message.
+    #[wasm_bindgen]
+    pub fn list_parts(netlist: &str) -> Result<String, JsValue> {
+        super::CircuitModel::from_netlist(netlist)
+            .map(|m| m.to_json())
+            .map_err(|e| JsValue::from_str(&e))
+    }
+
+    /// Add a part to a netlist and return the updated netlist text. Throws on a
+    /// malformed netlist or an invalid/duplicate part.
+    #[wasm_bindgen]
+    pub fn edit_add(
+        netlist: &str,
+        reference: &str,
+        node_a: &str,
+        node_b: &str,
+        value: &str,
+    ) -> Result<String, JsValue> {
+        let mut model =
+            super::CircuitModel::from_netlist(netlist).map_err(|e| JsValue::from_str(&e))?;
+        model
+            .add_part(reference, node_a, node_b, value)
+            .map_err(|e| JsValue::from_str(&e))?;
+        Ok(model.to_netlist())
+    }
+
+    /// Remove the part with this reference and return the updated netlist text.
+    /// A no-op if the reference is absent. Throws only on a malformed netlist.
+    #[wasm_bindgen]
+    pub fn edit_remove(netlist: &str, reference: &str) -> Result<String, JsValue> {
+        let mut model =
+            super::CircuitModel::from_netlist(netlist).map_err(|e| JsValue::from_str(&e))?;
+        model.remove_part(reference);
+        Ok(model.to_netlist())
     }
 }
 
@@ -460,5 +711,104 @@ C1 out gnd 1u
         let r = run(&netlist, 5e-3, Some(5e-6)).expect("decoded netlist simulates");
         assert_eq!(r.title, "rc-lowpass");
         assert_eq!(r.nodes.len(), 2);
+    }
+
+    // --- edit model: from/to netlist round-trip (CP-WEB.3) -----------------
+
+    #[test]
+    fn model_lifts_title_parts_and_values() {
+        let m = CircuitModel::from_netlist(RC).expect("RC lifts into the model");
+        assert_eq!(m.title.as_deref(), Some("rc-lowpass"));
+        assert_eq!(m.parts.len(), 3);
+        // Node names and the raw engineering-notation value strings survive.
+        let r1 = m.parts.iter().find(|p| p.reference == "R1").unwrap();
+        assert_eq!((r1.node_a.as_str(), r1.node_b.as_str()), ("in", "out"));
+        assert_eq!(r1.value, "1k", "raw value notation is preserved verbatim");
+        let c1 = m.parts.iter().find(|p| p.reference == "C1").unwrap();
+        assert_eq!(c1.value, "1u");
+    }
+
+    #[test]
+    fn model_round_trips_through_netlist_and_still_simulates() {
+        // Lift → emit → the emitted netlist parses and simulates exactly like RC.
+        let m = CircuitModel::from_netlist(RC).unwrap();
+        let netlist = m.to_netlist();
+        // Re-lifting the emitted text yields the identical model (semantic round trip).
+        assert_eq!(CircuitModel::from_netlist(&netlist).unwrap(), m);
+        let r = run(&netlist, 5e-3, Some(5e-6)).expect("emitted netlist simulates");
+        assert_eq!(r.title, "rc-lowpass");
+        assert_eq!(r.nodes.len(), 2);
+    }
+
+    #[test]
+    fn add_part_changes_the_netlist_and_still_simulates() {
+        // The gate: adding a part changes the netlist as expected, and the
+        // result still parses + simulates via `run`.
+        let mut m = CircuitModel::from_netlist(RC).unwrap();
+        assert!(!m.to_netlist().contains("R2"));
+        m.add_part("R2", "out", "gnd", "2k")
+            .expect("a well-formed resistor is accepted");
+        let netlist = m.to_netlist();
+        assert!(
+            netlist.contains("R2 out gnd 2k"),
+            "the new part appears in the netlist: {netlist}"
+        );
+        let r = run(&netlist, 5e-3, Some(5e-6)).expect("edited netlist simulates");
+        // R2 bleeds `out` to ground, so it no longer sits at the full 5 V rail.
+        assert_eq!(r.title, "rc-lowpass");
+        assert_eq!(r.nodes.len(), 2);
+    }
+
+    #[test]
+    fn remove_part_drops_it_from_the_netlist_and_still_simulates() {
+        let mut m = CircuitModel::from_netlist(RC).unwrap();
+        assert!(m.remove_part("C1"), "C1 was present and removed");
+        assert!(!m.remove_part("C1"), "removing again is a no-op");
+        let netlist = m.to_netlist();
+        assert!(!netlist.contains("C1"), "C1 is gone: {netlist}");
+        assert!(netlist.contains("R1 in out 1k"), "other parts remain");
+        // A bare V–R divider still parses and simulates.
+        let r = run(&netlist, 5e-3, Some(5e-6)).expect("reduced netlist simulates");
+        assert_eq!(r.title, "rc-lowpass");
+    }
+
+    #[test]
+    fn add_part_rejects_bad_input() {
+        let mut m = CircuitModel::from_netlist(RC).unwrap();
+        assert!(m.add_part("R1", "a", "b", "1k").is_err(), "duplicate ref");
+        assert!(m.add_part("X9", "a", "b", "1k").is_err(), "unknown kind");
+        assert!(m.add_part("R9", "", "b", "1k").is_err(), "empty node");
+        assert!(
+            m.add_part("R9", "a b", "c", "1k").is_err(),
+            "embedded whitespace"
+        );
+        assert_eq!(m.parts.len(), 3, "no bad part leaked into the model");
+    }
+
+    #[test]
+    fn model_rejects_malformed_netlist() {
+        assert!(
+            CircuitModel::from_netlist("R1 a b").is_err(),
+            "too few fields"
+        );
+        assert!(
+            CircuitModel::from_netlist("X1 a b 1k").is_err(),
+            "unknown part type"
+        );
+        assert!(
+            CircuitModel::from_netlist(".nope foo").is_err(),
+            "unknown directive"
+        );
+    }
+
+    #[test]
+    fn model_to_json_is_wellformed() {
+        let json = CircuitModel::from_netlist(RC).unwrap().to_json();
+        assert!(json.starts_with('{') && json.ends_with('}'));
+        assert!(json.contains("\"title\":\"rc-lowpass\""));
+        assert!(json.contains("\"reference\":\"R1\""));
+        assert!(json.contains("\"kind\":\"resistor\""));
+        assert!(json.contains("\"kind\":\"capacitor\""));
+        assert!(json.contains("\"value\":\"1k\""));
     }
 }
