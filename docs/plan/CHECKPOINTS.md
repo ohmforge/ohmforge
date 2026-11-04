@@ -129,17 +129,31 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 
 ---
 
+## M5 — close the debt + extend the frontier  → plan: [`M5-PLAN.md`](M5-PLAN.md)
+
+- [ ] **CP-SIM-M5.1** (sim-core) Wire KLU ordered/reusable solver into the engine's default hot loop. — *gate:* golden suite + large-ladder bit-for-bit intact; large net measurably faster.
+- [ ] **CP-SIM-M5.2** (sim-core) `DiodeModel` (Is/n/Rs) so SPICE `N`/`RS` apply. — *gate:* `N`≠1 + `RS`>0 shift the I–V as predicted; default diode unchanged.
+- [ ] **CP-AF-M5.1** (ai-fmt) SPICE device export (D/Q/M + `.model`, E/G/H/F). — *gate:* export→import preserves kind + model params.
+- [ ] **CP-AF-M5.2** (ai-fmt) Native project waveform + tolerance/tempco round-trip. — *gate:* a sine/expr source + tempco `save`→`load` exactly.
+- [ ] **CP-BRD-M5.1** (boards) AVR SPI + I²C (TWI) master. — *gate:* an AVR SPI/I²C transfer decodes correctly on the logic analyzer.
+- [ ] **CP-BRD-M5.2** (boards) Composite device subcircuits: op-amp macromodel, analog switch, relay. — *gate:* the op-amp hits its closed-loop gain; the switch gates a signal.
+- [ ] **CP-UX-M5.1** (ui-shell) Interactive schematic editing in the live TUI. — *gate:* app edit events add/wire/remove parts (no tty); panes reflect them.
+- [ ] **CP-WEB.3** (web) Browser schematic editor (edit, not just paste). — *gate:* edit→netlist round-trip (host) + the page edits & re-runs.
+- [ ] **CP-WEB.4** (web) Full-session shareable links (async collaboration). — *gate:* session encode→decode round-trip; the page restores a shared session.
+
+---
+
 ### Progress summary
 
 | Track | Done | In progress | Total |
 |---|---|---|---|
-| sim-core | 19 | 0 | 19 |
-| boards | 13 | 0 | 13 |
-| ui-shell | 15 | 0 | 15 |
-| ai-fmt | 12 | 0 | 12 |
+| sim-core | 19 | 0 | 21 |
+| boards | 13 | 0 | 15 |
+| ui-shell | 15 | 0 | 16 |
+| ai-fmt | 12 | 0 | 14 |
 | platform | 6 | 0 | 6 |
-| web | 2 | 0 | 2 |
-| **Total** | **67** | **0** | **67** ✅ |
+| web | 2 | 0 | 4 |
+| **Total** | **67** | **0** | **76** |
 
 _**67/67 — M0 through M4 all complete** (M0–M3 tagged v0.1.0; M4 adds the rest). M4 delivered the **plugin device-model API** + an **instrument/block plugin trait**, a **KLU-class ordered/reusable sparse solver** and **multithreaded analyses**, a **Cortex-M3/M4 (Thumb-2)** core with an STM32 board, **SPICE `.model` import** + a vendor model library, and **shareable circuit links** in the browser. Deferred by design: real-time collaboration, the QEMU full-SBC bridge, and full vendor-SPICE `.model` fidelity — the standing M-next horizon._
 
