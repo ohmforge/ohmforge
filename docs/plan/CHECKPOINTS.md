@@ -138,8 +138,8 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 - [ ] **CP-BRD-M5.1** (boards) AVR SPI + I²C (TWI) master. — *gate:* an AVR SPI/I²C transfer decodes correctly on the logic analyzer.
 - [ ] **CP-BRD-M5.2** (boards) Composite device subcircuits: op-amp macromodel, analog switch, relay. — *gate:* the op-amp hits its closed-loop gain; the switch gates a signal.
 - [x] **CP-UX-M5.1** (ui-shell) Interactive schematic editing in the live TUI. — *gate:* `edit_actions_place_wire_and_remove_on_the_real_circuit` + keystroke-driven selection/delete; `EditAction`→shell grammar (shared mutation path); new `remove` command. All asserted on the `Circuit`, no tty.
-- [ ] **CP-WEB.3** (web) Browser schematic editor (edit, not just paste). — *gate:* edit→netlist round-trip (host) + the page edits & re-runs.
-- [ ] **CP-WEB.4** (web) Full-session shareable links (async collaboration). — *gate:* session encode→decode round-trip; the page restores a shared session.
+- [x] **CP-WEB.3** (web) Browser schematic editor (edit, not just paste). — *gate:* `add_part_changes_the_netlist_and_still_simulates` / `remove_part…` — a `CircuitModel` (preserving node names + raw value notation) round-trips to netlist and re-simulates; page has a parts form that re-runs on edit.
+- [x] **CP-WEB.4** (web) Full-session shareable links (async collaboration). — *gate:* `session_round_trips_exactly` (netlist + probes + duration/step, URL-safe, garbage→clean Err); page restores every field on `hashchange` + falls back to M4 netlist-only links. Real-time co-edit still needs a relay (documented).
 
 ---
 
@@ -152,8 +152,8 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 | ui-shell | 16 | 0 | 16 |
 | ai-fmt | 14 | 0 | 14 |
 | platform | 6 | 0 | 6 |
-| web | 2 | 0 | 4 |
-| **Total** | **70** | **0** | **76** |
+| web | 4 | 0 | 4 |
+| **Total** | **72** | **0** | **76** |
 
 _**67/67 — M0 through M4 all complete** (M0–M3 tagged v0.1.0; M4 adds the rest). M4 delivered the **plugin device-model API** + an **instrument/block plugin trait**, a **KLU-class ordered/reusable sparse solver** and **multithreaded analyses**, a **Cortex-M3/M4 (Thumb-2)** core with an STM32 board, **SPICE `.model` import** + a vendor model library, and **shareable circuit links** in the browser. Deferred by design: real-time collaboration, the QEMU full-SBC bridge, and full vendor-SPICE `.model` fidelity — the standing M-next horizon._
 
