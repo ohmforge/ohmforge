@@ -470,6 +470,147 @@ impl CircuitModel {
     }
 }
 
+// --- Full-session shareable links (CP-WEB.4) -------------------------------
+//
+// The M4 share link (`encode`/`decode`) packs just the netlist. A full session
+// also captures the *workbench*: the transient `duration` and `step`, plus the
+// `probes` (node names the user is scoping). We serialize the session into a
+// small, line-oriented text blob and run it through the very same base64url
+// (`encode`/`decode`) so the token still drops straight into `location.hash`.
+//
+// The blob is a fixed header followed by the netlist *verbatim*:
+//
+// ```text
+// EEWS1\n                       magic + version
+// <duration f64>\n              Rust's shortest round-trippable f64 form
+// <step f64 | "auto">\n
+// <probe count>\n
+// <probe>\n   × count           node names (whitespace-free, so one per line)
+// <netlist…>                    everything after the last header line, byte-exact
+// ```
+//
+// Putting the netlist last and copying the remaining bytes wholesale is what
+// makes the round trip *exact*: its comments, blank lines, CRLFs and trailing
+// newline all survive, because nothing re-parses or re-emits them.
+//
+// Real-time co-editing is deliberately **out of scope**: a shared link is a
+// point-in-time snapshot (async collaboration). Live multi-cursor editing needs
+// a relay / CRDT backend, which this static, backend-free page has no place for.
+
+/// A full workbench snapshot: the circuit (as netlist text) plus the view
+/// settings the page holds (transient `duration`/`step` and the scoped `probes`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Session {
+    /// The circuit, as netlist text (preserved byte-exact across a round trip).
+    pub netlist: String,
+    /// Transient duration, in seconds.
+    pub duration: f64,
+    /// Fixed transient timestep in seconds, or `None` for an adaptive step.
+    pub step: Option<f64>,
+    /// Node names the user is scoping (empty means "show everything").
+    pub probes: Vec<String>,
+}
+
+/// Encode a [`Session`] into a URL-fragment-safe token (base64url, no padding),
+/// round-tripping exactly through [`decode_session`].
+pub fn encode_session(session: &Session) -> String {
+    let mut buf = String::new();
+    buf.push_str("EEWS1\n");
+    buf.push_str(&format!("{}\n", session.duration));
+    match session.step {
+        Some(v) => buf.push_str(&format!("{v}\n")),
+        None => buf.push_str("auto\n"),
+    }
+    buf.push_str(&format!("{}\n", session.probes.len()));
+    for p in &session.probes {
+        buf.push_str(p);
+        buf.push('\n');
+    }
+    buf.push_str(&session.netlist);
+    encode(&buf)
+}
+
+/// Decode a token produced by [`encode_session`] back into the full [`Session`].
+///
+/// Tolerant of a leading `#` (hand it `location.hash` as-is) via [`decode`], but
+/// otherwise strict: a bad base64url token, a missing/incorrect header, or a
+/// malformed field is a clean `Err`, never a panic.
+pub fn decode_session(token: &str) -> Result<Session, String> {
+    let raw = decode(token)?;
+    let rest = raw
+        .strip_prefix("EEWS1\n")
+        .ok_or("not a session token (bad magic/version)")?;
+
+    let (duration_s, rest) = take_line(rest)?;
+    let duration = duration_s
+        .parse::<f64>()
+        .map_err(|_| format!("bad session duration: {duration_s:?}"))?;
+
+    let (step_s, rest) = take_line(rest)?;
+    let step = if step_s == "auto" {
+        None
+    } else {
+        Some(
+            step_s
+                .parse::<f64>()
+                .map_err(|_| format!("bad session step: {step_s:?}"))?,
+        )
+    };
+
+    let (count_s, mut rest) = take_line(rest)?;
+    let count = count_s
+        .parse::<usize>()
+        .map_err(|_| format!("bad session probe count: {count_s:?}"))?;
+    let mut probes = Vec::with_capacity(count);
+    for _ in 0..count {
+        let (p, r) = take_line(rest)?;
+        probes.push(p.to_string());
+        rest = r;
+    }
+
+    // Everything left is the netlist, byte-exact.
+    Ok(Session {
+        netlist: rest.to_string(),
+        duration,
+        step,
+        probes,
+    })
+}
+
+/// Split off one `\n`-terminated header line, returning `(line, remainder)`.
+/// A missing newline means the blob was truncated — a clean `Err`.
+fn take_line(s: &str) -> Result<(&str, &str), String> {
+    match s.find('\n') {
+        Some(i) => Ok((&s[..i], &s[i + 1..])),
+        None => Err("truncated session data".to_string()),
+    }
+}
+
+impl Session {
+    /// Serialize to JSON for the page: `{netlist, duration, step, probes:[…]}`.
+    /// `step` is `null` for an adaptive step. Hand-rolled, like [`Report::to_json`].
+    pub fn to_json(&self) -> String {
+        let mut s = String::from("{\"netlist\":");
+        push_json_str(&mut s, &self.netlist);
+        s.push_str(",\"duration\":");
+        push_json_num(&mut s, self.duration);
+        s.push_str(",\"step\":");
+        match self.step {
+            Some(v) => push_json_num(&mut s, v),
+            None => s.push_str("null"),
+        }
+        s.push_str(",\"probes\":[");
+        for (i, p) in self.probes.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            push_json_str(&mut s, p);
+        }
+        s.push_str("]}");
+        s
+    }
+}
+
 /// The browser-facing API — a thin `#[wasm_bindgen]` shell over [`run`]. Compiled
 /// only for `wasm32`, so `wasm-bindgen` never enters the host build.
 #[cfg(target_arch = "wasm32")]
@@ -550,6 +691,37 @@ mod wasm {
             super::CircuitModel::from_netlist(netlist).map_err(|e| JsValue::from_str(&e))?;
         model.remove_part(reference);
         Ok(model.to_netlist())
+    }
+
+    // --- Full-session shareable links (CP-WEB.4) ---------------------------
+
+    /// Encode a full session (netlist + probes + view settings) into a
+    /// URL-fragment-safe token. `step <= 0` means an adaptive step; `probes` is
+    /// newline-separated (blank lines are dropped).
+    #[wasm_bindgen]
+    pub fn encode_session_share(netlist: &str, duration: f64, step: f64, probes: &str) -> String {
+        let step = (step > 0.0).then_some(step);
+        let probes = probes
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        super::encode_session(&super::Session {
+            netlist: netlist.to_string(),
+            duration,
+            step,
+            probes,
+        })
+    }
+
+    /// Decode a session token back into JSON `{netlist, duration, step, probes}`
+    /// for the page to restore the workbench. Throws on an invalid token.
+    #[wasm_bindgen]
+    pub fn decode_session_share(token: &str) -> Result<String, JsValue> {
+        super::decode_session(token)
+            .map(|s| s.to_json())
+            .map_err(|e| JsValue::from_str(&e))
     }
 }
 
@@ -810,5 +982,95 @@ C1 out gnd 1u
         assert!(json.contains("\"kind\":\"resistor\""));
         assert!(json.contains("\"kind\":\"capacitor\""));
         assert!(json.contains("\"value\":\"1k\""));
+    }
+
+    // --- full-session encode/decode round-trip (CP-WEB.4) ------------------
+
+    #[test]
+    fn session_round_trips_exactly() {
+        let cases = [
+            Session {
+                netlist: RC.to_string(),
+                duration: 5e-3,
+                step: Some(5e-6),
+                probes: vec!["out".into(), "in".into()],
+            },
+            Session {
+                netlist: "V1 in gnd 5\n".to_string(),
+                duration: 1.0,
+                step: None, // adaptive
+                probes: vec![],
+            },
+            Session {
+                // CRLF, tabs, trailing content, and unicode in the netlist all
+                // survive byte-exact; empty-probe and odd settings too.
+                netlist: ".title café-π\r\nV1 in gnd 5\tno trailing newline".to_string(),
+                duration: 0.000123,
+                step: Some(1e-9),
+                probes: vec!["a".into(), "b".into(), "c".into()],
+            },
+        ];
+        for s in cases {
+            let token = encode_session(&s);
+            let back = decode_session(&token).expect("valid session token decodes");
+            assert_eq!(back, s, "session round trip must be exact");
+        }
+    }
+
+    #[test]
+    fn session_token_is_url_fragment_safe() {
+        let token = encode_session(&Session {
+            netlist: ".title Ω\nV1 in gnd 5\n".to_string(),
+            duration: 5e-3,
+            step: Some(5e-6),
+            probes: vec!["out".into()],
+        });
+        assert!(
+            token
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "token must be pure base64url: {token}"
+        );
+    }
+
+    #[test]
+    fn decoded_session_netlist_runs() {
+        let s = Session {
+            netlist: RC.to_string(),
+            duration: 5e-3,
+            step: Some(5e-6),
+            probes: vec!["out".into()],
+        };
+        let back = decode_session(&format!("#{}", encode_session(&s))).expect("leading # ok");
+        let r = run(&back.netlist, back.duration, back.step).expect("session netlist simulates");
+        assert_eq!(r.title, "rc-lowpass");
+        assert_eq!(r.nodes.len(), 2);
+    }
+
+    #[test]
+    fn decode_session_of_garbage_is_a_clean_error() {
+        assert!(decode_session("has spaces").is_err(), "bad base64url");
+        // Valid base64url, but not a session blob (wrong magic).
+        assert!(
+            decode_session(&encode("not a session")).is_err(),
+            "wrong magic"
+        );
+        // Right magic, truncated body.
+        assert!(decode_session(&encode("EEWS1\n")).is_err(), "truncated");
+    }
+
+    #[test]
+    fn session_to_json_is_wellformed() {
+        let json = Session {
+            netlist: "V1 in gnd 5\n".into(),
+            duration: 5e-3,
+            step: None,
+            probes: vec!["out".into()],
+        }
+        .to_json();
+        assert!(json.contains("\"netlist\":\"V1 in gnd 5\\n\""));
+        assert!(json.contains("\"duration\":0.005"));
+        assert!(json.contains("\"step\":null"));
+        assert!(json.contains("\"probes\":[\"out\"]"));
     }
 }

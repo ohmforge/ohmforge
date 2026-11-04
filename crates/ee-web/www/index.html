@@ -107,6 +107,7 @@
       th { color: var(--muted); font-weight: 500; }
       .err { color: var(--err); font-family: ui-monospace, monospace; white-space: pre-wrap; }
       .muted { color: var(--muted); }
+      tr.probed td { color: var(--accent); font-weight: 600; }
     </style>
   </head>
   <body>
@@ -136,12 +137,16 @@
             <input id="step" type="number" value="0.000005" step="0.000001" min="0" />
           </div>
           <div>
+            <label for="probes">Probes (nodes)</label>
+            <input id="probes" type="text" style="width:140px" placeholder="out in" spellcheck="false" />
+          </div>
+          <div>
             <label>&nbsp;</label>
             <button id="run" class="run" disabled>Run</button>
           </div>
           <div>
             <label>&nbsp;</label>
-            <button id="share" disabled>Copy link</button>
+            <button id="share" disabled>Copy session link</button>
           </div>
         </div>
 
@@ -188,11 +193,12 @@
     <script type="module">
       import init, {
         simulate,
-        encode_share,
         decode_share,
         list_parts,
         edit_add,
         edit_remove,
+        encode_session_share,
+        decode_session_share,
       } from "./pkg/ee_web.js";
 
       const DEMOS = {
@@ -238,30 +244,56 @@ C2 out gnd 100n
       });
       netlist.value = DEMOS[Object.keys(DEMOS)[0]];
 
-      // A circuit is a shareable link: the netlist is packed (base64url) into
-      // the URL fragment. `encode_share`/`decode_share` are the wasm wrappers
-      // over the host-tested Rust encode/decode.
+      // The probed node names, split on whitespace/commas (empty tokens dropped).
+      const probeList = () =>
+        $("probes")
+          .value.split(/[\s,]+/)
+          .map((s) => s.trim())
+          .filter(Boolean);
+
+      // A shareable link restores a *full session* (CP-WEB.4): the netlist plus
+      // the view settings the page holds — duration, step and probes — packed
+      // (base64url) into the URL fragment. `encode_session_share` /
+      // `decode_session_share` are the wasm wrappers over the host-tested Rust
+      // encode_session/decode_session. On load we try the session token first and
+      // fall back to a plain M4 netlist-only token, so older links still open.
       function loadFromHash() {
         const frag = location.hash.slice(1); // drop the leading '#'
         if (!frag) return false;
-        const decoded = decode_share(frag); // "" on an unrecognized fragment
-        if (!decoded) return false;
-        netlist.value = decoded;
-        return true;
+        try {
+          const s = JSON.parse(decode_session_share(frag)); // throws on a bad token
+          netlist.value = s.netlist;
+          $("duration").value = s.duration;
+          $("step").value = s.step == null ? 0 : s.step;
+          $("probes").value = (s.probes || []).join(" ");
+          return true;
+        } catch {
+          const decoded = decode_share(frag); // "" on an unrecognized fragment
+          if (!decoded) return false;
+          netlist.value = decoded;
+          return true;
+        }
       }
 
       async function shareLink() {
-        const token = encode_share(netlist.value);
+        const duration = parseFloat($("duration").value) || 0;
+        const step = parseFloat($("step").value) || 0;
+        const token = encode_session_share(
+          netlist.value,
+          duration,
+          step,
+          probeList().join("\n")
+        );
         // Update the address bar without adding a history entry.
         history.replaceState(null, "", "#" + token);
         const url = location.href;
         try {
           await navigator.clipboard.writeText(url);
-          statusEl.textContent = "Link copied to clipboard.";
+          statusEl.textContent = "Session link copied to clipboard.";
         } catch {
           // Clipboard may be unavailable (insecure context / denied); the hash
           // is still set, so the user can copy the URL from the address bar.
-          statusEl.textContent = "Link set in the address bar — copy it to share.";
+          statusEl.textContent = "Session link set in the address bar — copy it to share.";
         }
       }
 
@@ -281,13 +313,14 @@ C2 out gnd 100n
         const r = JSON.parse(json);
         $("scope").textContent = r.scope || "(no scope)";
         const tbody = $("op").querySelector("tbody");
+        const probes = probeList();
         tbody.innerHTML =
           "<tr><th>node</th><th>voltage</th></tr>" +
           r.op
-            .map(
-              (n) =>
-                `<tr><td>${n.name}</td><td>${n.v == null ? "—" : n.v.toPrecision(5) + " V"}</td></tr>`
-            )
+            .map((n) => {
+              const probed = probes.some((p) => n.name.includes(p));
+              return `<tr class="${probed ? "probed" : ""}"><td>${n.name}</td><td>${n.v == null ? "—" : n.v.toPrecision(5) + " V"}</td></tr>`;
+            })
             .join("");
         statusEl.textContent = `OK — ${r.nodes.length} node(s), ${r.x.length} transient sample(s).`;
         refreshParts();

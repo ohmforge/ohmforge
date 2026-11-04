@@ -10,9 +10,12 @@ You can also **build** the circuit, not just paste it (CP-WEB.3): a parts form
 adds a part (ref / nodes / value), lists the parts, and removes one, staying in
 sync with the netlist text and re-simulating on every edit.
 
-A circuit is also a **shareable link** (CP-WEB.2): **Copy link** packs the
-current netlist into the URL fragment, and opening that link loads and runs the
-circuit — "open in a browser, poke it", shareable by copy-paste.
+A circuit is also a **shareable link** (CP-WEB.2, extended to a **full session**
+in CP-WEB.4): **Copy session link** packs the whole workbench — the netlist plus
+the probes and the duration/step view settings — into the URL fragment, and
+opening that link restores someone's exact workbench and re-runs it. "Open in a
+browser, poke it", shareable by copy-paste. Real-time co-editing is out of scope
+(see below).
 
 ## Architecture — pure core, thin wasm shell
 
@@ -86,6 +89,8 @@ exception (the error string) on a parse/solver failure.
 | `list_parts(netlist)` | `(string) → string` | JSON `{title, parts:[{reference,kind,node_a,node_b,value}]}`; throws on a malformed netlist |
 | `edit_add(netlist, ref, a, b, value)` | `(string, …) → string` | the netlist with a part appended; throws on an invalid/duplicate part |
 | `edit_remove(netlist, ref)` | `(string, string) → string` | the netlist with that reference removed (a no-op if absent) |
+| `encode_session_share(netlist, duration, step, probes)` | `(string, number, number, string) → string` | a session token (netlist + settings + newline-separated probes); `step ≤ 0` = adaptive |
+| `decode_session_share(token)` | `(string) → string` | JSON `{netlist, duration, step, probes:[…]}` for a session token (leading `#` ok); throws on an invalid token |
 
 `duration` is the transient length in seconds; `step` is the fixed timestep in
 seconds, or `0` (≤ 0) to let the engine pick an adaptive step. Non-finite samples
@@ -131,7 +136,39 @@ never a panic.
 
 The encode/decode pair is **pure host Rust** (`ee_web::encode` / `ee_web::decode`,
 no dependency), so it is unit-tested in CI without a browser; `encode_share` /
-`decode_share` are the thin `#[wasm_bindgen]` wrappers. In the page, **Copy link**
-sets `location.hash` to `encode_share(netlist)` and copies the URL, and on load
-(and on `hashchange`) the page decodes any fragment back into the textarea and
-runs it.
+`decode_share` are the thin `#[wasm_bindgen]` wrappers. The page no longer makes
+a netlist-only link itself (it shares a full session, below), but `decode_share`
+stays wired so that **older CP-WEB.2 netlist-only links still open**.
+
+## Full-session shareable links (CP-WEB.4)
+
+CP-WEB.4 extends the share link from "just the netlist" to the **full session**,
+so a link restores someone's exact workbench: the netlist **plus** the probes
+and the transient `duration`/`step` the page holds. The session is serialized to
+a small, line-oriented text blob and run through the *same* hand-rolled base64url
+as CP-WEB.2, so the token still drops straight into `location.hash`:
+
+```text
+EEWS1\n            magic + version
+<duration f64>\n   Rust's shortest round-trippable f64 form
+<step | auto>\n
+<probe count>\n
+<probe>\n × count  node names (whitespace-free → one per line)
+<netlist…>         everything after the header, byte-exact
+```
+
+Putting the netlist last and copying the remaining bytes wholesale is what makes
+the round trip **exact** — its comments, blank lines, CRLFs and trailing newline
+all survive. `ee_web::encode_session` / `ee_web::decode_session` are **pure host
+Rust** (`Session` → token → `Session`), unit-tested in CI; `encode_session_share`
+/ `decode_session_share` are the thin wasm wrappers. In the page, **Copy session
+link** encodes `{netlist, duration, step, probes}`, and on load (and `hashchange`)
+the page decodes it, restores every field, and re-runs — falling back to a legacy
+netlist-only token if the fragment is not a session.
+
+**Out of scope: real-time co-editing.** A session link is a point-in-time
+snapshot (async collaboration — you send a link, they open it later). Live
+multi-cursor co-editing is deliberately *not* built here: it needs a server-side
+relay or a CRDT backend to merge concurrent edits, which this static,
+backend-free page (just `.wasm` + `.js` + `.html`, served from any file host)
+has no place for.
