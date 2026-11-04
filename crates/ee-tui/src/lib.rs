@@ -16,7 +16,9 @@ pub mod run;
 pub mod schematic;
 pub mod screen;
 
-pub use app::{App, AppEvent, Backend, KeyCode, KeyEvent, MouseEvent, MouseKind, PanelId};
+pub use app::{
+    App, AppEvent, Backend, EditAction, KeyCode, KeyEvent, MouseEvent, MouseKind, PanelId,
+};
 pub use breadboard::Breadboard;
 pub use overlay::{NodeVoltages, Overlay};
 pub use plot::Plot;
