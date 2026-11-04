@@ -65,6 +65,21 @@
         padding: 6px 8px;
         font: inherit;
       }
+      input[type="text"] {
+        width: 92px;
+        background: #0b0d12;
+        color: var(--ink);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 6px 8px;
+        font: 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+      .editor { margin-top: 16px; border-top: 1px solid var(--border); padding-top: 12px; }
+      table.parts td button {
+        padding: 2px 8px;
+        font-size: 12px;
+      }
+      table.parts td { font-size: 12px; }
       select, button {
         background: #0b0d12;
         color: var(--ink);
@@ -92,6 +107,7 @@
       th { color: var(--muted); font-weight: 500; }
       .err { color: var(--err); font-family: ui-monospace, monospace; white-space: pre-wrap; }
       .muted { color: var(--muted); }
+      tr.probed td { color: var(--accent); font-weight: 600; }
     </style>
   </head>
   <body>
@@ -121,14 +137,47 @@
             <input id="step" type="number" value="0.000005" step="0.000001" min="0" />
           </div>
           <div>
+            <label for="probes">Probes (nodes)</label>
+            <input id="probes" type="text" style="width:140px" placeholder="out in" spellcheck="false" />
+          </div>
+          <div>
             <label>&nbsp;</label>
             <button id="run" class="run" disabled>Run</button>
           </div>
           <div>
             <label>&nbsp;</label>
-            <button id="share" disabled>Copy link</button>
+            <button id="share" disabled>Copy session link</button>
           </div>
         </div>
+
+        <div class="editor">
+          <label>Parts — add, list, remove (kept in sync with the netlist)</label>
+          <table class="parts" id="parts"><tbody></tbody></table>
+          <div class="row">
+            <div>
+              <label for="p-ref">Ref</label>
+              <input id="p-ref" type="text" placeholder="R2" spellcheck="false" />
+            </div>
+            <div>
+              <label for="p-a">Node A</label>
+              <input id="p-a" type="text" placeholder="out" spellcheck="false" />
+            </div>
+            <div>
+              <label for="p-b">Node B</label>
+              <input id="p-b" type="text" placeholder="gnd" spellcheck="false" />
+            </div>
+            <div>
+              <label for="p-val">Value</label>
+              <input id="p-val" type="text" placeholder="2k" spellcheck="false" />
+            </div>
+            <div>
+              <label>&nbsp;</label>
+              <button id="p-add" disabled>Add part</button>
+            </div>
+          </div>
+          <p id="edit-err" class="err" style="margin:6px 0 0"></p>
+        </div>
+
         <p id="status" class="muted" style="margin:10px 0 0">Loading WebAssembly…</p>
       </section>
 
@@ -142,7 +191,15 @@
     </main>
 
     <script type="module">
-      import init, { simulate, encode_share, decode_share } from "./pkg/ee_web.js";
+      import init, {
+        simulate,
+        decode_share,
+        list_parts,
+        edit_add,
+        edit_remove,
+        encode_session_share,
+        decode_session_share,
+      } from "./pkg/ee_web.js";
 
       const DEMOS = {
         "RC low-pass": `# out charges toward the 5 V rail through R1
@@ -173,6 +230,7 @@ C2 out gnd 100n
       const netlist = $("netlist");
       const statusEl = $("status");
       const errEl = $("error");
+      const editErr = $("edit-err");
 
       for (const name of Object.keys(DEMOS)) {
         const o = document.createElement("option");
@@ -182,33 +240,60 @@ C2 out gnd 100n
       }
       demoSel.addEventListener("change", () => {
         netlist.value = DEMOS[demoSel.value];
+        refreshParts();
       });
       netlist.value = DEMOS[Object.keys(DEMOS)[0]];
 
-      // A circuit is a shareable link: the netlist is packed (base64url) into
-      // the URL fragment. `encode_share`/`decode_share` are the wasm wrappers
-      // over the host-tested Rust encode/decode.
+      // The probed node names, split on whitespace/commas (empty tokens dropped).
+      const probeList = () =>
+        $("probes")
+          .value.split(/[\s,]+/)
+          .map((s) => s.trim())
+          .filter(Boolean);
+
+      // A shareable link restores a *full session* (CP-WEB.4): the netlist plus
+      // the view settings the page holds — duration, step and probes — packed
+      // (base64url) into the URL fragment. `encode_session_share` /
+      // `decode_session_share` are the wasm wrappers over the host-tested Rust
+      // encode_session/decode_session. On load we try the session token first and
+      // fall back to a plain M4 netlist-only token, so older links still open.
       function loadFromHash() {
         const frag = location.hash.slice(1); // drop the leading '#'
         if (!frag) return false;
-        const decoded = decode_share(frag); // "" on an unrecognized fragment
-        if (!decoded) return false;
-        netlist.value = decoded;
-        return true;
+        try {
+          const s = JSON.parse(decode_session_share(frag)); // throws on a bad token
+          netlist.value = s.netlist;
+          $("duration").value = s.duration;
+          $("step").value = s.step == null ? 0 : s.step;
+          $("probes").value = (s.probes || []).join(" ");
+          return true;
+        } catch {
+          const decoded = decode_share(frag); // "" on an unrecognized fragment
+          if (!decoded) return false;
+          netlist.value = decoded;
+          return true;
+        }
       }
 
       async function shareLink() {
-        const token = encode_share(netlist.value);
+        const duration = parseFloat($("duration").value) || 0;
+        const step = parseFloat($("step").value) || 0;
+        const token = encode_session_share(
+          netlist.value,
+          duration,
+          step,
+          probeList().join("\n")
+        );
         // Update the address bar without adding a history entry.
         history.replaceState(null, "", "#" + token);
         const url = location.href;
         try {
           await navigator.clipboard.writeText(url);
-          statusEl.textContent = "Link copied to clipboard.";
+          statusEl.textContent = "Session link copied to clipboard.";
         } catch {
           // Clipboard may be unavailable (insecure context / denied); the hash
           // is still set, so the user can copy the URL from the address bar.
-          statusEl.textContent = "Link set in the address bar — copy it to share.";
+          statusEl.textContent = "Session link set in the address bar — copy it to share.";
         }
       }
 
@@ -228,15 +313,83 @@ C2 out gnd 100n
         const r = JSON.parse(json);
         $("scope").textContent = r.scope || "(no scope)";
         const tbody = $("op").querySelector("tbody");
+        const probes = probeList();
         tbody.innerHTML =
           "<tr><th>node</th><th>voltage</th></tr>" +
           r.op
-            .map(
-              (n) =>
-                `<tr><td>${n.name}</td><td>${n.v == null ? "—" : n.v.toPrecision(5) + " V"}</td></tr>`
-            )
+            .map((n) => {
+              const probed = probes.some((p) => n.name.includes(p));
+              return `<tr class="${probed ? "probed" : ""}"><td>${n.name}</td><td>${n.v == null ? "—" : n.v.toPrecision(5) + " V"}</td></tr>`;
+            })
             .join("");
         statusEl.textContent = `OK — ${r.nodes.length} node(s), ${r.x.length} transient sample(s).`;
+        refreshParts();
+      }
+
+      // --- Structured editing (CP-WEB.3) ---------------------------------
+      // The parts form is a view over the netlist text: `list_parts` reads the
+      // textarea into a structured list, and `edit_add` / `edit_remove` rewrite
+      // the textarea. Both sides are the host-tested Rust model, so the form and
+      // the text can never drift apart.
+      function refreshParts() {
+        editErr.textContent = "";
+        const tbody = $("parts").querySelector("tbody");
+        let model;
+        try {
+          model = JSON.parse(list_parts(netlist.value));
+        } catch (e) {
+          // Netlist isn't currently parseable (mid-edit); show it, leave the
+          // last good list in place rather than clearing it.
+          editErr.textContent = String(e);
+          return;
+        }
+        if (model.parts.length === 0) {
+          tbody.innerHTML =
+            "<tr><td class='muted' colspan='5'>(no parts yet — add one below)</td></tr>";
+          return;
+        }
+        tbody.innerHTML =
+          "<tr><th>ref</th><th>kind</th><th>nodes</th><th>value</th><th></th></tr>" +
+          model.parts
+            .map(
+              (p) =>
+                `<tr><td>${p.reference}</td><td>${p.kind}</td>` +
+                `<td>${p.node_a} → ${p.node_b}</td><td>${p.value}</td>` +
+                `<td><button data-ref="${p.reference}" class="rm">remove</button></td></tr>`
+            )
+            .join("");
+        for (const btn of tbody.querySelectorAll("button.rm")) {
+          btn.addEventListener("click", () => removePart(btn.dataset.ref));
+        }
+      }
+
+      function addPart() {
+        editErr.textContent = "";
+        try {
+          netlist.value = edit_add(
+            netlist.value,
+            $("p-ref").value,
+            $("p-a").value,
+            $("p-b").value,
+            $("p-val").value
+          );
+        } catch (e) {
+          editErr.textContent = String(e);
+          return;
+        }
+        $("p-ref").value = $("p-a").value = $("p-b").value = $("p-val").value = "";
+        runSim(); // re-simulate on edit
+      }
+
+      function removePart(ref) {
+        editErr.textContent = "";
+        try {
+          netlist.value = edit_remove(netlist.value, ref);
+        } catch (e) {
+          editErr.textContent = String(e);
+          return;
+        }
+        runSim(); // re-simulate on edit
       }
 
       init()
@@ -244,8 +397,12 @@ C2 out gnd 100n
           statusEl.textContent = "Ready.";
           $("run").disabled = false;
           $("share").disabled = false;
+          $("p-add").disabled = false;
           $("run").addEventListener("click", runSim);
           $("share").addEventListener("click", shareLink);
+          $("p-add").addEventListener("click", addPart);
+          // Typing in the netlist keeps the parts list in sync (no re-run).
+          netlist.addEventListener("input", refreshParts);
           // A shared link (#…) wins over the default demo: load it, then run.
           loadFromHash();
           runSim();
