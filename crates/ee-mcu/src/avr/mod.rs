@@ -35,6 +35,6 @@ pub use self::core::Avr;
 pub use board::{Mega, Uno};
 pub use decode::decode;
 pub use isa::{Instr, Ptr, PtrMode};
-pub use periph::{pin_id, pin_location, Peripherals, Port, PIN_COUNT};
+pub use periph::{pin_id, pin_location, Peripherals, Port, SpiEdge, TwiEvent, TwiLine, PIN_COUNT};
 pub use sreg::Sreg;
 pub use variant::{AvrVariant, TimerSpec};

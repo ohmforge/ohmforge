@@ -11,8 +11,10 @@
 
 pub mod manifest;
 pub mod modules;
+pub mod subcircuits;
 
 pub use manifest::{ManifestError, OnboardPart};
+pub use subcircuits::{AnalogSwitch, OpAmp, Relay};
 
 /// A board the user can `board add`.
 #[derive(Debug, Clone, PartialEq, Eq)]

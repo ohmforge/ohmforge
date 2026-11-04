@@ -11,3 +11,9 @@ workspace = true
 
 [dependencies]
 ee-core = { workspace = true }
+
+[dev-dependencies]
+# Used only by the subcircuit gate tests to confirm the stamped primitives
+# actually simulate; the library itself keeps the ee-core-only dependency set
+# and stays wasm32-clean.
+ee-sim = { workspace = true }
