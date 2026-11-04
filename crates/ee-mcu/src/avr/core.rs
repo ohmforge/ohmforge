@@ -1267,4 +1267,83 @@ mod tests {
         );
         assert_eq!(avr.load_firmware(&[]), Err(FirmwareError::BadImage));
     }
+
+    #[test]
+    fn spi_program_clocks_a_byte_out_on_mosi() {
+        // A hand-assembled SPI master transmit, mirroring the blink gate:
+        //   SBI  DDRB, 3        ; MOSI (PB3) output        0x9A23
+        //   SBI  DDRB, 5        ; SCK  (PB5) output        0x9A25
+        //   LDI  r16, 0x50      ; SPE | MSTR               0xE500
+        //   OUT  SPCR, r16      ; I/O 0x0C                 0xB90C
+        //   LDI  r16, 0xA5                                 0xEA05
+        //   OUT  SPDR, r16      ; I/O 0x0E → start xfer    0xB90E
+        // wait:
+        //   SBIS SPSR, 7        ; skip when SPIF set        0x9B6F
+        //   RJMP wait           ; (-2)                      0xCFFE
+        //   IN   r17, SPDR      ; read received byte        0xB11E
+        // done:
+        //   RJMP done           ; (self)                    0xCFFF
+        let mut avr = with_program(&[
+            0x9A23, 0x9A25, 0xE500, 0xB90C, 0xEA05, 0xB90E, 0x9B6F, 0xCFFE, 0xB11E, 0xCFFF,
+        ]);
+        run(&mut avr, 80);
+
+        let p = avr.peripherals();
+        assert_eq!(p.spi_tx(), &[0xA5], "the OUT SPDR shifted 0xA5 out");
+        // Reconstruct the MOSI sequence captured on the SCK sampling edges.
+        let mut byte = 0u8;
+        for e in p.spi_edges().iter().filter(|e| e.sample) {
+            assert!(e.sck, "mode-0 sampling edge is a rising SCK edge");
+            byte = (byte << 1) | e.mosi as u8;
+        }
+        assert_eq!(byte, 0xA5, "captured MOSI bits match the byte, MSB first");
+    }
+
+    #[test]
+    fn twi_program_writes_start_addr_data_stop() {
+        use crate::avr::periph::TwiEvent;
+        // A hand-assembled TWI master write of one byte to slave 0x28. The TWI
+        // registers live above the IN/OUT window, so this uses STS/LDS. Each
+        // phase writes TWCR with TWINT|TWEN (plus TWSTA/TWSTO) and polls TWINT.
+        //   LDI r16,0xA4 ; STS TWCR,r16        ; START (TWINT|TWSTA|TWEN)
+        // wait1: LDS r16,TWCR ; SBRS r16,7 ; RJMP wait1
+        //   LDI r16,0x50 ; STS TWDR,r16        ; SLA+W (0x28<<1 | 0)
+        //   LDI r16,0x84 ; STS TWCR,r16        ; transmit (TWINT|TWEN)
+        // wait2: LDS r16,TWCR ; SBRS r16,7 ; RJMP wait2
+        //   LDI r16,0x5A ; STS TWDR,r16        ; data byte
+        //   LDI r16,0x84 ; STS TWCR,r16        ; transmit
+        // wait3: LDS r16,TWCR ; SBRS r16,7 ; RJMP wait3
+        //   LDI r16,0x94 ; STS TWCR,r16        ; STOP (TWINT|TWSTO|TWEN)
+        // done: RJMP done
+        let mut avr = with_program(&[
+            0xEA04, 0x9300, 0x00BC, // LDI r16,0xA4 ; STS TWCR,r16
+            0x9100, 0x00BC, 0xFF07, 0xCFFC, // wait1: LDS ; SBRS ; RJMP -4
+            0xE500, 0x9300, 0x00BB, // LDI r16,0x50 ; STS TWDR,r16
+            0xE804, 0x9300, 0x00BC, // LDI r16,0x84 ; STS TWCR,r16
+            0x9100, 0x00BC, 0xFF07, 0xCFFC, // wait2
+            0xE50A, 0x9300, 0x00BB, // LDI r16,0x5A ; STS TWDR,r16
+            0xE804, 0x9300, 0x00BC, // LDI r16,0x84 ; STS TWCR,r16
+            0x9100, 0x00BC, 0xFF07, 0xCFFC, // wait3
+            0xE904, 0x9300, 0x00BC, // LDI r16,0x94 ; STS TWCR,r16
+            0xCFFF, // done: RJMP done
+        ]);
+        run(&mut avr, 800);
+
+        assert_eq!(
+            avr.peripherals().twi_events(),
+            &[
+                TwiEvent::Start,
+                TwiEvent::Byte {
+                    value: 0x50,
+                    ack: true
+                },
+                TwiEvent::Byte {
+                    value: 0x5A,
+                    ack: true
+                },
+                TwiEvent::Stop,
+            ],
+            "the program drove a START / SLA+W / data / STOP sequence"
+        );
+    }
 }
