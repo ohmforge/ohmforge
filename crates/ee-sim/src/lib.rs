@@ -27,7 +27,7 @@ use ee_core::graph::{
 };
 use ee_core::value::Value;
 use ee_core::{Complex, Domain, Signal, SignalData, Unit};
-use mna::System;
+use mna::{ReusableSolver, System};
 use mna_complex::ComplexSystem;
 
 /// The analyses the engine can run.
@@ -1164,7 +1164,9 @@ fn collect_nonlinear(
 /// aids ([`gmin_stepping`] / [`source_stepping`]) warm-start each continuation
 /// step from the previous one. `gmin` adds a conductance from every node to
 /// ground on every iteration — the knob gmin stepping ramps from large → 0; pass
-/// `0.0` for the unaided solve.
+/// `0.0` for the unaided solve. `solver` carries the linear-solve strategy and its
+/// reusable ordered factorization across the iterations (`CP-SIM-M5.1`).
+#[allow(clippy::too_many_arguments)] // one cohesive Newton solve: system + aids + solver
 fn solve_nr(
     circuit: &Circuit,
     layout: &Layout,
@@ -1173,13 +1175,17 @@ fn solve_nr(
     stamp_linear: &dyn Fn(&mut System) -> Result<(), SimError>,
     x_init: Option<&[f64]>,
     gmin: f64,
+    solver: &mut ReusableSolver,
 ) -> Result<Vec<f64>, SimError> {
     // Purely linear: one stamp-and-solve is exact (and identical to M0). A linear
     // circuit always solves in one shot, so the convergence aids never reach here.
+    // The `solver` routes the large-net solve through the ordered KLU path (and,
+    // across a transient's steps, reuses its symbolic factorization); below
+    // `KLU_THRESHOLD` it is a bit-for-bit pass-through, so small circuits are exact.
     if devices.is_empty() {
         let mut sys = System::new(size);
         stamp_linear(&mut sys)?;
-        return sys.solve().ok_or(SimError::Singular);
+        return solver.solve(sys).ok_or(SimError::Singular);
     }
 
     // Initial guess: the warm start if given, else every node at 0 V.
@@ -1221,7 +1227,7 @@ fn solve_nr(
             i_now.push(comp.i);
         }
 
-        let x_new = sys.solve().ok_or(SimError::Singular)?;
+        let x_new = solver.solve(sys).ok_or(SimError::Singular)?;
         // A diverging solution (overflow → inf/NaN) must never read as converged.
         // `f64::max` ignores NaN, so test finiteness explicitly before the tol
         // check rather than letting a NaN step fold to a spurious zero.
@@ -1279,8 +1285,13 @@ fn solve_aided(
     size: usize,
     devices: &[Box<dyn NonlinearDevice>],
     stamp_at: &dyn Fn(&mut System, f64) -> Result<(), SimError>,
+    solver: &mut ReusableSolver,
 ) -> Result<Vec<f64>, SimError> {
-    // 1. Plain Newton–Raphson, full sources, no gmin, cold start.
+    // 1. Plain Newton–Raphson, full sources, no gmin, cold start. This is the only
+    // path that reuses the caller's `solver` — its structure (full sources, gmin 0)
+    // is the one a transient repeats step after step, so the symbolic factorization
+    // carries over. The gmin / source-stepping fallbacks below perturb the structure
+    // (gmin adds node-to-ground stamps), so each gets its own throwaway solver.
     match solve_nr(
         circuit,
         layout,
@@ -1289,6 +1300,7 @@ fn solve_aided(
         &|sys| stamp_at(sys, 1.0),
         None,
         0.0,
+        solver,
     ) {
         Ok(x) => return Ok(x),
         // Hit the iteration cap or a singular guess — the aids may still get there.
@@ -1331,7 +1343,12 @@ fn solve_dc(
         stamp_inductor_shorts(sys, circuit, layout)?;
         Ok(())
     };
-    solve_aided(circuit, layout, size, &devices, &stamp_at)
+    // A one-shot operating point: its own solver reuses the symbolic factorization
+    // across this solve's Newton iterations (and, on a large net, takes the ordered
+    // KLU path); a sweep/Monte-Carlo point owns one per point, so parallel fan-out
+    // stays thread-local.
+    let mut solver = ReusableSolver::new(size);
+    solve_aided(circuit, layout, size, &devices, &stamp_at, &mut solver)
 }
 
 /// gmin stepping: solve with a large node-to-ground conductance first (which
@@ -1356,6 +1373,9 @@ fn gmin_stepping(
         } else {
             GMIN_START * ratio.powf(k as f64 / STEPPING_STEPS as f64)
         };
+        // Each continuation step's gmin changes the stamped structure, so it gets a
+        // fresh solver (reuse holds only within its own Newton iterations).
+        let mut solver = ReusableSolver::new(size);
         match solve_nr(
             circuit,
             layout,
@@ -1364,6 +1384,7 @@ fn gmin_stepping(
             &|sys| stamp_at(sys, 1.0),
             Some(&x),
             gmin,
+            &mut solver,
         ) {
             Ok(sol) => x = sol,
             Err(SimError::NonConvergence(_)) => return Ok(None),
@@ -1388,6 +1409,9 @@ fn source_stepping(
     let mut x = vec![0.0; size];
     for k in 0..=STEPPING_STEPS {
         let alpha = k as f64 / STEPPING_STEPS as f64; // 0 → 1
+                                                      // Source scale changes only right-hand-side numbers, not structure, but a
+                                                      // fresh per-step solver keeps the stepping path independent of the plain one.
+        let mut solver = ReusableSolver::new(size);
         match solve_nr(
             circuit,
             layout,
@@ -1396,6 +1420,7 @@ fn source_stepping(
             &|sys| stamp_at(sys, alpha),
             Some(&x),
             0.0,
+            &mut solver,
         ) {
             Ok(sol) => x = sol,
             Err(SimError::NonConvergence(_)) => return Ok(None),
@@ -1539,13 +1564,18 @@ impl<'a> TransientModel<'a> {
         };
         // The t = 0 solve gets the same convergence-aid ladder as the DC operating
         // point: a stiff nonlinear bias the op-point can crack must not spuriously
-        // fail a transient just because it is the first sample.
+        // fail a transient just because it is the first sample. Its structure (caps
+        // held as 0 V sources) differs from the stepping structure, so it uses its
+        // own solver rather than the one the step loop reuses.
+        let init_size = n + m + cb + self.caps.len();
+        let mut solver = ReusableSolver::new(init_size);
         let x0 = solve_aided(
             circuit,
             layout,
-            n + m + cb + self.caps.len(),
+            init_size,
             &self.devices,
             &stamp_at,
+            &mut solver,
         )?;
         let cap_v0 = self
             .caps
@@ -1570,6 +1600,7 @@ impl<'a> TransientModel<'a> {
         h: f64,
         cap_prev: &[f64],
         ind_prev: &[f64],
+        solver: &mut ReusableSolver,
     ) -> Result<StepResult, SimError> {
         let (circuit, layout) = (self.circuit, self.layout);
         // `alpha` ramps the independent sources only (source stepping); the
@@ -1597,12 +1628,16 @@ impl<'a> TransientModel<'a> {
         };
         // Each step gets the aided ladder too (plain NR first, so a convergent step
         // is unchanged); this keeps a nonlinear transient as robust as its op-point.
+        // The caller's `solver` is shared across steps: every step stamps the same
+        // structure (the reactive companions never change shape), so on a large net
+        // the fill-reducing ordering is computed once and only refactored per step.
         let x = solve_aided(
             circuit,
             layout,
             self.n + self.m + self.cb,
             &self.devices,
             &stamp_at,
+            solver,
         )?;
         let new_caps = self
             .caps
@@ -1680,9 +1715,12 @@ fn fixed_transient(
     }
     let mut cap_prev = cap_v0;
     let mut ind_prev = vec![0.0; model.inds.len()];
+    // One solver for the whole run: every step stamps the same structure, so a
+    // large net analyzes the fill-reducing ordering once and refactors per step.
+    let mut solver = ReusableSolver::new(model.n + model.m + model.cb);
     for k in 1..=steps {
         let t = k as f64 * h;
-        let (x, caps, inds) = model.step(t, h, &cap_prev, &ind_prev)?;
+        let (x, caps, inds) = model.step(t, h, &cap_prev, &ind_prev, &mut solver)?;
         times.push(t);
         for (d, trace) in traces.iter_mut().enumerate() {
             trace.push(x[d]);
@@ -1743,6 +1781,9 @@ fn adaptive_transient(
     let mut ind_prev = vec![0.0; model.inds.len()];
     let mut t = 0.0;
     let mut h = (duration / 100.0).clamp(h_min, h_max);
+    // Shared across every accept/reject attempt (coarse + two half steps): all stamp
+    // the same structure, so a large net reuses one symbolic factorization throughout.
+    let mut solver = ReusableSolver::new(model.n + model.m + model.cb);
 
     let mut iters = 0usize;
     while t < duration * (1.0 - 1e-12) {
@@ -1755,10 +1796,12 @@ fn adaptive_transient(
         let at_floor = h_try <= h_min * (1.0 + 1e-9);
 
         // Coarse: one step of h_try. Fine: two steps of h_try/2.
-        let (x_coarse, _, _) = model.step(t + h_try, h_try, &cap_prev, &ind_prev)?;
+        let (x_coarse, _, _) = model.step(t + h_try, h_try, &cap_prev, &ind_prev, &mut solver)?;
         let half = 0.5 * h_try;
-        let (_, caps_mid, inds_mid) = model.step(t + half, half, &cap_prev, &ind_prev)?;
-        let (x_fine, caps_fine, inds_fine) = model.step(t + h_try, half, &caps_mid, &inds_mid)?;
+        let (_, caps_mid, inds_mid) =
+            model.step(t + half, half, &cap_prev, &ind_prev, &mut solver)?;
+        let (x_fine, caps_fine, inds_fine) =
+            model.step(t + h_try, half, &caps_mid, &inds_mid, &mut solver)?;
 
         let err = lte_norm(&x_fine, &x_coarse);
         if err <= 1.0 || at_floor {
@@ -2589,6 +2632,17 @@ pub mod bench_support {
         linear_dc_system(circuit, System::sparse).solve()
     }
 
+    /// Solve `circuit`'s linear DC operating point through the fill-reducing ordered
+    /// KLU path — the route [`Engine::run`] takes above the engine's `KLU_THRESHOLD`
+    /// (`CP-SIM-M5.1`). Assembles the identical system [`dc_solve_sparse`] does, then
+    /// analyzes + factors + solves it ordered, so a bench can race the two on one
+    /// matrix at any size. (A single solve; the symbolic-reuse win is `refactor_reuse`.)
+    pub fn dc_solve_ordered(circuit: &Circuit) -> Option<Vec<f64>> {
+        let (mat, rhs) = linear_dc_system(circuit, System::sparse).into_ordered_parts();
+        let sym = Symbolic::analyze(&mat);
+        Some(sym.factor(&mat)?.solve(&rhs))
+    }
+
     // --- CP-SIM-M4.2: fill-reducing ordered reusable sparse LU -------------
 
     pub use crate::mna::{Numeric, SparseMatrix, Symbolic};
@@ -2711,6 +2765,7 @@ mod tests {
         let layout = Layout::build(c);
         let size = layout.n_nodes() + layout.vsources.len() + layout.inductors.len();
         let devices = collect_nonlinear(c).unwrap();
+        let mut solver = ReusableSolver::new(size);
         solve_nr(
             c,
             &layout,
@@ -2725,6 +2780,7 @@ mod tests {
             },
             None,
             0.0,
+            &mut solver,
         )
     }
 
@@ -5383,6 +5439,131 @@ mod tests {
             assert_eq!(got, dense[idx], "node {net:?}: sparse engine != dense");
             assert!(got > 0.0 && got < last, "ladder not monotone at {net:?}");
             last = got;
+        }
+    }
+
+    // --- Ordered KLU hot-loop routing — CP-SIM-M5.1 ------------------------
+
+    /// A star / "hub" resistor net: one hub node tied by 1 kΩ to each of `leaves`
+    /// leaf nodes, every leaf also tied to ground by 1 kΩ, and a 10 V source driving
+    /// the hub. Numbering the hub first (it is the source node, net 1) is the fill
+    /// pathology min-degree ordering is built to defeat — natural order fills the
+    /// whole leaf block. Returns the circuit, the hub net, and the leaf nets.
+    fn hub(leaves: usize) -> (Circuit, NetId, Vec<NetId>) {
+        let mut c = Circuit::new("hub");
+        let h = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("10", Unit::Volt),
+            vec![h, NetId::GROUND],
+        );
+        let mut leaf_nets = Vec::with_capacity(leaves);
+        for i in 0..leaves {
+            let leaf = c.new_net();
+            c.add_part(
+                format!("Rh{i}"),
+                PartKind::Resistor,
+                v("1k", Unit::Ohm),
+                vec![h, leaf],
+            );
+            c.add_part(
+                format!("Rg{i}"),
+                PartKind::Resistor,
+                v("1k", Unit::Ohm),
+                vec![leaf, NetId::GROUND],
+            );
+            leaf_nets.push(leaf);
+        }
+        (c, h, leaf_nets)
+    }
+
+    /// Above [`mna::KLU_THRESHOLD`], `Engine::run` routes the solve through the
+    /// fill-reducing ordered LU. On a large hub net its operating point must match
+    /// the forced *dense* reference to ≤1e-12 (the ordered path is the same LU,
+    /// merely reordered, so it agrees to a few ULP rather than bit-for-bit), and be
+    /// physically right — the source pins the hub to 10 V and, by the symmetric
+    /// 1 kΩ/1 kΩ divider at every leaf, each leaf sits at exactly half the hub.
+    #[test]
+    fn large_hub_uses_ordered_klu_and_matches_dense() {
+        let leaves = 400; // system size 402 ≥ KLU_THRESHOLD (256) → ordered path
+        assert!(
+            leaves + 2 >= crate::mna::KLU_THRESHOLD,
+            "test must clear the KLU threshold"
+        );
+        let (c, hub_net, leaf_nets) = hub(leaves);
+
+        let sigs = Engine::new().run(&c, &Analysis::OperatingPoint).unwrap();
+        let dense = bench_support::dc_solve_dense(&c).expect("dense hub solves");
+        let layout = Layout::build(&c);
+
+        // Hub pinned to the source.
+        let hub_name = format!("v(n{})", c.resolve(hub_net).0);
+        let hub_v = sigs
+            .iter()
+            .find(|s| s.name == hub_name)
+            .unwrap()
+            .real()
+            .unwrap()[0];
+        assert!(
+            (hub_v - 10.0).abs() <= 1e-12,
+            "hub = {hub_v} V, expected 10 V"
+        );
+
+        // Every node agrees with the dense reference to ≤1e-12, and each leaf is the
+        // hub's symmetric half-divider (5 V).
+        let mut max_diff = 0.0_f64;
+        for s in &sigs {
+            // Parse the node index out of the "v(nX)" signal back to a dense index.
+            let raw: u32 = s.name["v(n".len()..s.name.len() - 1].parse().unwrap();
+            let idx = *layout.index.get(&raw).unwrap();
+            let got = s.real().unwrap()[0];
+            max_diff = max_diff.max((got - dense[idx]).abs());
+        }
+        assert!(
+            max_diff <= 1e-12,
+            "ordered engine vs dense max |Δ| = {max_diff} (> 1e-12)"
+        );
+        for &leaf in &leaf_nets {
+            let name = format!("v(n{})", c.resolve(leaf).0);
+            let got = sigs
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap()
+                .real()
+                .unwrap()[0];
+            assert!(
+                (got - 5.0).abs() <= 1e-9,
+                "leaf {leaf:?} = {got} V, expected 5 V"
+            );
+        }
+    }
+
+    /// A large-net *transient* also takes the ordered path, and reuses one symbolic
+    /// factorization across all its steps (the structure never changes). The result
+    /// must still match the forced-dense per-step reference to ≤1e-12. A purely
+    /// resistive hub has no reactive state, so every step is the same DC solve — its
+    /// hub stays at 10 V and leaves at 5 V for the whole run.
+    #[test]
+    fn large_transient_reuses_ordered_factorization() {
+        let leaves = 400; // ≥ KLU_THRESHOLD
+        let (c, hub_net, _leaves) = hub(leaves);
+        let sigs = Engine::new()
+            .run(
+                &c,
+                &Analysis::Transient {
+                    duration: 1e-3,
+                    step: Some(1e-4), // 10 steps, each reusing the factorization
+                },
+            )
+            .unwrap();
+        let hub_name = format!("v(n{})", c.resolve(hub_net).0);
+        let hub = sigs.iter().find(|s| s.name == hub_name).unwrap();
+        for &y in hub.real().unwrap() {
+            assert!(
+                (y - 10.0).abs() <= 1e-12,
+                "hub drifted to {y} V across steps"
+            );
         }
     }
 

@@ -36,6 +36,25 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 /// ladders the sparse path targets clear it comfortably.
 pub const SPARSE_THRESHOLD: usize = 64;
 
+/// Unknown count at or above which the engine's repeated-solve hot loops route
+/// through the fill-reducing, reusable ordered LU ([`Symbolic`] / [`Numeric`] via
+/// [`ReusableSolver`], `CP-SIM-M5.1`) instead of the natural-order sparse solve.
+///
+/// **Why this exact value.** The natural-order dense and sparse backings are
+/// bit-for-bit identical to each other (and the sparse one is what every circuit
+/// in `[SPARSE_THRESHOLD, KLU_THRESHOLD)` gets); the ordered path reorders the
+/// elimination and so matches them only to a few ULP (≤1e-12), not to the bit. The
+/// golden determinism suite and `large_ladder_uses_sparse_and_matches_dense` pin
+/// results bit-for-bit, and the largest circuit any of them runs through
+/// `Engine::run` is a 200-rung ladder — MNA size 202. Setting the threshold at
+/// **256** keeps every one of those below it (so they stay on the exact
+/// natural-order path and do not move a bit), while genuinely large nets — the
+/// thousands-of-node meshes and hubs where natural order fills catastrophically —
+/// clear it and get the near-linear ordered solve with its reusable symbolic
+/// factorization. Raising it only ever keeps more nets on the slower exact path;
+/// lowering it below 203 would move a golden result and break the bit-for-bit gate.
+pub const KLU_THRESHOLD: usize = 256;
+
 /// The coefficient-matrix store behind a [`System`]: a dense array, or one sorted
 /// nonzero map per row. The right-hand side `z` is always dense (length `size`).
 #[derive(Clone)]
@@ -165,6 +184,34 @@ impl System {
             Backing::Dense(a) => Self::solve_dense(a, self.z, self.size),
             Backing::Sparse(rows) => Self::solve_sparse(rows, self.z, self.size),
         }
+    }
+
+    /// Consume this assembled system into the `(SparseMatrix, rhs)` pair the
+    /// fill-reducing ordered LU ([`Symbolic`] / [`Numeric`]) consumes — the bridge
+    /// the engine's [`ReusableSolver`] crosses above [`KLU_THRESHOLD`] (`CP-SIM-M5.1`).
+    /// A sparse backing hands its row maps straight over (a move, no rebuild); a
+    /// dense backing (only reachable if something forced one at a KLU-scale size)
+    /// is condensed to its structural nonzeros. The matrix structure is identical
+    /// to what the natural-order solve would have eliminated, so the ordered result
+    /// agrees with it to a few ULP.
+    pub(crate) fn into_ordered_parts(self) -> (SparseMatrix, Vec<f64>) {
+        let n = self.size;
+        let rows = match self.backing {
+            Backing::Sparse(rows) => rows,
+            Backing::Dense(a) => {
+                let mut rows = vec![BTreeMap::new(); n];
+                for (r, row) in rows.iter_mut().enumerate() {
+                    for c in 0..n {
+                        let v = a[r * n + c];
+                        if v != 0.0 {
+                            row.insert(c, v);
+                        }
+                    }
+                }
+                rows
+            }
+        };
+        (SparseMatrix { n, rows }, self.z)
     }
 
     /// Dense Gaussian elimination with partial pivoting — the original `O(N³)`
@@ -667,6 +714,69 @@ impl Numeric {
         let fresh = sym.run(mat, Some(&self.pivot_of_col))?;
         *self = fresh;
         Some(())
+    }
+}
+
+/// The engine-facing linear solver for a repeated-structure hot loop — the
+/// Newton–Raphson iterations of one solve, the steps of a transient, the points of
+/// a sweep (`CP-SIM-M5.1`). It owns the strategy choice and the reuse:
+///
+/// * **Below [`KLU_THRESHOLD`]** it is a pass-through — each assembled [`System`] is
+///   solved by its own backing exactly as before ([`System::solve`]), so every
+///   small / human-scale circuit keeps its current result *bit-for-bit*. This is
+///   the overwhelming common case and costs nothing.
+/// * **At or above [`KLU_THRESHOLD`]** the first solve runs the fill-reducing
+///   [`Symbolic::analyze`] once and [`Symbolic::factor`], caching both; every later
+///   solve of the *same structure* only [`Numeric::refactor`]s (no re-ordering, no
+///   pivot search) and back-solves. A collapsed pivot (a reused pivot gone ~0 as
+///   the numbers moved) transparently re-analyzes and re-factors, so correctness
+///   never depends on the reuse holding.
+///
+/// All matrices a single solver is fed **must share one structure** — the caller
+/// guarantees it by giving each structurally-distinct context (a gmin-stepping
+/// continuation, a transient's `t = 0` solve vs. its stepping solves) its own
+/// solver. That is exactly how the engine drives it.
+pub(crate) struct ReusableSolver {
+    /// Whether to take the ordered KLU path (size ≥ [`KLU_THRESHOLD`]).
+    ordered: bool,
+    /// The cached fill-reducing ordering, once the first ordered solve computed it.
+    sym: Option<Symbolic>,
+    /// The cached numeric factors, refactored in place on every later solve.
+    num: Option<Numeric>,
+}
+
+impl ReusableSolver {
+    /// A solver for systems of `size` unknowns: the ordered reusable path at or
+    /// above [`KLU_THRESHOLD`], else a bit-for-bit pass-through to [`System::solve`].
+    pub(crate) fn new(size: usize) -> Self {
+        Self {
+            ordered: size >= KLU_THRESHOLD,
+            sym: None,
+            num: None,
+        }
+    }
+
+    /// Solve one assembled system, consuming it. On the ordered path this reuses
+    /// the cached symbolic factorization (analyzing only on the first call or after
+    /// a pivot collapse). Returns `None` if the matrix is singular.
+    pub(crate) fn solve(&mut self, sys: System) -> Option<Vec<f64>> {
+        if !self.ordered {
+            return sys.solve();
+        }
+        let (mat, rhs) = sys.into_ordered_parts();
+        // Reuse the cached ordering + pivot sequence when we have one and it still
+        // holds for these numbers; otherwise analyze + factor afresh.
+        if let (Some(sym), Some(num)) = (self.sym.as_ref(), self.num.as_mut()) {
+            if num.refactor(sym, &mat).is_some() {
+                return Some(num.solve(&rhs));
+            }
+        }
+        let sym = Symbolic::analyze(&mat);
+        let num = sym.factor(&mat)?;
+        let x = num.solve(&rhs);
+        self.sym = Some(sym);
+        self.num = Some(num);
+        Some(x)
     }
 }
 
