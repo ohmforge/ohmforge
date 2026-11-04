@@ -23,11 +23,12 @@ use std::f64::consts::TAU;
 use std::fmt;
 
 use ee_core::graph::{
-    BjtModel, Circuit, MosfetModel, NetId, Part, PartKind, Polarity, Waveform, NOMINAL_TEMP_C,
+    BjtModel, Circuit, DiodeModel, MosfetModel, NetId, Part, PartKind, Polarity, Waveform,
+    NOMINAL_TEMP_C,
 };
 use ee_core::value::Value;
 use ee_core::{Complex, Domain, Signal, SignalData, Unit};
-use mna::System;
+use mna::{ReusableSolver, System};
 use mna_complex::ComplexSystem;
 
 /// The analyses the engine can run.
@@ -250,7 +251,7 @@ fn validate(circuit: &Circuit, registry: &DeviceRegistry) -> Result<(), SimError
             | PartKind::Inductor
             | PartKind::VoltageSource
             | PartKind::CurrentSource
-            | PartKind::Diode
+            | PartKind::Diode(..)
             | PartKind::Bjt(..)
             | PartKind::Mosfet(..)
             | PartKind::Vcvs(..)
@@ -876,30 +877,21 @@ fn pnjlim(v_new: f64, v_old: f64, vte: f64, is: f64) -> f64 {
     }
 }
 
-/// Shockley-diode model parameters. Defaults are a generic small-signal silicon
-/// diode at 300 K.
-#[derive(Debug, Clone, Copy)]
-struct DiodeModel {
-    /// Saturation current `I_s` (A).
-    is: f64,
-    /// Emission coefficient `n` (dimensionless).
-    n: f64,
-    /// Thermal voltage `V_t = kT/q` (V).
-    vt: f64,
-}
+/// The junction thermal voltage `V_t = kT/q` (V) at the nominal temperature — the
+/// fixed solver constant a diode's emission coefficient scales to `n·V_t`. (It is a
+/// constant rather than a [`DiodeModel`] field because the model exposes only the
+/// SPICE `.model` knobs `I_s`/`n`/`R_s`.)
+const DIODE_VT: f64 = 0.025_852;
 
-impl Default for DiodeModel {
-    fn default() -> Self {
-        Self {
-            is: 1e-14,
-            n: 1.0,
-            vt: 0.025_852,
-        }
-    }
-}
+/// Local-Newton iteration cap for resolving a diode's internal junction voltage
+/// when it carries a series resistance `R_s > 0` (`CP-SIM-M5.2`). A handful of
+/// steps converges the scalar `V = V_j + R_s·I(V_j)` from a warm start; the cap is
+/// only a guard against a pathological start.
+const DIODE_RS_ITERS: usize = 50;
 
 /// A junction diode. Terminals `[anode, cathode]`; the branch voltage is
-/// `v(anode) − v(cathode)` and forward current flows anode → cathode.
+/// `v(anode) − v(cathode)` and forward current flows anode → cathode. Carries its
+/// [`DiodeModel`] (`I_s`, `n`, `R_s`); the thermal voltage is [`DIODE_VT`].
 struct Diode {
     nets: [NetId; 2],
     model: DiodeModel,
@@ -911,23 +903,61 @@ impl NonlinearDevice for Diode {
     }
 
     fn state_len(&self) -> usize {
-        1 // the single junction voltage
+        1 // the single (junction) voltage carried for limiting / warm-starting
     }
 
     fn linearize(&self, v: &[f64], state: &mut [f64], limit: bool) -> Companion {
-        // Shockley: I = Is·(exp(V/(n·Vt)) − 1), g = dI/dV = (Is/(n·Vt))·exp(V/(n·Vt)).
-        let vte = self.model.n * self.model.vt;
-        let mut vd = v[0] - v[1];
-        if limit {
-            vd = pnjlim(vd, state[0], vte, self.model.is);
-            state[0] = vd;
-        }
-        let ex = (vd / vte).exp();
-        let i = self.model.is * (ex - 1.0);
-        let g = (self.model.is / vte) * ex;
-        // Norton equivalent current into the anode, `g·v − I`; the cathode mirrors
-        // it. This reproduces the two-terminal stamp bit-for-bit.
-        let i_eq = g * vd - i;
+        let is = self.model.is;
+        let vte = self.model.n * DIODE_VT; // emission-scaled thermal voltage, n·Vt
+        let v_term = v[0] - v[1];
+
+        let (i, g, i_eq) = if self.model.rs == 0.0 {
+            // Ideal junction — the exact pre-model path, bit-for-bit. Shockley:
+            // I = Is·(exp(V/(n·Vt)) − 1), g = dI/dV = (Is/(n·Vt))·exp(V/(n·Vt)).
+            let mut vd = v_term;
+            if limit {
+                vd = pnjlim(vd, state[0], vte, is);
+                state[0] = vd;
+            }
+            let ex = (vd / vte).exp();
+            let i = is * (ex - 1.0);
+            let g = (is / vte) * ex;
+            (i, g, g * vd - i)
+        } else {
+            // Series resistance: the terminal voltage splits across the ohmic R_s
+            // and the junction, `V = V_j + R_s·I(V_j)`. Resolve the internal V_j for
+            // the present terminal voltage by a damped local Newton (warm-started
+            // from the stored V_j), then present the composite's small-signal
+            // conductance g_eff = g_j/(1 + R_s·g_j) — the series combination of the
+            // junction conductance with R_s — as a single two-terminal companion, so
+            // no internal MNA node is needed.
+            let rs = self.model.rs;
+            let mut vj = state[0]; // previous junction voltage (0 on a cold start)
+            for _ in 0..DIODE_RS_ITERS {
+                let ex = (vj / vte).exp();
+                let ij = is * (ex - 1.0);
+                let gj = (is / vte) * ex;
+                // f(Vj) = Vj + Rs·I(Vj) − V_term, f'(Vj) = 1 + Rs·gj.
+                let f = vj + rs * ij - v_term;
+                let step = f / (1.0 + rs * gj);
+                let vj_next = pnjlim(vj - step, vj, vte, is); // damp the junction step
+                let done = (vj_next - vj).abs() < 1e-14 * (1.0 + vj_next.abs());
+                vj = vj_next;
+                if done {
+                    break;
+                }
+            }
+            if limit {
+                state[0] = vj;
+            }
+            let ex = (vj / vte).exp();
+            let i = is * (ex - 1.0);
+            let gj = (is / vte) * ex;
+            let g = gj / (1.0 + rs * gj); // composite (junction + Rs) conductance
+                                          // Norton source referenced to the terminal voltage: i_eq = g·V_term − I.
+            (i, g, g * v_term - i)
+        };
+        // Norton equivalent current into the anode; the cathode mirrors it.
         Companion {
             i: vec![i, -i],
             i_eq: vec![i_eq, -i_eq],
@@ -1090,18 +1120,6 @@ fn mos_chan(vgs: f64, vds: f64, m: &MosfetModel) -> (f64, f64, f64) {
     }
 }
 
-/// Build the diode model for a part: defaults, with `I_s` overridden by the
-/// part's value (amperes) when a sensible positive magnitude is present.
-fn diode_model(part: &Part) -> DiodeModel {
-    let mut m = DiodeModel::default();
-    if let Some(v) = &part.value {
-        if v.magnitude > 0.0 && v.magnitude.is_finite() {
-            m.is = v.magnitude;
-        }
-    }
-    m
-}
-
 /// Collect every nonlinear device in the circuit as a boxed [`NonlinearDevice`].
 /// This is the one place a new device kind is wired into the solver: the built-in
 /// diode / BJT / MOSFET, plus any [`PartKind::Other`] part whose name has a plugin
@@ -1115,11 +1133,11 @@ fn collect_nonlinear(
     let mut devices: Vec<Box<dyn NonlinearDevice>> = Vec::new();
     for part in circuit.parts() {
         match &part.kind {
-            PartKind::Diode => {
+            PartKind::Diode(model) => {
                 let (a, b) = terminals2(part)?;
                 devices.push(Box::new(Diode {
                     nets: [a, b],
-                    model: diode_model(part),
+                    model: *model,
                 }));
             }
             PartKind::Bjt(polarity, model) => {
@@ -1164,7 +1182,9 @@ fn collect_nonlinear(
 /// aids ([`gmin_stepping`] / [`source_stepping`]) warm-start each continuation
 /// step from the previous one. `gmin` adds a conductance from every node to
 /// ground on every iteration — the knob gmin stepping ramps from large → 0; pass
-/// `0.0` for the unaided solve.
+/// `0.0` for the unaided solve. `solver` carries the linear-solve strategy and its
+/// reusable ordered factorization across the iterations (`CP-SIM-M5.1`).
+#[allow(clippy::too_many_arguments)] // one cohesive Newton solve: system + aids + solver
 fn solve_nr(
     circuit: &Circuit,
     layout: &Layout,
@@ -1173,13 +1193,17 @@ fn solve_nr(
     stamp_linear: &dyn Fn(&mut System) -> Result<(), SimError>,
     x_init: Option<&[f64]>,
     gmin: f64,
+    solver: &mut ReusableSolver,
 ) -> Result<Vec<f64>, SimError> {
     // Purely linear: one stamp-and-solve is exact (and identical to M0). A linear
     // circuit always solves in one shot, so the convergence aids never reach here.
+    // The `solver` routes the large-net solve through the ordered KLU path (and,
+    // across a transient's steps, reuses its symbolic factorization); below
+    // `KLU_THRESHOLD` it is a bit-for-bit pass-through, so small circuits are exact.
     if devices.is_empty() {
         let mut sys = System::new(size);
         stamp_linear(&mut sys)?;
-        return sys.solve().ok_or(SimError::Singular);
+        return solver.solve(sys).ok_or(SimError::Singular);
     }
 
     // Initial guess: the warm start if given, else every node at 0 V.
@@ -1221,7 +1245,7 @@ fn solve_nr(
             i_now.push(comp.i);
         }
 
-        let x_new = sys.solve().ok_or(SimError::Singular)?;
+        let x_new = solver.solve(sys).ok_or(SimError::Singular)?;
         // A diverging solution (overflow → inf/NaN) must never read as converged.
         // `f64::max` ignores NaN, so test finiteness explicitly before the tol
         // check rather than letting a NaN step fold to a spurious zero.
@@ -1279,8 +1303,13 @@ fn solve_aided(
     size: usize,
     devices: &[Box<dyn NonlinearDevice>],
     stamp_at: &dyn Fn(&mut System, f64) -> Result<(), SimError>,
+    solver: &mut ReusableSolver,
 ) -> Result<Vec<f64>, SimError> {
-    // 1. Plain Newton–Raphson, full sources, no gmin, cold start.
+    // 1. Plain Newton–Raphson, full sources, no gmin, cold start. This is the only
+    // path that reuses the caller's `solver` — its structure (full sources, gmin 0)
+    // is the one a transient repeats step after step, so the symbolic factorization
+    // carries over. The gmin / source-stepping fallbacks below perturb the structure
+    // (gmin adds node-to-ground stamps), so each gets its own throwaway solver.
     match solve_nr(
         circuit,
         layout,
@@ -1289,6 +1318,7 @@ fn solve_aided(
         &|sys| stamp_at(sys, 1.0),
         None,
         0.0,
+        solver,
     ) {
         Ok(x) => return Ok(x),
         // Hit the iteration cap or a singular guess — the aids may still get there.
@@ -1331,7 +1361,12 @@ fn solve_dc(
         stamp_inductor_shorts(sys, circuit, layout)?;
         Ok(())
     };
-    solve_aided(circuit, layout, size, &devices, &stamp_at)
+    // A one-shot operating point: its own solver reuses the symbolic factorization
+    // across this solve's Newton iterations (and, on a large net, takes the ordered
+    // KLU path); a sweep/Monte-Carlo point owns one per point, so parallel fan-out
+    // stays thread-local.
+    let mut solver = ReusableSolver::new(size);
+    solve_aided(circuit, layout, size, &devices, &stamp_at, &mut solver)
 }
 
 /// gmin stepping: solve with a large node-to-ground conductance first (which
@@ -1356,6 +1391,9 @@ fn gmin_stepping(
         } else {
             GMIN_START * ratio.powf(k as f64 / STEPPING_STEPS as f64)
         };
+        // Each continuation step's gmin changes the stamped structure, so it gets a
+        // fresh solver (reuse holds only within its own Newton iterations).
+        let mut solver = ReusableSolver::new(size);
         match solve_nr(
             circuit,
             layout,
@@ -1364,6 +1402,7 @@ fn gmin_stepping(
             &|sys| stamp_at(sys, 1.0),
             Some(&x),
             gmin,
+            &mut solver,
         ) {
             Ok(sol) => x = sol,
             Err(SimError::NonConvergence(_)) => return Ok(None),
@@ -1388,6 +1427,9 @@ fn source_stepping(
     let mut x = vec![0.0; size];
     for k in 0..=STEPPING_STEPS {
         let alpha = k as f64 / STEPPING_STEPS as f64; // 0 → 1
+                                                      // Source scale changes only right-hand-side numbers, not structure, but a
+                                                      // fresh per-step solver keeps the stepping path independent of the plain one.
+        let mut solver = ReusableSolver::new(size);
         match solve_nr(
             circuit,
             layout,
@@ -1396,6 +1438,7 @@ fn source_stepping(
             &|sys| stamp_at(sys, alpha),
             Some(&x),
             0.0,
+            &mut solver,
         ) {
             Ok(sol) => x = sol,
             Err(SimError::NonConvergence(_)) => return Ok(None),
@@ -1539,13 +1582,18 @@ impl<'a> TransientModel<'a> {
         };
         // The t = 0 solve gets the same convergence-aid ladder as the DC operating
         // point: a stiff nonlinear bias the op-point can crack must not spuriously
-        // fail a transient just because it is the first sample.
+        // fail a transient just because it is the first sample. Its structure (caps
+        // held as 0 V sources) differs from the stepping structure, so it uses its
+        // own solver rather than the one the step loop reuses.
+        let init_size = n + m + cb + self.caps.len();
+        let mut solver = ReusableSolver::new(init_size);
         let x0 = solve_aided(
             circuit,
             layout,
-            n + m + cb + self.caps.len(),
+            init_size,
             &self.devices,
             &stamp_at,
+            &mut solver,
         )?;
         let cap_v0 = self
             .caps
@@ -1570,6 +1618,7 @@ impl<'a> TransientModel<'a> {
         h: f64,
         cap_prev: &[f64],
         ind_prev: &[f64],
+        solver: &mut ReusableSolver,
     ) -> Result<StepResult, SimError> {
         let (circuit, layout) = (self.circuit, self.layout);
         // `alpha` ramps the independent sources only (source stepping); the
@@ -1597,12 +1646,16 @@ impl<'a> TransientModel<'a> {
         };
         // Each step gets the aided ladder too (plain NR first, so a convergent step
         // is unchanged); this keeps a nonlinear transient as robust as its op-point.
+        // The caller's `solver` is shared across steps: every step stamps the same
+        // structure (the reactive companions never change shape), so on a large net
+        // the fill-reducing ordering is computed once and only refactored per step.
         let x = solve_aided(
             circuit,
             layout,
             self.n + self.m + self.cb,
             &self.devices,
             &stamp_at,
+            solver,
         )?;
         let new_caps = self
             .caps
@@ -1680,9 +1733,12 @@ fn fixed_transient(
     }
     let mut cap_prev = cap_v0;
     let mut ind_prev = vec![0.0; model.inds.len()];
+    // One solver for the whole run: every step stamps the same structure, so a
+    // large net analyzes the fill-reducing ordering once and refactors per step.
+    let mut solver = ReusableSolver::new(model.n + model.m + model.cb);
     for k in 1..=steps {
         let t = k as f64 * h;
-        let (x, caps, inds) = model.step(t, h, &cap_prev, &ind_prev)?;
+        let (x, caps, inds) = model.step(t, h, &cap_prev, &ind_prev, &mut solver)?;
         times.push(t);
         for (d, trace) in traces.iter_mut().enumerate() {
             trace.push(x[d]);
@@ -1743,6 +1799,9 @@ fn adaptive_transient(
     let mut ind_prev = vec![0.0; model.inds.len()];
     let mut t = 0.0;
     let mut h = (duration / 100.0).clamp(h_min, h_max);
+    // Shared across every accept/reject attempt (coarse + two half steps): all stamp
+    // the same structure, so a large net reuses one symbolic factorization throughout.
+    let mut solver = ReusableSolver::new(model.n + model.m + model.cb);
 
     let mut iters = 0usize;
     while t < duration * (1.0 - 1e-12) {
@@ -1755,10 +1814,12 @@ fn adaptive_transient(
         let at_floor = h_try <= h_min * (1.0 + 1e-9);
 
         // Coarse: one step of h_try. Fine: two steps of h_try/2.
-        let (x_coarse, _, _) = model.step(t + h_try, h_try, &cap_prev, &ind_prev)?;
+        let (x_coarse, _, _) = model.step(t + h_try, h_try, &cap_prev, &ind_prev, &mut solver)?;
         let half = 0.5 * h_try;
-        let (_, caps_mid, inds_mid) = model.step(t + half, half, &cap_prev, &ind_prev)?;
-        let (x_fine, caps_fine, inds_fine) = model.step(t + h_try, half, &caps_mid, &inds_mid)?;
+        let (_, caps_mid, inds_mid) =
+            model.step(t + half, half, &cap_prev, &ind_prev, &mut solver)?;
+        let (x_fine, caps_fine, inds_fine) =
+            model.step(t + h_try, half, &caps_mid, &inds_mid, &mut solver)?;
 
         let err = lte_norm(&x_fine, &x_coarse);
         if err <= 1.0 || at_floor {
@@ -2589,6 +2650,17 @@ pub mod bench_support {
         linear_dc_system(circuit, System::sparse).solve()
     }
 
+    /// Solve `circuit`'s linear DC operating point through the fill-reducing ordered
+    /// KLU path — the route [`Engine::run`] takes above the engine's `KLU_THRESHOLD`
+    /// (`CP-SIM-M5.1`). Assembles the identical system [`dc_solve_sparse`] does, then
+    /// analyzes + factors + solves it ordered, so a bench can race the two on one
+    /// matrix at any size. (A single solve; the symbolic-reuse win is `refactor_reuse`.)
+    pub fn dc_solve_ordered(circuit: &Circuit) -> Option<Vec<f64>> {
+        let (mat, rhs) = linear_dc_system(circuit, System::sparse).into_ordered_parts();
+        let sym = Symbolic::analyze(&mat);
+        Some(sym.factor(&mat)?.solve(&rhs))
+    }
+
     // --- CP-SIM-M4.2: fill-reducing ordered reusable sparse LU -------------
 
     pub use crate::mna::{Numeric, SparseMatrix, Symbolic};
@@ -2655,7 +2727,12 @@ pub mod bench_support {
             Value::parse("1k", Unit::Ohm).ok(),
             vec![vin, mid],
         );
-        c.add_part("D1", PartKind::Diode, None, vec![mid, NetId::GROUND]);
+        c.add_part(
+            "D1",
+            PartKind::Diode(DiodeModel::default()),
+            None,
+            vec![mid, NetId::GROUND],
+        );
         c.set_tolerance("R1", 0.05);
         (c, mid)
     }
@@ -2711,6 +2788,7 @@ mod tests {
         let layout = Layout::build(c);
         let size = layout.n_nodes() + layout.vsources.len() + layout.inductors.len();
         let devices = collect_nonlinear(c).unwrap();
+        let mut solver = ReusableSolver::new(size);
         solve_nr(
             c,
             &layout,
@@ -2725,6 +2803,7 @@ mod tests {
             },
             None,
             0.0,
+            &mut solver,
         )
     }
 
@@ -2797,7 +2876,12 @@ mod tests {
             vec![vin, NetId::GROUND],
         );
         c.add_part("R1", PartKind::Resistor, v("1k", Unit::Ohm), vec![vin, mid]);
-        c.add_part("D1", PartKind::Diode, None, vec![mid, NetId::GROUND]);
+        c.add_part(
+            "D1",
+            PartKind::Diode(DiodeModel::default()),
+            None,
+            vec![mid, NetId::GROUND],
+        );
 
         let layout = Layout::build(&c);
         let size = layout.n_nodes() + layout.vsources.len() + layout.inductors.len();
@@ -2844,7 +2928,12 @@ mod tests {
             vec![vin, NetId::GROUND],
         );
         c.add_part("R1", PartKind::Resistor, v("1k", Unit::Ohm), vec![vin, mid]);
-        c.add_part("D1", PartKind::Diode, None, vec![mid, NetId::GROUND]);
+        c.add_part(
+            "D1",
+            PartKind::Diode(DiodeModel::default()),
+            None,
+            vec![mid, NetId::GROUND],
+        );
         // If plain NR already solves it, the aids are not exercised for this input.
         assert!(
             plain_nr_dc(&c).is_ok(),
@@ -3128,7 +3217,12 @@ mod tests {
                 v(&format!("{i}"), Unit::Ampere),
                 vec![NetId::GROUND, node],
             );
-            c.add_part("D1", PartKind::Diode, None, vec![node, NetId::GROUND]);
+            c.add_part(
+                "D1",
+                PartKind::Diode(DiodeModel::default()),
+                None,
+                vec![node, NetId::GROUND],
+            );
 
             let layout = Layout::build(&c);
             let x = solve_dc(&c, &layout).unwrap();
@@ -3149,6 +3243,70 @@ mod tests {
         }
     }
 
+    /// `CP-SIM-M5.2` gate: the emission coefficient `n` and the series resistance
+    /// `R_s` both reach the device and shift the I–V curve exactly as the model
+    /// predicts. Forcing a known current `I` through the diode, the terminal voltage
+    /// must be the junction drop `n·Vt·ln(I/Is + 1)` *plus* the ohmic `I·R_s` — and a
+    /// default diode (`n = 1`, `R_s = 0`) must still land on the plain Shockley drop.
+    #[test]
+    fn diode_model_n_and_rs_shift_the_iv_curve() {
+        let is = 1e-14;
+        let vt = 0.025_852;
+        // (n, Rs): an ideal default, a high-emission junction, a series-resistive
+        // one, and one with both effects.
+        for &(n, rs) in &[(1.0, 0.0), (2.0, 0.0), (1.0, 50.0), (1.8, 100.0)] {
+            for &i in &[1e-6, 1e-3, 1e-2_f64] {
+                let mut c = Circuit::new("diode_model");
+                let node = c.new_net();
+                c.add_part(
+                    "I1",
+                    PartKind::CurrentSource,
+                    v(&format!("{i}"), Unit::Ampere),
+                    vec![NetId::GROUND, node],
+                );
+                c.add_part(
+                    "D1",
+                    PartKind::Diode(DiodeModel { is, n, rs }),
+                    None,
+                    vec![node, NetId::GROUND],
+                );
+                let layout = Layout::build(&c);
+                let x = solve_dc(&c, &layout).unwrap();
+                let vd = x[layout.node_of(&c, node).unwrap()];
+
+                // Terminal voltage = junction drop (n·Vt·ln(I/Is+1)) + ohmic I·Rs.
+                let expected = n * vt * (i / is + 1.0).ln() + i * rs;
+                assert!(
+                    (vd - expected).abs() <= 1e-6 + 1e-6 * expected.abs(),
+                    "n={n}, Rs={rs}, I={i}: vd={vd} V, expected {expected} V"
+                );
+            }
+        }
+
+        // Explicit "default is unchanged": the default model reproduces the plain
+        // Shockley junction (no series drop) to the same tolerance diode_iv holds.
+        let mut c = Circuit::new("default_diode");
+        let node = c.new_net();
+        c.add_part(
+            "I1",
+            PartKind::CurrentSource,
+            v("1m", Unit::Ampere),
+            vec![NetId::GROUND, node],
+        );
+        c.add_part(
+            "D1",
+            PartKind::Diode(DiodeModel::default()),
+            None,
+            vec![node, NetId::GROUND],
+        );
+        let layout = Layout::build(&c);
+        let vd = solve_dc(&c, &layout).unwrap()[layout.node_of(&c, node).unwrap()];
+        assert!(
+            (vd - VTE * (1e-3 / IS + 1.0).ln()).abs() <= 1e-7,
+            "default diode drifted from the plain Shockley drop: {vd} V"
+        );
+    }
+
     #[test]
     fn diode_resistor_op_converges() {
         // 5 V ─ 1k ─ diode ─ gnd. The operating point must settle to a sane
@@ -3164,7 +3322,12 @@ mod tests {
             vec![vin, NetId::GROUND],
         );
         c.add_part("R1", PartKind::Resistor, v("1k", Unit::Ohm), vec![vin, mid]);
-        c.add_part("D1", PartKind::Diode, None, vec![mid, NetId::GROUND]);
+        c.add_part(
+            "D1",
+            PartKind::Diode(DiodeModel::default()),
+            None,
+            vec![mid, NetId::GROUND],
+        );
 
         let layout = Layout::build(&c);
         let x = solve_dc(&c, &layout).unwrap();
@@ -3199,7 +3362,12 @@ mod tests {
             v("1e300", Unit::Ampere),
             vec![NetId::GROUND, node],
         );
-        c.add_part("D1", PartKind::Diode, None, vec![node, NetId::GROUND]);
+        c.add_part(
+            "D1",
+            PartKind::Diode(DiodeModel::default()),
+            None,
+            vec![node, NetId::GROUND],
+        );
 
         let err = Engine::new()
             .run(&c, &Analysis::OperatingPoint)
@@ -4202,7 +4370,12 @@ mod tests {
             v("1m", Unit::Ampere),
             vec![NetId::GROUND, node],
         );
-        c.add_part("D1", PartKind::Diode, None, vec![node, NetId::GROUND]);
+        c.add_part(
+            "D1",
+            PartKind::Diode(DiodeModel::default()),
+            None,
+            vec![node, NetId::GROUND],
+        );
 
         let sigs = Engine::new()
             .run(
@@ -4947,7 +5120,12 @@ mod tests {
             v("1m", Unit::Ampere),
             vec![NetId::GROUND, node],
         );
-        c.add_part("D1", PartKind::Diode, None, vec![node, NetId::GROUND]);
+        c.add_part(
+            "D1",
+            PartKind::Diode(DiodeModel::default()),
+            None,
+            vec![node, NetId::GROUND],
+        );
         let sweep = Analysis::DcSweep {
             source: "I1".into(),
             start: 1e-3,
@@ -5383,6 +5561,131 @@ mod tests {
             assert_eq!(got, dense[idx], "node {net:?}: sparse engine != dense");
             assert!(got > 0.0 && got < last, "ladder not monotone at {net:?}");
             last = got;
+        }
+    }
+
+    // --- Ordered KLU hot-loop routing — CP-SIM-M5.1 ------------------------
+
+    /// A star / "hub" resistor net: one hub node tied by 1 kΩ to each of `leaves`
+    /// leaf nodes, every leaf also tied to ground by 1 kΩ, and a 10 V source driving
+    /// the hub. Numbering the hub first (it is the source node, net 1) is the fill
+    /// pathology min-degree ordering is built to defeat — natural order fills the
+    /// whole leaf block. Returns the circuit, the hub net, and the leaf nets.
+    fn hub(leaves: usize) -> (Circuit, NetId, Vec<NetId>) {
+        let mut c = Circuit::new("hub");
+        let h = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("10", Unit::Volt),
+            vec![h, NetId::GROUND],
+        );
+        let mut leaf_nets = Vec::with_capacity(leaves);
+        for i in 0..leaves {
+            let leaf = c.new_net();
+            c.add_part(
+                format!("Rh{i}"),
+                PartKind::Resistor,
+                v("1k", Unit::Ohm),
+                vec![h, leaf],
+            );
+            c.add_part(
+                format!("Rg{i}"),
+                PartKind::Resistor,
+                v("1k", Unit::Ohm),
+                vec![leaf, NetId::GROUND],
+            );
+            leaf_nets.push(leaf);
+        }
+        (c, h, leaf_nets)
+    }
+
+    /// Above [`mna::KLU_THRESHOLD`], `Engine::run` routes the solve through the
+    /// fill-reducing ordered LU. On a large hub net its operating point must match
+    /// the forced *dense* reference to ≤1e-12 (the ordered path is the same LU,
+    /// merely reordered, so it agrees to a few ULP rather than bit-for-bit), and be
+    /// physically right — the source pins the hub to 10 V and, by the symmetric
+    /// 1 kΩ/1 kΩ divider at every leaf, each leaf sits at exactly half the hub.
+    #[test]
+    fn large_hub_uses_ordered_klu_and_matches_dense() {
+        let leaves = 400; // system size 402 ≥ KLU_THRESHOLD (256) → ordered path
+        assert!(
+            leaves + 2 >= crate::mna::KLU_THRESHOLD,
+            "test must clear the KLU threshold"
+        );
+        let (c, hub_net, leaf_nets) = hub(leaves);
+
+        let sigs = Engine::new().run(&c, &Analysis::OperatingPoint).unwrap();
+        let dense = bench_support::dc_solve_dense(&c).expect("dense hub solves");
+        let layout = Layout::build(&c);
+
+        // Hub pinned to the source.
+        let hub_name = format!("v(n{})", c.resolve(hub_net).0);
+        let hub_v = sigs
+            .iter()
+            .find(|s| s.name == hub_name)
+            .unwrap()
+            .real()
+            .unwrap()[0];
+        assert!(
+            (hub_v - 10.0).abs() <= 1e-12,
+            "hub = {hub_v} V, expected 10 V"
+        );
+
+        // Every node agrees with the dense reference to ≤1e-12, and each leaf is the
+        // hub's symmetric half-divider (5 V).
+        let mut max_diff = 0.0_f64;
+        for s in &sigs {
+            // Parse the node index out of the "v(nX)" signal back to a dense index.
+            let raw: u32 = s.name["v(n".len()..s.name.len() - 1].parse().unwrap();
+            let idx = *layout.index.get(&raw).unwrap();
+            let got = s.real().unwrap()[0];
+            max_diff = max_diff.max((got - dense[idx]).abs());
+        }
+        assert!(
+            max_diff <= 1e-12,
+            "ordered engine vs dense max |Δ| = {max_diff} (> 1e-12)"
+        );
+        for &leaf in &leaf_nets {
+            let name = format!("v(n{})", c.resolve(leaf).0);
+            let got = sigs
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap()
+                .real()
+                .unwrap()[0];
+            assert!(
+                (got - 5.0).abs() <= 1e-9,
+                "leaf {leaf:?} = {got} V, expected 5 V"
+            );
+        }
+    }
+
+    /// A large-net *transient* also takes the ordered path, and reuses one symbolic
+    /// factorization across all its steps (the structure never changes). The result
+    /// must still match the forced-dense per-step reference to ≤1e-12. A purely
+    /// resistive hub has no reactive state, so every step is the same DC solve — its
+    /// hub stays at 10 V and leaves at 5 V for the whole run.
+    #[test]
+    fn large_transient_reuses_ordered_factorization() {
+        let leaves = 400; // ≥ KLU_THRESHOLD
+        let (c, hub_net, _leaves) = hub(leaves);
+        let sigs = Engine::new()
+            .run(
+                &c,
+                &Analysis::Transient {
+                    duration: 1e-3,
+                    step: Some(1e-4), // 10 steps, each reusing the factorization
+                },
+            )
+            .unwrap();
+        let hub_name = format!("v(n{})", c.resolve(hub_net).0);
+        let hub = sigs.iter().find(|s| s.name == hub_name).unwrap();
+        for &y in hub.real().unwrap() {
+            assert!(
+                (y - 10.0).abs() <= 1e-12,
+                "hub drifted to {y} V across steps"
+            );
         }
     }
 

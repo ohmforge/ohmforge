@@ -66,6 +66,39 @@ fn resistor_ladder(n: usize) -> Circuit {
     c
 }
 
+/// A star / "hub" resistor net: a 10 V source at the hub, then a 1 kΩ from the hub
+/// to each of `leaves` leaf nodes with a 1 kΩ shunt to ground. The hub is the
+/// source node (numbered first), so natural-order elimination fills its whole leaf
+/// block (`O(leaves²)`) while the fill-reducing order eliminates it last and stays
+/// near-linear — the `CP-SIM-M5.1` routing win measured through the engine's own
+/// assembled DC system.
+fn hub_net(leaves: usize) -> Circuit {
+    let mut c = Circuit::new("hub");
+    let h = c.new_net();
+    c.add_part(
+        "V1",
+        PartKind::VoltageSource,
+        val("10", Unit::Volt),
+        vec![h, NetId::GROUND],
+    );
+    for i in 0..leaves {
+        let leaf = c.new_net();
+        c.add_part(
+            format!("Rh{i}"),
+            PartKind::Resistor,
+            val("1k", Unit::Ohm),
+            vec![h, leaf],
+        );
+        c.add_part(
+            format!("Rg{i}"),
+            PartKind::Resistor,
+            val("1k", Unit::Ohm),
+            vec![leaf, NetId::GROUND],
+        );
+    }
+    c
+}
+
 /// 5 V step into a 1 kΩ / 1 µF low-pass (RC = 1 ms).
 fn rc_circuit() -> Circuit {
     let mut c = Circuit::new("rc");
@@ -281,6 +314,40 @@ fn bench_refactor_reuse(c: &mut Criterion) {
     group.finish();
 }
 
+/// The `CP-SIM-M5.1` routing gate: the engine's own assembled DC system for a large
+/// hub net, solved the old way (natural-order sparse) vs the way `Engine::run` now
+/// routes it above `KLU_THRESHOLD` (the fill-reducing ordered LU). Same matrix, same
+/// stamps — only the elimination order differs, so the ratio is the hot-loop win the
+/// threshold unlocks. Natural order's fill is quadratic, so it is capped modestly
+/// while the ordered path runs out to ~4000 leaves.
+fn bench_engine_klu_routing(c: &mut Criterion) {
+    let mut group = c.benchmark_group("engine_klu_routing");
+    for leaves in [500usize, 1000, 2000] {
+        let circuit = hub_net(leaves);
+        group.bench_with_input(
+            BenchmarkId::new("natural", leaves),
+            &circuit,
+            |b, circuit| b.iter(|| bench_support::dc_solve_sparse(black_box(circuit)).unwrap()),
+        );
+        group.bench_with_input(
+            BenchmarkId::new("ordered", leaves),
+            &circuit,
+            |b, circuit| b.iter(|| bench_support::dc_solve_ordered(black_box(circuit)).unwrap()),
+        );
+    }
+    // The ordered path alone out to where the natural-order fill is impractical —
+    // its own near-linear curve, end to end.
+    for leaves in [4000usize, 8000] {
+        let circuit = hub_net(leaves);
+        group.bench_with_input(
+            BenchmarkId::new("ordered", leaves),
+            &circuit,
+            |b, circuit| b.iter(|| bench_support::dc_solve_ordered(black_box(circuit)).unwrap()),
+        );
+    }
+    group.finish();
+}
+
 /// The `CP-SIM-M4.3` speedup gate: a many-run Monte-Carlo, sequential vs the
 /// public (threaded under `--features parallel`) path. Each run is a nonlinear
 /// Newton solve, so with the feature on `parallel` pulls markedly ahead of
@@ -308,6 +375,7 @@ criterion_group!(
     bench_sparse_scaling,
     bench_ordered_vs_natural,
     bench_refactor_reuse,
+    bench_engine_klu_routing,
     bench_monte_carlo
 );
 criterion_main!(benches);
