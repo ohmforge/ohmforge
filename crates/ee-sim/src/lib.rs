@@ -23,7 +23,8 @@ use std::f64::consts::TAU;
 use std::fmt;
 
 use ee_core::graph::{
-    BjtModel, Circuit, MosfetModel, NetId, Part, PartKind, Polarity, Waveform, NOMINAL_TEMP_C,
+    BjtModel, Circuit, DiodeModel, MosfetModel, NetId, Part, PartKind, Polarity, Waveform,
+    NOMINAL_TEMP_C,
 };
 use ee_core::value::Value;
 use ee_core::{Complex, Domain, Signal, SignalData, Unit};
@@ -250,7 +251,7 @@ fn validate(circuit: &Circuit, registry: &DeviceRegistry) -> Result<(), SimError
             | PartKind::Inductor
             | PartKind::VoltageSource
             | PartKind::CurrentSource
-            | PartKind::Diode
+            | PartKind::Diode(..)
             | PartKind::Bjt(..)
             | PartKind::Mosfet(..)
             | PartKind::Vcvs(..)
@@ -876,30 +877,21 @@ fn pnjlim(v_new: f64, v_old: f64, vte: f64, is: f64) -> f64 {
     }
 }
 
-/// Shockley-diode model parameters. Defaults are a generic small-signal silicon
-/// diode at 300 K.
-#[derive(Debug, Clone, Copy)]
-struct DiodeModel {
-    /// Saturation current `I_s` (A).
-    is: f64,
-    /// Emission coefficient `n` (dimensionless).
-    n: f64,
-    /// Thermal voltage `V_t = kT/q` (V).
-    vt: f64,
-}
+/// The junction thermal voltage `V_t = kT/q` (V) at the nominal temperature — the
+/// fixed solver constant a diode's emission coefficient scales to `n·V_t`. (It is a
+/// constant rather than a [`DiodeModel`] field because the model exposes only the
+/// SPICE `.model` knobs `I_s`/`n`/`R_s`.)
+const DIODE_VT: f64 = 0.025_852;
 
-impl Default for DiodeModel {
-    fn default() -> Self {
-        Self {
-            is: 1e-14,
-            n: 1.0,
-            vt: 0.025_852,
-        }
-    }
-}
+/// Local-Newton iteration cap for resolving a diode's internal junction voltage
+/// when it carries a series resistance `R_s > 0` (`CP-SIM-M5.2`). A handful of
+/// steps converges the scalar `V = V_j + R_s·I(V_j)` from a warm start; the cap is
+/// only a guard against a pathological start.
+const DIODE_RS_ITERS: usize = 50;
 
 /// A junction diode. Terminals `[anode, cathode]`; the branch voltage is
-/// `v(anode) − v(cathode)` and forward current flows anode → cathode.
+/// `v(anode) − v(cathode)` and forward current flows anode → cathode. Carries its
+/// [`DiodeModel`] (`I_s`, `n`, `R_s`); the thermal voltage is [`DIODE_VT`].
 struct Diode {
     nets: [NetId; 2],
     model: DiodeModel,
@@ -911,23 +903,61 @@ impl NonlinearDevice for Diode {
     }
 
     fn state_len(&self) -> usize {
-        1 // the single junction voltage
+        1 // the single (junction) voltage carried for limiting / warm-starting
     }
 
     fn linearize(&self, v: &[f64], state: &mut [f64], limit: bool) -> Companion {
-        // Shockley: I = Is·(exp(V/(n·Vt)) − 1), g = dI/dV = (Is/(n·Vt))·exp(V/(n·Vt)).
-        let vte = self.model.n * self.model.vt;
-        let mut vd = v[0] - v[1];
-        if limit {
-            vd = pnjlim(vd, state[0], vte, self.model.is);
-            state[0] = vd;
-        }
-        let ex = (vd / vte).exp();
-        let i = self.model.is * (ex - 1.0);
-        let g = (self.model.is / vte) * ex;
-        // Norton equivalent current into the anode, `g·v − I`; the cathode mirrors
-        // it. This reproduces the two-terminal stamp bit-for-bit.
-        let i_eq = g * vd - i;
+        let is = self.model.is;
+        let vte = self.model.n * DIODE_VT; // emission-scaled thermal voltage, n·Vt
+        let v_term = v[0] - v[1];
+
+        let (i, g, i_eq) = if self.model.rs == 0.0 {
+            // Ideal junction — the exact pre-model path, bit-for-bit. Shockley:
+            // I = Is·(exp(V/(n·Vt)) − 1), g = dI/dV = (Is/(n·Vt))·exp(V/(n·Vt)).
+            let mut vd = v_term;
+            if limit {
+                vd = pnjlim(vd, state[0], vte, is);
+                state[0] = vd;
+            }
+            let ex = (vd / vte).exp();
+            let i = is * (ex - 1.0);
+            let g = (is / vte) * ex;
+            (i, g, g * vd - i)
+        } else {
+            // Series resistance: the terminal voltage splits across the ohmic R_s
+            // and the junction, `V = V_j + R_s·I(V_j)`. Resolve the internal V_j for
+            // the present terminal voltage by a damped local Newton (warm-started
+            // from the stored V_j), then present the composite's small-signal
+            // conductance g_eff = g_j/(1 + R_s·g_j) — the series combination of the
+            // junction conductance with R_s — as a single two-terminal companion, so
+            // no internal MNA node is needed.
+            let rs = self.model.rs;
+            let mut vj = state[0]; // previous junction voltage (0 on a cold start)
+            for _ in 0..DIODE_RS_ITERS {
+                let ex = (vj / vte).exp();
+                let ij = is * (ex - 1.0);
+                let gj = (is / vte) * ex;
+                // f(Vj) = Vj + Rs·I(Vj) − V_term, f'(Vj) = 1 + Rs·gj.
+                let f = vj + rs * ij - v_term;
+                let step = f / (1.0 + rs * gj);
+                let vj_next = pnjlim(vj - step, vj, vte, is); // damp the junction step
+                let done = (vj_next - vj).abs() < 1e-14 * (1.0 + vj_next.abs());
+                vj = vj_next;
+                if done {
+                    break;
+                }
+            }
+            if limit {
+                state[0] = vj;
+            }
+            let ex = (vj / vte).exp();
+            let i = is * (ex - 1.0);
+            let gj = (is / vte) * ex;
+            let g = gj / (1.0 + rs * gj); // composite (junction + Rs) conductance
+                                          // Norton source referenced to the terminal voltage: i_eq = g·V_term − I.
+            (i, g, g * v_term - i)
+        };
+        // Norton equivalent current into the anode; the cathode mirrors it.
         Companion {
             i: vec![i, -i],
             i_eq: vec![i_eq, -i_eq],
@@ -1090,18 +1120,6 @@ fn mos_chan(vgs: f64, vds: f64, m: &MosfetModel) -> (f64, f64, f64) {
     }
 }
 
-/// Build the diode model for a part: defaults, with `I_s` overridden by the
-/// part's value (amperes) when a sensible positive magnitude is present.
-fn diode_model(part: &Part) -> DiodeModel {
-    let mut m = DiodeModel::default();
-    if let Some(v) = &part.value {
-        if v.magnitude > 0.0 && v.magnitude.is_finite() {
-            m.is = v.magnitude;
-        }
-    }
-    m
-}
-
 /// Collect every nonlinear device in the circuit as a boxed [`NonlinearDevice`].
 /// This is the one place a new device kind is wired into the solver: the built-in
 /// diode / BJT / MOSFET, plus any [`PartKind::Other`] part whose name has a plugin
@@ -1115,11 +1133,11 @@ fn collect_nonlinear(
     let mut devices: Vec<Box<dyn NonlinearDevice>> = Vec::new();
     for part in circuit.parts() {
         match &part.kind {
-            PartKind::Diode => {
+            PartKind::Diode(model) => {
                 let (a, b) = terminals2(part)?;
                 devices.push(Box::new(Diode {
                     nets: [a, b],
-                    model: diode_model(part),
+                    model: *model,
                 }));
             }
             PartKind::Bjt(polarity, model) => {
@@ -2709,7 +2727,12 @@ pub mod bench_support {
             Value::parse("1k", Unit::Ohm).ok(),
             vec![vin, mid],
         );
-        c.add_part("D1", PartKind::Diode, None, vec![mid, NetId::GROUND]);
+        c.add_part(
+            "D1",
+            PartKind::Diode(DiodeModel::default()),
+            None,
+            vec![mid, NetId::GROUND],
+        );
         c.set_tolerance("R1", 0.05);
         (c, mid)
     }
@@ -2853,7 +2876,12 @@ mod tests {
             vec![vin, NetId::GROUND],
         );
         c.add_part("R1", PartKind::Resistor, v("1k", Unit::Ohm), vec![vin, mid]);
-        c.add_part("D1", PartKind::Diode, None, vec![mid, NetId::GROUND]);
+        c.add_part(
+            "D1",
+            PartKind::Diode(DiodeModel::default()),
+            None,
+            vec![mid, NetId::GROUND],
+        );
 
         let layout = Layout::build(&c);
         let size = layout.n_nodes() + layout.vsources.len() + layout.inductors.len();
@@ -2900,7 +2928,12 @@ mod tests {
             vec![vin, NetId::GROUND],
         );
         c.add_part("R1", PartKind::Resistor, v("1k", Unit::Ohm), vec![vin, mid]);
-        c.add_part("D1", PartKind::Diode, None, vec![mid, NetId::GROUND]);
+        c.add_part(
+            "D1",
+            PartKind::Diode(DiodeModel::default()),
+            None,
+            vec![mid, NetId::GROUND],
+        );
         // If plain NR already solves it, the aids are not exercised for this input.
         assert!(
             plain_nr_dc(&c).is_ok(),
@@ -3184,7 +3217,12 @@ mod tests {
                 v(&format!("{i}"), Unit::Ampere),
                 vec![NetId::GROUND, node],
             );
-            c.add_part("D1", PartKind::Diode, None, vec![node, NetId::GROUND]);
+            c.add_part(
+                "D1",
+                PartKind::Diode(DiodeModel::default()),
+                None,
+                vec![node, NetId::GROUND],
+            );
 
             let layout = Layout::build(&c);
             let x = solve_dc(&c, &layout).unwrap();
@@ -3205,6 +3243,70 @@ mod tests {
         }
     }
 
+    /// `CP-SIM-M5.2` gate: the emission coefficient `n` and the series resistance
+    /// `R_s` both reach the device and shift the I–V curve exactly as the model
+    /// predicts. Forcing a known current `I` through the diode, the terminal voltage
+    /// must be the junction drop `n·Vt·ln(I/Is + 1)` *plus* the ohmic `I·R_s` — and a
+    /// default diode (`n = 1`, `R_s = 0`) must still land on the plain Shockley drop.
+    #[test]
+    fn diode_model_n_and_rs_shift_the_iv_curve() {
+        let is = 1e-14;
+        let vt = 0.025_852;
+        // (n, Rs): an ideal default, a high-emission junction, a series-resistive
+        // one, and one with both effects.
+        for &(n, rs) in &[(1.0, 0.0), (2.0, 0.0), (1.0, 50.0), (1.8, 100.0)] {
+            for &i in &[1e-6, 1e-3, 1e-2_f64] {
+                let mut c = Circuit::new("diode_model");
+                let node = c.new_net();
+                c.add_part(
+                    "I1",
+                    PartKind::CurrentSource,
+                    v(&format!("{i}"), Unit::Ampere),
+                    vec![NetId::GROUND, node],
+                );
+                c.add_part(
+                    "D1",
+                    PartKind::Diode(DiodeModel { is, n, rs }),
+                    None,
+                    vec![node, NetId::GROUND],
+                );
+                let layout = Layout::build(&c);
+                let x = solve_dc(&c, &layout).unwrap();
+                let vd = x[layout.node_of(&c, node).unwrap()];
+
+                // Terminal voltage = junction drop (n·Vt·ln(I/Is+1)) + ohmic I·Rs.
+                let expected = n * vt * (i / is + 1.0).ln() + i * rs;
+                assert!(
+                    (vd - expected).abs() <= 1e-6 + 1e-6 * expected.abs(),
+                    "n={n}, Rs={rs}, I={i}: vd={vd} V, expected {expected} V"
+                );
+            }
+        }
+
+        // Explicit "default is unchanged": the default model reproduces the plain
+        // Shockley junction (no series drop) to the same tolerance diode_iv holds.
+        let mut c = Circuit::new("default_diode");
+        let node = c.new_net();
+        c.add_part(
+            "I1",
+            PartKind::CurrentSource,
+            v("1m", Unit::Ampere),
+            vec![NetId::GROUND, node],
+        );
+        c.add_part(
+            "D1",
+            PartKind::Diode(DiodeModel::default()),
+            None,
+            vec![node, NetId::GROUND],
+        );
+        let layout = Layout::build(&c);
+        let vd = solve_dc(&c, &layout).unwrap()[layout.node_of(&c, node).unwrap()];
+        assert!(
+            (vd - VTE * (1e-3 / IS + 1.0).ln()).abs() <= 1e-7,
+            "default diode drifted from the plain Shockley drop: {vd} V"
+        );
+    }
+
     #[test]
     fn diode_resistor_op_converges() {
         // 5 V ─ 1k ─ diode ─ gnd. The operating point must settle to a sane
@@ -3220,7 +3322,12 @@ mod tests {
             vec![vin, NetId::GROUND],
         );
         c.add_part("R1", PartKind::Resistor, v("1k", Unit::Ohm), vec![vin, mid]);
-        c.add_part("D1", PartKind::Diode, None, vec![mid, NetId::GROUND]);
+        c.add_part(
+            "D1",
+            PartKind::Diode(DiodeModel::default()),
+            None,
+            vec![mid, NetId::GROUND],
+        );
 
         let layout = Layout::build(&c);
         let x = solve_dc(&c, &layout).unwrap();
@@ -3255,7 +3362,12 @@ mod tests {
             v("1e300", Unit::Ampere),
             vec![NetId::GROUND, node],
         );
-        c.add_part("D1", PartKind::Diode, None, vec![node, NetId::GROUND]);
+        c.add_part(
+            "D1",
+            PartKind::Diode(DiodeModel::default()),
+            None,
+            vec![node, NetId::GROUND],
+        );
 
         let err = Engine::new()
             .run(&c, &Analysis::OperatingPoint)
@@ -4258,7 +4370,12 @@ mod tests {
             v("1m", Unit::Ampere),
             vec![NetId::GROUND, node],
         );
-        c.add_part("D1", PartKind::Diode, None, vec![node, NetId::GROUND]);
+        c.add_part(
+            "D1",
+            PartKind::Diode(DiodeModel::default()),
+            None,
+            vec![node, NetId::GROUND],
+        );
 
         let sigs = Engine::new()
             .run(
@@ -5003,7 +5120,12 @@ mod tests {
             v("1m", Unit::Ampere),
             vec![NetId::GROUND, node],
         );
-        c.add_part("D1", PartKind::Diode, None, vec![node, NetId::GROUND]);
+        c.add_part(
+            "D1",
+            PartKind::Diode(DiodeModel::default()),
+            None,
+            vec![node, NetId::GROUND],
+        );
         let sweep = Analysis::DcSweep {
             source: "I1".into(),
             start: 1e-3,

@@ -37,11 +37,12 @@ pub enum PartKind {
     /// Independent current source (value in amperes).
     CurrentSource,
     /// Semiconductor junction diode (Shockley model). Terminals are
-    /// `[anode, cathode]`; forward current flows anode → cathode. Model
-    /// parameters default to a small-signal silicon diode (saturation current
-    /// `I_s ≈ 1e-14 A`, emission `n = 1`, thermal voltage `V_t ≈ 0.0259 V`); an
-    /// optional [`Value`] in amperes overrides `I_s`. (`CP-SIM-M1.1`.)
-    Diode,
+    /// `[anode, cathode]`; forward current flows anode → cathode. Carries its own
+    /// [`DiodeModel`] parameters — saturation current `I_s`, emission coefficient
+    /// `n`, and series resistance `R_s` — so a SPICE `.model` `N`/`RS` reaches the
+    /// device. Defaults are a small-signal silicon diode (`I_s = 1e-14 A`, `n = 1`,
+    /// `R_s = 0 Ω`). (`CP-SIM-M1.1`, model params `CP-SIM-M5.2`.)
+    Diode(DiodeModel),
     /// Bipolar junction transistor, Ebers–Moll injection model. Terminals are
     /// `[collector, base, emitter]`; the [`Polarity`] selects NPN (`N`) or
     /// PNP (`P`). Carries its own [`BjtModel`] parameters. (`CP-SIM-M1.2`.)
@@ -141,6 +142,33 @@ impl Default for MosfetModel {
             vth: 1.0,
             kp: 1e-3,
             lambda: 0.0,
+        }
+    }
+}
+
+/// Shockley parameters for a [`PartKind::Diode`] (`CP-SIM-M5.2`), mirroring
+/// [`BjtModel`] / [`MosfetModel`]. Defaults are a generic small-signal silicon
+/// diode: `I_s = 1e-14 A`, emission `n = 1`, and no series resistance — exactly the
+/// values the diode device assumed before the model existed, so a default diode
+/// solves bit-for-bit as before. (The thermal voltage `V_t` is a fixed solver
+/// constant at the nominal temperature, not a per-part knob, so it is not a field.)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DiodeModel {
+    /// Saturation current `I_s` (A).
+    pub is: f64,
+    /// Emission coefficient `n` (dimensionless); scales the thermal voltage to
+    /// `n·V_t` in the junction law.
+    pub n: f64,
+    /// Ohmic series resistance `R_s` (Ω) in series with the junction; `0` is ideal.
+    pub rs: f64,
+}
+
+impl Default for DiodeModel {
+    fn default() -> Self {
+        Self {
+            is: 1e-14,
+            n: 1.0,
+            rs: 0.0,
         }
     }
 }
