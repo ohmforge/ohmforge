@@ -41,7 +41,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 
-use ee_core::graph::{Circuit, NetId, PartKind};
+use ee_core::graph::{Circuit, NetId, PartKind, Waveform};
 use ee_core::units::Unit;
 use ee_core::value::{ParseError, Value};
 use ee_sim::{Analysis, Engine, SimError};
@@ -111,6 +111,7 @@ impl Shell {
         "add",
         "wire",
         "probe",
+        "remove",
         "run",
         "show",
         "undo",
@@ -151,11 +152,12 @@ impl Shell {
         match command {
             // Mutating commands snapshot the session first (on success only) so
             // `undo` can revert exactly the last command.
-            "add" | "wire" | "probe" => {
+            "add" | "wire" | "probe" | "remove" => {
                 let before = self.capture();
                 let result = match command {
                     "add" => self.cmd_add(&args),
                     "wire" => self.cmd_wire(&args),
+                    "remove" => self.cmd_remove(&args),
                     _ => self.cmd_probe(&args),
                 };
                 if result.is_ok() {
@@ -415,6 +417,91 @@ impl Shell {
         Ok(msg)
     }
 
+    /// `remove <ref>` — delete a placed part by reference designator.
+    fn cmd_remove(&mut self, args: &[&str]) -> Result<String, ShellError> {
+        let [reference] = args else {
+            return Err(ShellError::Usage {
+                command: "remove",
+                usage: "remove <ref>",
+            });
+        };
+        self.remove(reference)
+    }
+
+    /// Delete a part from the circuit by reference designator, leaving the node
+    /// names and probes in place. Unknown references yield
+    /// [`ShellError::UnknownPart`].
+    ///
+    /// `ee_core::Circuit` has no in-place part removal, so this rebuilds an
+    /// equivalent circuit without the target part — the same nets (ids and
+    /// union-find topology preserved via [`resolve`](Circuit::resolve)), the same
+    /// remaining parts with their values, waveforms, tolerances, and tempcos, and
+    /// the same operating temperature. A native `Circuit::remove_part` in `ee-core`
+    /// would be cleaner; see the cross-crate note in the M5 report.
+    pub fn remove(&mut self, reference: &str) -> Result<String, ShellError> {
+        if self.circuit.part_by_ref(reference).is_none() {
+            return Err(ShellError::UnknownPart(reference.to_string()));
+        }
+        self.circuit = self.rebuild_circuit_without(reference);
+        let n = self.circuit.parts().len();
+        Ok(format!(
+            "removed {reference} — {n} part{} remain",
+            if n == 1 { "" } else { "s" }
+        ))
+    }
+
+    /// Build a fresh circuit identical to the current one minus `reference`.
+    fn rebuild_circuit_without(&self, reference: &str) -> Circuit {
+        let old = &self.circuit;
+        // The highest net id referenced anywhere — terminals or the name map — so
+        // the rebuilt circuit allocates net ids 1:1 with the original (both are
+        // dense from 0, so equal counts give equal ids).
+        let mut max_id = 0u32;
+        for p in old.parts() {
+            for t in &p.terminals {
+                max_id = max_id.max(t.0);
+            }
+        }
+        for id in self.nets.values() {
+            max_id = max_id.max(id.0);
+        }
+
+        let mut c = Circuit::new(old.name.clone());
+        for _ in 1..=max_id {
+            c.new_net();
+        }
+        // Reproduce the union-find groups: wire each net to its old representative.
+        for id in 1..=max_id {
+            let root = old.resolve(NetId(id));
+            if root.0 != id {
+                c.wire(NetId(id), root);
+            }
+        }
+        // Re-add every part except the removed one, carrying all its metadata.
+        for p in old.parts() {
+            if p.reference == reference {
+                continue;
+            }
+            c.add_part(
+                p.reference.clone(),
+                p.kind.clone(),
+                p.value,
+                p.terminals.clone(),
+            );
+            if p.waveform != Waveform::Dc {
+                c.set_waveform(&p.reference, p.waveform.clone());
+            }
+            if let Some(tol) = old.tolerance(&p.reference) {
+                c.set_tolerance(&p.reference, tol);
+            }
+            if let Some(tc) = old.tempco(&p.reference) {
+                c.set_tempco(&p.reference, tc);
+            }
+        }
+        c.set_temperature(old.temperature());
+        c
+    }
+
     /// `run [tran [<dur>]]` / `run op` — simulate and render.
     fn cmd_run(&self, args: &[&str]) -> Result<String, ShellError> {
         match args {
@@ -529,6 +616,7 @@ impl Shell {
             "  add <ref> <a> <b> <value>   place a part (R/C/L/V from the ref's first letter)",
             "  wire <a> <b>                merge two named nodes into one net",
             "  probe <node>                mark a node to plot on the next run",
+            "  remove <ref>                delete a placed part",
             "  run [tran [<dur>]]          transient (default 1 ms), plotting each probe",
             "  run op                      DC operating-point node-voltage table",
             "  show                        list the placed parts",
@@ -666,6 +754,8 @@ pub enum ShellError {
     DuplicateRef(String),
     /// A node named in `probe`/`wire` was never introduced by `add`.
     UnknownNode(String),
+    /// `remove` named a part reference that is not in the circuit.
+    UnknownPart(String),
     /// `undo` was called with an empty undo stack — a friendly no-op.
     NothingToUndo,
     /// `restore` named a checkpoint that was never saved.
@@ -709,6 +799,9 @@ impl fmt::Display for ShellError {
             ShellError::DuplicateRef(r) => write!(f, "a part named {r:?} already exists"),
             ShellError::UnknownNode(n) => {
                 write!(f, "unknown node {n:?} — add a part that uses it first")
+            }
+            ShellError::UnknownPart(r) => {
+                write!(f, "no part named {r:?} — nothing to remove")
             }
             ShellError::NothingToUndo => {
                 write!(f, "nothing to undo — no commands have been run yet")
@@ -842,6 +935,201 @@ mod tests {
             sh.execute("wire a ghost").unwrap_err(),
             ShellError::UnknownNode(_)
         ));
+    }
+
+    /// `remove` deletes a part by reference, preserving the rest of the circuit
+    /// (topology and values), and is undoable like any other mutating command.
+    #[test]
+    fn remove_drops_a_part_preserving_topology_and_is_undoable() {
+        let mut sh = Shell::new();
+        sh.execute("add V1 in gnd 10").unwrap();
+        sh.execute("add R1 in out 1k").unwrap();
+        sh.execute("add R2 out gnd 1k").unwrap();
+        assert_eq!(sh.circuit().parts().len(), 3);
+
+        let msg = sh.execute("remove R1").unwrap();
+        assert!(msg.contains("removed R1"), "{msg}");
+        assert!(sh.circuit().part_by_ref("R1").is_none(), "R1 gone");
+        assert!(sh.circuit().part_by_ref("V1").is_some(), "V1 kept");
+        assert!(sh.circuit().part_by_ref("R2").is_some(), "R2 kept");
+
+        // The surviving parts keep their values and node topology: the op-point
+        // still resolves (V1 drives `in`, R2 bridges `out`→gnd).
+        let table = sh.execute("run op").unwrap();
+        assert!(
+            table.contains("v(in)") && table.contains("10.000000 V"),
+            "{table}"
+        );
+
+        // Undo brings R1 back exactly.
+        sh.execute("undo").unwrap();
+        assert_eq!(sh.circuit().parts().len(), 3, "undo restores R1");
+        assert!(sh.circuit().part_by_ref("R1").is_some());
+    }
+
+    /// Removing a part that was wired keeps the merged net intact for the rest.
+    #[test]
+    fn remove_preserves_wired_nets() {
+        let mut sh = Shell::new();
+        sh.execute("add R1 a b 1k").unwrap();
+        sh.execute("add R2 b c 2k").unwrap();
+        sh.execute("wire a c").unwrap();
+        let before = sh.circuit().resolve(*sh.nets.get("a").unwrap());
+        assert_eq!(before, sh.circuit().resolve(*sh.nets.get("c").unwrap()));
+
+        sh.execute("remove R1").unwrap();
+        // `a` and `c` are still the same net after R1 is gone.
+        assert_eq!(
+            sh.circuit().resolve(*sh.nets.get("a").unwrap()),
+            sh.circuit().resolve(*sh.nets.get("c").unwrap()),
+            "the wire survives the removal"
+        );
+    }
+
+    /// `remove` of an unknown reference, and with the wrong arity, fail friendly.
+    #[test]
+    fn remove_unknown_and_bad_arity_fail_friendly() {
+        let mut sh = Shell::new();
+        sh.execute("add R1 a b 1k").unwrap();
+        let err = sh.execute("remove R9").unwrap_err();
+        assert!(matches!(err, ShellError::UnknownPart(_)), "{err}");
+        assert!(err.to_string().contains("R9"), "{err}");
+        assert!(matches!(
+            sh.execute("remove").unwrap_err(),
+            ShellError::Usage {
+                command: "remove",
+                ..
+            }
+        ));
+    }
+
+    // ── interactive editing in the live TUI app (CP-UX-M5.1) ───────────────
+
+    /// The TUI app's edit actions drive the real `Shell` circuit: placing adds a
+    /// part, wiring merges nets (verified via `resolve`), removing drops a part —
+    /// all asserted on the app's own `Circuit`, no tty.
+    #[test]
+    fn app_edit_actions_drive_the_shell_circuit() {
+        use ee_tui::{App, EditAction};
+
+        let mut app = App::new(Shell::new());
+        app.apply_edit(EditAction::Place {
+            reference: "V1".into(),
+            node_a: "in".into(),
+            node_b: "gnd".into(),
+            value: "5".into(),
+        });
+        app.apply_edit(EditAction::Place {
+            reference: "R1".into(),
+            node_a: "in".into(),
+            node_b: "out".into(),
+            value: "1k".into(),
+        });
+        assert_eq!(app.backend().circuit().parts().len(), 2, "two parts placed");
+        assert!(app.backend().circuit().part_by_ref("R1").is_some());
+
+        // Wiring `out` to `in` must merge the two nets (same resolved id).
+        app.apply_edit(EditAction::Wire {
+            node_a: "out".into(),
+            node_b: "in".into(),
+        });
+        let r1 = app.backend().circuit().part_by_ref("R1").unwrap();
+        let (ta, tb) = (r1.terminals[0], r1.terminals[1]);
+        assert_eq!(
+            app.backend().circuit().resolve(ta),
+            app.backend().circuit().resolve(tb),
+            "wire merged R1's two nets into one"
+        );
+
+        // Removing R1 drops it from the app's circuit.
+        app.apply_edit(EditAction::Remove {
+            reference: "R1".into(),
+        });
+        assert!(
+            app.backend().circuit().part_by_ref("R1").is_none(),
+            "R1 removed"
+        );
+        assert!(
+            app.backend().circuit().part_by_ref("V1").is_some(),
+            "V1 remains"
+        );
+    }
+
+    /// The interactive keystroke path (no tty): enter edit mode, place two parts
+    /// through the add prompt, then select and delete one — asserted on the app's
+    /// circuit. The schematic pane reflects each change, and a malformed add is a
+    /// clean logged error, not a panic.
+    #[test]
+    fn app_edit_keystrokes_place_select_and_remove() {
+        use ee_tui::{App, AppEvent, KeyCode, KeyEvent, PanelId};
+
+        let mut app = App::new(Shell::new());
+        let key = |app: &mut App<Shell>, code| app.handle_event(AppEvent::Key(KeyEvent::new(code)));
+        let typ = |app: &mut App<Shell>, s: &str| {
+            for c in s.chars() {
+                app.handle_event(AppEvent::Key(KeyEvent::char(c)));
+            }
+        };
+
+        // Focus the schematic (Tab from the shell) and enter edit mode with 'e'.
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.focus(), PanelId::Schematic);
+        key(&mut app, KeyCode::Char('e'));
+        assert!(app.edit_mode(), "'e' enters edit mode on the schematic");
+
+        // 'a' opens the add prompt; type the fields; Enter commits.
+        key(&mut app, KeyCode::Char('a'));
+        typ(&mut app, "R1 a b 1k");
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Char('a'));
+        typ(&mut app, "R2 b c 2k");
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.backend().circuit().parts().len(),
+            2,
+            "both parts placed"
+        );
+
+        // The schematic pane reflects the edited circuit.
+        let frame = app.render(80, 24);
+        assert!(
+            frame.contains("R1") && frame.contains("R2"),
+            "schematic lists parts:\n{frame}"
+        );
+        assert!(frame.contains("[edit]"), "edit-mode title:\n{frame}");
+
+        // Select the first part and delete it with 'd'.
+        key(&mut app, KeyCode::Up);
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.selected_part().as_deref(), Some("R1"), "cursor on R1");
+        key(&mut app, KeyCode::Char('d'));
+        assert!(
+            app.backend().circuit().part_by_ref("R1").is_none(),
+            "R1 deleted"
+        );
+        assert!(
+            app.backend().circuit().part_by_ref("R2").is_some(),
+            "R2 kept"
+        );
+
+        // A malformed add (too few fields) is a clean logged error, no panic.
+        key(&mut app, KeyCode::Char('a'));
+        typ(&mut app, "oops");
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.backend().circuit().parts().len(),
+            1,
+            "bad add placed nothing"
+        );
+        let frame = app.render(80, 24);
+        assert!(
+            frame.contains("error"),
+            "malformed add surfaces an error:\n{frame}"
+        );
+
+        // Esc leaves edit mode cleanly.
+        key(&mut app, KeyCode::Esc);
+        assert!(!app.edit_mode(), "Esc exits edit mode");
     }
 
     /// A blank line is a no-op; `help` lists every command.

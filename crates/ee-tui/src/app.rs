@@ -194,6 +194,70 @@ pub enum AppEvent {
     Resize(usize, usize),
 }
 
+/// A single interactive circuit edit.
+///
+/// This is the whole edit surface of the app: every interactive edit (a key
+/// chord, a committed prompt, a palette entry) is reduced to one of these, and
+/// [`App::apply_edit`] turns it into the equivalent shell command line fed to the
+/// [`Backend`]. So the shell's `add`/`wire`/`remove` grammar is the *single*
+/// mutation path — the live editor and the typed shell line share it, and the
+/// circuit the schematic/overlay draws is the one the sim runs against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditAction {
+    /// Place a part: `add <reference> <node_a> <node_b> <value>`.
+    Place {
+        reference: String,
+        node_a: String,
+        node_b: String,
+        value: String,
+    },
+    /// Merge two named nodes into one net: `wire <node_a> <node_b>`.
+    Wire { node_a: String, node_b: String },
+    /// Delete a placed part by reference: `remove <reference>`.
+    Remove { reference: String },
+}
+
+impl EditAction {
+    /// The shell command line this edit is equivalent to.
+    fn to_command(&self) -> String {
+        match self {
+            EditAction::Place {
+                reference,
+                node_a,
+                node_b,
+                value,
+            } => format!("add {reference} {node_a} {node_b} {value}"),
+            EditAction::Wire { node_a, node_b } => format!("wire {node_a} {node_b}"),
+            EditAction::Remove { reference } => format!("remove {reference}"),
+        }
+    }
+}
+
+/// What the edit-mode mini-prompt is currently collecting, if anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum EditPrompt {
+    /// No prompt: arrow keys move the selection; `a`/`w`/`d` start an edit.
+    #[default]
+    None,
+    /// Collecting `<ref> <a> <b> <value>` for a part placement.
+    Place,
+    /// Collecting `<a> <b>` for a wire.
+    Wire,
+}
+
+/// The interactive edit-mode sub-state.
+#[derive(Debug, Default)]
+struct Edit {
+    /// Whether edit mode is active (keystrokes edit the circuit, not the shell).
+    active: bool,
+    /// Selection cursor as an index into the circuit's part list.
+    selected: usize,
+    /// Which argument prompt is open, if any.
+    prompt: EditPrompt,
+    /// The text typed into the current prompt (whitespace-separated fields).
+    buffer: String,
+}
+
 /// A command-palette action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
@@ -201,6 +265,7 @@ enum Action {
     GrowFocus,
     ShrinkFocus,
     ToggleOverlay,
+    ToggleEdit,
     ClearLog,
     Quit,
 }
@@ -236,6 +301,10 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "toggle overlay",
         action: Action::ToggleOverlay,
+    },
+    Command {
+        name: "edit mode",
+        action: Action::ToggleEdit,
     },
     Command {
         name: "clear log",
@@ -274,6 +343,8 @@ pub struct App<B: Backend> {
     input: String,
     /// Whether the left pane shows the op-point overlay rather than the list.
     overlay: bool,
+    /// Interactive schematic-editing sub-state (`CP-UX-M5.1`).
+    edit: Edit,
     /// Last known terminal size, for mouse hit-testing between renders.
     size: (usize, usize),
     should_quit: bool,
@@ -291,6 +362,7 @@ impl<B: Backend> App<B> {
             scope: String::new(),
             input: String::new(),
             overlay: false,
+            edit: Edit::default(),
             size: (100, 30),
             should_quit: false,
         }
@@ -347,9 +419,16 @@ impl<B: Backend> App<B> {
                 _ => {}
             }
         }
+        // Edit mode takes over the keyboard until Esc leaves it.
+        if self.edit.active {
+            self.on_edit_key(key);
+            return;
+        }
         match key.code {
             KeyCode::Tab => self.focus_next(),
             KeyCode::BackTab => self.focus_prev(),
+            // `e` on the schematic pane enters interactive edit mode.
+            KeyCode::Char('e') if self.focus == PanelId::Schematic => self.enter_edit_mode(),
             _ if self.focus == PanelId::Shell => self.on_shell_key(key),
             _ => {}
         }
@@ -497,6 +576,7 @@ impl<B: Backend> App<B> {
             Action::GrowFocus => self.grow_focused(),
             Action::ShrinkFocus => self.shrink_focused(),
             Action::ToggleOverlay => self.overlay = !self.overlay,
+            Action::ToggleEdit => self.toggle_edit_mode(),
             Action::ClearLog => self.log.clear(),
             Action::Quit => self.should_quit = true,
         }
@@ -511,8 +591,16 @@ impl<B: Backend> App<B> {
         if line.is_empty() {
             return;
         }
+        self.run_line(&line);
+    }
+
+    /// Execute one command line through the backend and record its result: a
+    /// waveform frame updates the scope, other output is logged line by line, and
+    /// an error is logged with an `error:` prefix (never a panic). Shared by the
+    /// typed shell line and the interactive editor.
+    fn run_line(&mut self, line: &str) {
         self.push_log(format!("> {line}"));
-        match self.backend.execute(&line) {
+        match self.backend.execute(line) {
             Ok(out) if is_scope(&out) => {
                 self.scope = out;
                 self.push_log("scope updated".to_string());
@@ -523,6 +611,146 @@ impl<B: Backend> App<B> {
                 }
             }
             Err(e) => self.push_log(format!("error: {e}")),
+        }
+    }
+
+    // ── interactive editing (CP-UX-M5.1) ──────────────────────────────────
+
+    /// Whether interactive edit mode is active.
+    pub fn edit_mode(&self) -> bool {
+        self.edit.active
+    }
+
+    /// The reference of the part under the selection cursor, if any.
+    pub fn selected_part(&self) -> Option<String> {
+        self.backend
+            .circuit()
+            .parts()
+            .get(self.edit.selected)
+            .map(|p| p.reference.clone())
+    }
+
+    /// Apply one [`EditAction`] to the circuit by running the equivalent shell
+    /// command through the backend. The result (or a friendly error) is logged and
+    /// the schematic/overlay pane reflects it on the next render. Pure — no I/O.
+    pub fn apply_edit(&mut self, action: EditAction) {
+        let line = action.to_command();
+        self.run_line(&line);
+        self.clamp_selection();
+    }
+
+    /// Enter edit mode, focusing the schematic and clearing any stale prompt.
+    fn enter_edit_mode(&mut self) {
+        self.edit.active = true;
+        self.edit.prompt = EditPrompt::None;
+        self.edit.buffer.clear();
+        self.focus = PanelId::Schematic;
+        self.clamp_selection();
+    }
+
+    /// Leave edit mode, discarding any in-progress prompt.
+    fn exit_edit_mode(&mut self) {
+        self.edit.active = false;
+        self.edit.prompt = EditPrompt::None;
+        self.edit.buffer.clear();
+    }
+
+    fn toggle_edit_mode(&mut self) {
+        if self.edit.active {
+            self.exit_edit_mode();
+        } else {
+            self.enter_edit_mode();
+        }
+    }
+
+    /// Keep the selection cursor within the current part list (0 when empty).
+    fn clamp_selection(&mut self) {
+        let n = self.backend.circuit().parts().len();
+        self.edit.selected = if n == 0 {
+            0
+        } else {
+            self.edit.selected.min(n - 1)
+        };
+    }
+
+    /// Route a keystroke to the selection handler or the open prompt.
+    fn on_edit_key(&mut self, key: KeyEvent) {
+        match self.edit.prompt {
+            EditPrompt::None => self.on_edit_select_key(key),
+            _ => self.on_edit_prompt_key(key),
+        }
+    }
+
+    /// Edit mode with no prompt open: move the cursor or begin an edit.
+    fn on_edit_select_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.exit_edit_mode(),
+            KeyCode::Up => self.edit.selected = self.edit.selected.saturating_sub(1),
+            KeyCode::Down => {
+                let last = self.backend.circuit().parts().len().saturating_sub(1);
+                self.edit.selected = (self.edit.selected + 1).min(last);
+            }
+            KeyCode::Char('a') => self.open_prompt(EditPrompt::Place),
+            KeyCode::Char('w') => self.open_prompt(EditPrompt::Wire),
+            KeyCode::Char('d') | KeyCode::Backspace => self.remove_selected(),
+            _ => {}
+        }
+    }
+
+    fn open_prompt(&mut self, prompt: EditPrompt) {
+        self.edit.prompt = prompt;
+        self.edit.buffer.clear();
+    }
+
+    /// Delete the selected part, or log a clean error when nothing is selected.
+    fn remove_selected(&mut self) {
+        match self.selected_part() {
+            Some(reference) => self.apply_edit(EditAction::Remove { reference }),
+            None => self.push_log("error: no part selected to remove".to_string()),
+        }
+    }
+
+    /// Edit mode with an argument prompt open: type, erase, cancel, or commit.
+    fn on_edit_prompt_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.edit.prompt = EditPrompt::None;
+                self.edit.buffer.clear();
+            }
+            KeyCode::Backspace => {
+                self.edit.buffer.pop();
+            }
+            KeyCode::Char(c) => self.edit.buffer.push(c),
+            KeyCode::Enter => self.commit_prompt(),
+            _ => {}
+        }
+    }
+
+    /// Commit the open prompt: parse its fields into an [`EditAction`] and apply
+    /// it. A wrong field count is a clean logged error, not a panic.
+    fn commit_prompt(&mut self) {
+        let prompt = self.edit.prompt;
+        let buffer = std::mem::take(&mut self.edit.buffer);
+        self.edit.prompt = EditPrompt::None;
+        let fields: Vec<&str> = buffer.split_whitespace().collect();
+        match (prompt, fields.as_slice()) {
+            (EditPrompt::Place, [reference, node_a, node_b, value]) => {
+                self.apply_edit(EditAction::Place {
+                    reference: (*reference).to_string(),
+                    node_a: (*node_a).to_string(),
+                    node_b: (*node_b).to_string(),
+                    value: (*value).to_string(),
+                })
+            }
+            (EditPrompt::Place, _) => {
+                self.push_log("error: add needs <ref> <nodeA> <nodeB> <value>".to_string())
+            }
+            (EditPrompt::Wire, [node_a, node_b]) => self.apply_edit(EditAction::Wire {
+                node_a: (*node_a).to_string(),
+                node_b: (*node_b).to_string(),
+            }),
+            (EditPrompt::Wire, _) => self.push_log("error: wire needs <nodeA> <nodeB>".to_string()),
+            (EditPrompt::None, _) => {}
         }
     }
 
@@ -621,13 +849,15 @@ impl<B: Backend> App<B> {
                 let rows = Schematic::new("schematic")
                     .width(rect.w)
                     .rows(self.backend.circuit());
-                let body = if rows.is_empty() {
-                    "(no parts)".to_string()
+                let (base, name) = if self.edit.active {
+                    (self.edit_schematic_body(&rows), "schematic [edit]")
+                } else if rows.is_empty() {
+                    ("(no parts)".to_string(), "schematic")
                 } else {
-                    rows.join("\n")
+                    (rows.join("\n"), "schematic")
                 };
-                let title = focus_title("schematic", focused);
-                Pane::new(&title, &body).render(rect.w, rect.h)
+                let title = focus_title(name, focused);
+                Pane::new(&title, &base).render(rect.w, rect.h)
             }
             PanelId::Scope => {
                 let body = if self.scope.is_empty() {
@@ -644,6 +874,33 @@ impl<B: Backend> App<B> {
                 Pane::new(&title, &body).render(rect.w, rect.h)
             }
         }
+    }
+
+    /// The schematic pane body while editing: the part rows with a selection
+    /// marker on the cursor, then a hint or the open argument prompt.
+    fn edit_schematic_body(&self, rows: &[String]) -> String {
+        let mut lines: Vec<String> = if rows.is_empty() {
+            vec!["  (no parts)".to_string()]
+        } else {
+            rows.iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    let marker = if i == self.edit.selected {
+                        "▸ "
+                    } else {
+                        "  "
+                    };
+                    format!("{marker}{r}")
+                })
+                .collect()
+        };
+        let hint = match self.edit.prompt {
+            EditPrompt::None => "[a]dd [w]ire [d]el [esc]".to_string(),
+            EditPrompt::Place => format!("add> {}", self.edit.buffer),
+            EditPrompt::Wire => format!("wire> {}", self.edit.buffer),
+        };
+        lines.push(hint);
+        lines.join("\n")
     }
 
     /// The shell pane body: the most recent log lines, then the input prompt.
@@ -818,11 +1075,11 @@ mod tests {
         App::new(MockBackend::new())
     }
 
-    fn key(app: &mut App<MockBackend>, code: KeyCode) {
+    fn key<B: Backend>(app: &mut App<B>, code: KeyCode) {
         app.handle_event(AppEvent::Key(KeyEvent::new(code)));
     }
 
-    fn typ(app: &mut App<MockBackend>, s: &str) {
+    fn typ<B: Backend>(app: &mut App<B>, s: &str) {
         for c in s.chars() {
             app.handle_event(AppEvent::Key(KeyEvent::char(c)));
         }
@@ -1073,5 +1330,272 @@ mod tests {
         let scattered = fuzzy_score("qt", "quit").unwrap();
         assert!(prefix > scattered, "{prefix} vs {scattered}");
         assert!(fuzzy_score("zzz", "quit").is_none(), "non-subsequence");
+    }
+
+    // ── interactive editing (CP-UX-M5.1) ──────────────────────────────────
+
+    /// A backend that actually builds an `ee_core::Circuit` from the `add`/`wire`/
+    /// `remove` grammar — a faithful stand-in for `ee-shell`'s `Shell` so the edit
+    /// state machine can be asserted on a *real* circuit without depending on the
+    /// shell crate. Minimal on purpose: only what the editor emits is parsed.
+    struct EditBackend {
+        circuit: Circuit,
+        nets: std::collections::HashMap<String, NetId>,
+    }
+
+    impl EditBackend {
+        fn new() -> Self {
+            Self {
+                circuit: Circuit::new("edit"),
+                nets: std::collections::HashMap::new(),
+            }
+        }
+
+        fn is_ground(name: &str) -> bool {
+            matches!(name, "gnd" | "ground" | "0")
+        }
+
+        fn net_for(&mut self, name: &str) -> NetId {
+            if Self::is_ground(name) {
+                return NetId::GROUND;
+            }
+            if let Some(&id) = self.nets.get(name) {
+                return id;
+            }
+            let id = self.circuit.new_net();
+            self.nets.insert(name.to_string(), id);
+            id
+        }
+
+        fn net_known(&self, name: &str) -> Result<NetId, String> {
+            if Self::is_ground(name) {
+                return Ok(NetId::GROUND);
+            }
+            self.nets
+                .get(name)
+                .copied()
+                .ok_or_else(|| format!("unknown node {name:?}"))
+        }
+    }
+
+    impl Backend for EditBackend {
+        fn execute(&mut self, line: &str) -> Result<String, String> {
+            let w: Vec<&str> = line.split_whitespace().collect();
+            match w.as_slice() {
+                ["add", r, a, b, v] => {
+                    if self.circuit.part_by_ref(r).is_some() {
+                        return Err(format!("duplicate part {r}"));
+                    }
+                    let (kind, unit) = match r.chars().next().map(|c| c.to_ascii_uppercase()) {
+                        Some('R') => (PartKind::Resistor, Unit::Ohm),
+                        Some('C') => (PartKind::Capacitor, Unit::Farad),
+                        Some('V') => (PartKind::VoltageSource, Unit::Volt),
+                        _ => return Err(format!("unknown part type for {r}")),
+                    };
+                    let value = Value::parse(v, unit).map_err(|_| format!("bad value {v:?}"))?;
+                    let (na, nb) = (self.net_for(a), self.net_for(b));
+                    self.circuit.add_part(*r, kind, Some(value), vec![na, nb]);
+                    Ok(format!("added {r}"))
+                }
+                ["wire", a, b] => {
+                    let (na, nb) = (self.net_known(a)?, self.net_known(b)?);
+                    self.circuit.wire(na, nb);
+                    Ok(format!("wired {a} {b}"))
+                }
+                ["remove", r] => {
+                    if self.circuit.part_by_ref(r).is_none() {
+                        return Err(format!("no part named {r}"));
+                    }
+                    // ee-core has no part removal; rebuild without the target,
+                    // preserving net ids and union-find topology via `resolve`.
+                    let old = &self.circuit;
+                    let mut max_id = 0u32;
+                    for p in old.parts() {
+                        for t in &p.terminals {
+                            max_id = max_id.max(t.0);
+                        }
+                    }
+                    let mut c = Circuit::new("edit");
+                    for _ in 1..=max_id {
+                        c.new_net();
+                    }
+                    for id in 1..=max_id {
+                        let root = old.resolve(NetId(id));
+                        if root.0 != id {
+                            c.wire(NetId(id), root);
+                        }
+                    }
+                    for p in old.parts() {
+                        if &p.reference == r {
+                            continue;
+                        }
+                        c.add_part(
+                            p.reference.clone(),
+                            p.kind.clone(),
+                            p.value,
+                            p.terminals.clone(),
+                        );
+                    }
+                    self.circuit = c;
+                    Ok(format!("removed {r}"))
+                }
+                _ => Err(format!("cannot parse {line:?}")),
+            }
+        }
+
+        fn circuit(&self) -> &Circuit {
+            &self.circuit
+        }
+    }
+
+    fn edit_app() -> App<EditBackend> {
+        App::new(EditBackend::new())
+    }
+
+    /// Placing parts adds them to the app's circuit; wiring two nodes merges their
+    /// nets (checked via `resolve`); removing a part drops it.
+    #[test]
+    fn edit_actions_place_wire_and_remove_on_the_real_circuit() {
+        let mut a = edit_app();
+        a.apply_edit(EditAction::Place {
+            reference: "V1".into(),
+            node_a: "in".into(),
+            node_b: "gnd".into(),
+            value: "5".into(),
+        });
+        a.apply_edit(EditAction::Place {
+            reference: "R1".into(),
+            node_a: "in".into(),
+            node_b: "out".into(),
+            value: "1k".into(),
+        });
+        assert_eq!(a.backend().circuit().parts().len(), 2, "two parts placed");
+
+        // Before wiring, R1's two terminals are distinct nets.
+        let r1 = a.backend().circuit().part_by_ref("R1").unwrap();
+        let (ta, tb) = (r1.terminals[0], r1.terminals[1]);
+        assert_ne!(
+            a.backend().circuit().resolve(ta),
+            a.backend().circuit().resolve(tb)
+        );
+
+        a.apply_edit(EditAction::Wire {
+            node_a: "in".into(),
+            node_b: "out".into(),
+        });
+        assert_eq!(
+            a.backend().circuit().resolve(ta),
+            a.backend().circuit().resolve(tb),
+            "wiring merged the two nets"
+        );
+
+        a.apply_edit(EditAction::Remove {
+            reference: "V1".into(),
+        });
+        assert!(
+            a.backend().circuit().part_by_ref("V1").is_none(),
+            "V1 removed"
+        );
+        assert!(a.backend().circuit().part_by_ref("R1").is_some(), "R1 kept");
+    }
+
+    /// The keystroke path: enter edit mode, add through the prompt, select, delete.
+    #[test]
+    fn edit_keystrokes_drive_selection_and_deletion() {
+        let mut a = edit_app();
+        // Focus the schematic, then `e` enters edit mode.
+        a.focus = PanelId::Schematic;
+        key(&mut a, KeyCode::Char('e'));
+        assert!(a.edit_mode(), "entered edit mode");
+
+        key(&mut a, KeyCode::Char('a'));
+        typ(&mut a, "R1 a b 1k");
+        key(&mut a, KeyCode::Enter);
+        key(&mut a, KeyCode::Char('a'));
+        typ(&mut a, "R2 b c 2k");
+        key(&mut a, KeyCode::Enter);
+        assert_eq!(a.backend().circuit().parts().len(), 2);
+
+        // Cursor up to the first part and delete it.
+        key(&mut a, KeyCode::Up);
+        key(&mut a, KeyCode::Up);
+        assert_eq!(a.selected_part().as_deref(), Some("R1"));
+        key(&mut a, KeyCode::Char('d'));
+        assert!(
+            a.backend().circuit().part_by_ref("R1").is_none(),
+            "R1 deleted"
+        );
+        assert_eq!(a.backend().circuit().parts().len(), 1);
+
+        key(&mut a, KeyCode::Esc);
+        assert!(!a.edit_mode(), "Esc exits edit mode");
+    }
+
+    /// The schematic pane reflects edits and shows the edit-mode chrome.
+    #[test]
+    fn schematic_render_reflects_edits_and_edit_mode() {
+        let mut a = edit_app();
+        a.apply_edit(EditAction::Place {
+            reference: "R1".into(),
+            node_a: "a".into(),
+            node_b: "b".into(),
+            value: "4k7".into(),
+        });
+        // Not yet in edit mode: the part lists in the normal schematic pane.
+        let frame = a.render(80, 24);
+        assert!(frame.contains("R1"), "placed part renders:\n{frame}");
+
+        a.focus = PanelId::Schematic;
+        key(&mut a, KeyCode::Char('e'));
+        let frame = a.render(80, 24);
+        assert!(frame.contains("[edit]"), "edit-mode title:\n{frame}");
+        assert!(frame.contains("▸ R1"), "selection marker on R1:\n{frame}");
+        assert!(frame.contains("[a]dd"), "edit hint line:\n{frame}");
+
+        // The overlay view also reflects the edited circuit.
+        a.overlay = true;
+        let frame = a.render(80, 24);
+        assert!(frame.contains("R1"), "overlay reflects the part:\n{frame}");
+    }
+
+    /// A malformed add (too few fields) and a backend-rejected edit (unknown node
+    /// on a wire) are clean logged errors — no panic, no circuit change.
+    #[test]
+    fn invalid_edits_surface_errors_without_panic() {
+        let mut a = edit_app();
+        a.focus = PanelId::Schematic;
+        key(&mut a, KeyCode::Char('e'));
+
+        // Malformed add: too few fields.
+        key(&mut a, KeyCode::Char('a'));
+        typ(&mut a, "oops");
+        key(&mut a, KeyCode::Enter);
+        assert_eq!(a.backend().circuit().parts().len(), 0, "nothing placed");
+
+        // A wire naming an unknown node is rejected by the backend, logged clean.
+        a.apply_edit(EditAction::Wire {
+            node_a: "ghost".into(),
+            node_b: "gnd".into(),
+        });
+        let frame = a.render(80, 24);
+        assert!(
+            frame.contains("error"),
+            "errors surface in the log:\n{frame}"
+        );
+
+        // Deleting with nothing selected is a friendly no-op, not a panic.
+        a.remove_selected();
+        assert_eq!(a.backend().circuit().parts().len(), 0);
+    }
+
+    /// Opening the palette and running "edit mode" toggles edit mode on.
+    #[test]
+    fn palette_edit_mode_command_toggles_editing() {
+        let mut a = edit_app();
+        a.open_palette();
+        typ(&mut a, "edit mode");
+        assert_eq!(a.palette_filtered().first().copied(), Some("edit mode"));
+        key(&mut a, KeyCode::Enter);
+        assert!(a.edit_mode(), "palette command entered edit mode");
     }
 }
