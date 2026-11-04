@@ -32,6 +32,24 @@
 //! * **Kinds.** `R`/`C`/`L`/`V` map to the modeled kinds; anything else is
 //!   `other(<name>)`, preserving [`PartKind::Other`] verbatim (any name without a
 //!   `)`, a newline, or a comment marker).
+//! * **Source waveforms + part metadata (`CP-AF-M5.1`).** State a part line
+//!   cannot carry rides on directives emitted right after it: `.wave <ref> …`
+//!   for a source's time [`Waveform`] (`sine`/`pulse`/`expr`; `dc` is the default
+//!   and omitted), `.tol <ref> <frac>` for a tolerance, and `.tempco <ref> <tc>`
+//!   for a temperature coefficient. The circuit's operating `.temp` is written
+//!   once near the top when it is off the nominal default. Each directive binds
+//!   to the part named just above it, so save→load→save is byte-identical.
+//!
+//! ```text
+//! V1 V 0V n1 gnd
+//! .wave V1 sine 5 1000 0 90    // offset+amp·sin(2π·freq·t+phase°)
+//! R1 R 1000Ω n1 n2
+//! .tol R1 0.05                 // ±5 %
+//! .tempco R1 0.01              // 1/°C
+//! ```
+//!
+//! (Transistor Ebers–Moll / level-1 model coefficients still default on load —
+//! a separate documented follow-up; everything else round-trips exactly.)
 //!
 //! Zero dependencies beyond `ee-core`; the parser is hand-written like the
 //! netlist's.
@@ -40,7 +58,9 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{self, Write as _};
 
-use ee_core::graph::{BjtModel, Circuit, MosfetModel, NetId, PartKind, Polarity};
+use ee_core::graph::{
+    BjtModel, Circuit, MosfetModel, NetId, PartKind, Polarity, Waveform, NOMINAL_TEMP_C,
+};
 use ee_core::units::Unit;
 use ee_core::value::{ParseError, Value};
 
@@ -92,6 +112,12 @@ pub enum ErrorKind {
     DuplicateReference(String),
     /// A `.directive` the format does not recognize.
     UnknownDirective(String),
+    /// A metadata directive (`.wave`/`.tol`/`.tempco`) named a part that no
+    /// earlier line defined.
+    UnknownReference(String),
+    /// A directive's argument was missing, mis-shaped, or not a valid number.
+    /// The reason is a short human description.
+    BadDirective(String),
 }
 
 impl fmt::Display for ProjectError {
@@ -130,6 +156,10 @@ impl fmt::Display for ErrorKind {
             }
             ErrorKind::DuplicateReference(r) => write!(f, "duplicate part reference {r:?}"),
             ErrorKind::UnknownDirective(d) => write!(f, "unknown directive .{d}"),
+            ErrorKind::UnknownReference(r) => {
+                write!(f, "directive references unknown part {r:?}")
+            }
+            ErrorKind::BadDirective(why) => write!(f, "malformed directive: {why}"),
         }
     }
 }
@@ -145,6 +175,11 @@ pub fn save(circuit: &Circuit) -> String {
     if !circuit.name.is_empty() {
         let _ = writeln!(out, ".name {}", circuit.name);
     }
+    // The operating temperature is circuit-level state; emit it only when it has
+    // moved off the nominal default, so an untouched circuit stays byte-identical.
+    if circuit.temperature() != NOMINAL_TEMP_C {
+        let _ = writeln!(out, ".temp {}", circuit.temperature());
+    }
     for part in circuit.parts() {
         let _ = write!(
             out,
@@ -157,8 +192,56 @@ pub fn save(circuit: &Circuit) -> String {
             let _ = write!(out, " {}", write_net(circuit.resolve(terminal)));
         }
         out.push('\n');
+        // Per-part metadata the `REF KIND VALUE NET...` line cannot carry: a
+        // source's time waveform, and the part's tolerance/tempco. Each is emitted
+        // right after its part so load sees the part first, in a fixed order so
+        // save→load→save stays byte-identical. Defaults (`Dc`, no tolerance, no
+        // tempco) emit nothing.
+        write_waveform(&mut out, &part.reference, &part.waveform);
+        if let Some(tol) = circuit.tolerance(&part.reference) {
+            let _ = writeln!(out, ".tol {} {}", part.reference, tol);
+        }
+        if let Some(tc) = circuit.tempco(&part.reference) {
+            let _ = writeln!(out, ".tempco {} {}", part.reference, tc);
+        }
     }
     out
+}
+
+/// Emit a source's time [`Waveform`] as a `.wave <ref> <kind> …` directive.
+/// [`Waveform::Dc`] is the default and writes nothing; the others write their
+/// fields as base-SI decimals (shortest-round-trip `f64` `Display`), and
+/// [`Waveform::Expr`] writes its expression verbatim as the line's tail.
+fn write_waveform(out: &mut String, reference: &str, waveform: &Waveform) {
+    match waveform {
+        Waveform::Dc => {}
+        Waveform::Sine {
+            amplitude,
+            freq,
+            offset,
+            phase_deg,
+        } => {
+            let _ = writeln!(
+                out,
+                ".wave {reference} sine {amplitude} {freq} {offset} {phase_deg}"
+            );
+        }
+        Waveform::Pulse {
+            v1,
+            v2,
+            delay,
+            width,
+            period,
+        } => {
+            let _ = writeln!(
+                out,
+                ".wave {reference} pulse {v1} {v2} {delay} {width} {period}"
+            );
+        }
+        Waveform::Expr(expr) => {
+            let _ = writeln!(out, ".wave {reference} expr {expr}");
+        }
+    }
 }
 
 /// Parse native project text back into a [`Circuit`] whose topology and values
@@ -219,7 +302,8 @@ fn parse_header(text: &str, line: usize) -> Result<(), ProjectError> {
     }
 }
 
-/// Handle a `.directive` line (currently only `.name`).
+/// Handle a `.directive` line: `.name`, the circuit `.temp`, and the per-part
+/// `.wave`/`.tol`/`.tempco` metadata.
 fn apply_directive(circuit: &mut Circuit, rest: &str, line: usize) -> Result<(), ProjectError> {
     let mut it = rest.splitn(2, char::is_whitespace);
     let name = it.next().unwrap_or("");
@@ -229,8 +313,178 @@ fn apply_directive(circuit: &mut Circuit, rest: &str, line: usize) -> Result<(),
             circuit.name = arg.to_string();
             Ok(())
         }
+        "temp" => {
+            let celsius = parse_f64(arg, line, "`.temp` expects a temperature in °C")?;
+            if !circuit.set_temperature(celsius) {
+                return Err(err(
+                    line,
+                    ErrorKind::BadDirective(format!("`.temp` value {celsius} is not finite")),
+                ));
+            }
+            Ok(())
+        }
+        "wave" => apply_wave(circuit, arg, line),
+        "tol" => apply_scalar(circuit, arg, line, Scalar::Tolerance),
+        "tempco" => apply_scalar(circuit, arg, line, Scalar::Tempco),
         other => Err(err(line, ErrorKind::UnknownDirective(other.to_string()))),
     }
+}
+
+/// Which per-part scalar a `.tol`/`.tempco` directive sets.
+#[derive(Clone, Copy)]
+enum Scalar {
+    Tolerance,
+    Tempco,
+}
+
+/// Apply a `.tol <ref> <value>` or `.tempco <ref> <value>` directive. The part
+/// must already exist (metadata is emitted right after its part line).
+fn apply_scalar(
+    circuit: &mut Circuit,
+    arg: &str,
+    line: usize,
+    which: Scalar,
+) -> Result<(), ProjectError> {
+    let name = match which {
+        Scalar::Tolerance => "tol",
+        Scalar::Tempco => "tempco",
+    };
+    let mut it = arg.split_whitespace();
+    let reference = it.next().ok_or_else(|| {
+        err(
+            line,
+            ErrorKind::BadDirective(format!("`.{name}` expects `<ref> <value>`")),
+        )
+    })?;
+    let value_tok = it.next().ok_or_else(|| {
+        err(
+            line,
+            ErrorKind::BadDirective(format!("`.{name}` expects `<ref> <value>`")),
+        )
+    })?;
+    let value = parse_f64(value_tok, line, &format!("`.{name}` value is not a number"))?;
+    if circuit.part_by_ref(reference).is_none() {
+        return Err(err(
+            line,
+            ErrorKind::UnknownReference(reference.to_string()),
+        ));
+    }
+    let ok = match which {
+        Scalar::Tolerance => circuit.set_tolerance(reference, value),
+        Scalar::Tempco => circuit.set_tempco(reference, value),
+    };
+    if !ok {
+        return Err(err(
+            line,
+            ErrorKind::BadDirective(format!("`.{name}` value {value} is out of range")),
+        ));
+    }
+    Ok(())
+}
+
+/// Apply a `.wave <ref> <kind> …` directive, attaching a [`Waveform`] to an
+/// existing part. The part must already be defined earlier in the file.
+fn apply_wave(circuit: &mut Circuit, arg: &str, line: usize) -> Result<(), ProjectError> {
+    let mut it = arg.splitn(3, char::is_whitespace);
+    let reference = it.next().unwrap_or("");
+    let kind = it.next().unwrap_or("");
+    let params = it.next().unwrap_or("").trim();
+    if reference.is_empty() || kind.is_empty() {
+        return Err(err(
+            line,
+            ErrorKind::BadDirective("`.wave` expects `<ref> <kind> …`".to_string()),
+        ));
+    }
+    if circuit.part_by_ref(reference).is_none() {
+        return Err(err(
+            line,
+            ErrorKind::UnknownReference(reference.to_string()),
+        ));
+    }
+    let waveform = parse_waveform(kind, params, line)?;
+    circuit.set_waveform(reference, waveform);
+    Ok(())
+}
+
+/// Parse a waveform spelling (`dc`/`sine`/`pulse`/`expr`) and its parameter tail
+/// into a [`Waveform`]. Numeric forms expect an exact count of base-SI numbers;
+/// `expr` keeps the remaining text verbatim as the expression.
+fn parse_waveform(kind: &str, params: &str, line: usize) -> Result<Waveform, ProjectError> {
+    match kind.to_ascii_lowercase().as_str() {
+        "dc" => Ok(Waveform::Dc),
+        "sine" => {
+            let n = wave_numbers(params, 4, "sine", line)?;
+            Ok(Waveform::Sine {
+                amplitude: n[0],
+                freq: n[1],
+                offset: n[2],
+                phase_deg: n[3],
+            })
+        }
+        "pulse" => {
+            let n = wave_numbers(params, 5, "pulse", line)?;
+            Ok(Waveform::Pulse {
+                v1: n[0],
+                v2: n[1],
+                delay: n[2],
+                width: n[3],
+                period: n[4],
+            })
+        }
+        "expr" => {
+            if params.is_empty() {
+                return Err(err(
+                    line,
+                    ErrorKind::BadDirective("`.wave … expr` needs an expression".to_string()),
+                ));
+            }
+            Ok(Waveform::Expr(params.to_string()))
+        }
+        other => Err(err(
+            line,
+            ErrorKind::BadDirective(format!("unknown waveform {other:?}")),
+        )),
+    }
+}
+
+/// Parse exactly `count` whitespace-separated base-SI numbers from a waveform's
+/// parameter tail.
+fn wave_numbers(
+    params: &str,
+    count: usize,
+    kind: &str,
+    line: usize,
+) -> Result<Vec<f64>, ProjectError> {
+    let toks: Vec<&str> = params.split_whitespace().collect();
+    if toks.len() != count {
+        return Err(err(
+            line,
+            ErrorKind::BadDirective(format!(
+                "`.wave … {kind}` expects {count} numbers, found {}",
+                toks.len()
+            )),
+        ));
+    }
+    toks.iter()
+        .map(|t| {
+            parse_f64(
+                t,
+                line,
+                &format!("`.wave … {kind}` parameter is not a number"),
+            )
+        })
+        .collect()
+}
+
+/// Parse a plain `f64` (as written by `f64`'s `Display`), mapping a failure to a
+/// [`ErrorKind::BadDirective`] carrying `why`.
+fn parse_f64(tok: &str, line: usize, why: &str) -> Result<f64, ProjectError> {
+    tok.parse::<f64>().map_err(|_| {
+        err(
+            line,
+            ErrorKind::BadDirective(format!("{why} (got {tok:?})")),
+        )
+    })
 }
 
 /// Parse one `REF KIND VALUE NET...` part line and add it to the circuit.
@@ -734,6 +988,125 @@ R3 R 1k a ground
     fn display_includes_line_number() {
         let e = err(7, ErrorKind::MissingValue);
         assert!(e.to_string().starts_with("line 7:"), "{e}");
+    }
+
+    // ── waveform + tolerance/tempco round-trip (CP-AF-M5.2) ──────────────────
+
+    #[test]
+    fn waveform_tolerance_tempco_and_temp_round_trip_exactly() {
+        // The M5.2 gate: a Sine source, an Expr source, a ±5 % tolerance, and a
+        // tempco (plus a non-nominal temperature) survive save→load exactly, and a
+        // second save is byte-identical.
+        let mut c = Circuit::new("waveforms");
+        let n1 = c.new_net();
+        let n2 = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            Some(Value::new(0.0, Unit::Volt)),
+            vec![n1, NetId::GROUND],
+        );
+        c.add_part(
+            "V2",
+            PartKind::VoltageSource,
+            Some(Value::new(0.0, Unit::Volt)),
+            vec![n2, NetId::GROUND],
+        );
+        c.add_part(
+            "R1",
+            PartKind::Resistor,
+            Some(Value::new(1000.0, Unit::Ohm)),
+            vec![n1, n2],
+        );
+        let sine = Waveform::Sine {
+            amplitude: 5.0,
+            freq: 1000.0,
+            offset: 0.5,
+            phase_deg: 90.0,
+        };
+        assert!(c.set_waveform("V1", sine.clone()));
+        let expr = Waveform::Expr("sin(2*pi*1000*t)".to_string());
+        assert!(c.set_waveform("V2", expr.clone()));
+        assert!(c.set_tolerance("R1", 0.05));
+        assert!(c.set_tempco("R1", 0.01));
+        assert!(c.set_temperature(85.0));
+
+        let text = save(&c);
+        let back = load(&text).unwrap();
+
+        // save→load→save is byte-identical.
+        assert_eq!(
+            save(&back),
+            text,
+            "re-save must reproduce the file exactly:\n{text}"
+        );
+
+        // The reloaded circuit is equivalent in every serialized field.
+        assert_eq!(back.part_by_ref("V1").unwrap().waveform, sine);
+        assert_eq!(back.part_by_ref("V2").unwrap().waveform, expr);
+        assert_eq!(back.tolerance("R1"), Some(0.05));
+        assert_eq!(back.tempco("R1"), Some(0.01));
+        assert_eq!(back.temperature(), 85.0);
+        // Parts without metadata stay at their defaults.
+        assert_eq!(back.part_by_ref("R1").unwrap().waveform, Waveform::Dc);
+        assert_eq!(back.tolerance("V1"), None);
+    }
+
+    #[test]
+    fn pulse_waveform_round_trips() {
+        let mut c = Circuit::new("pulse");
+        let n = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            Some(Value::new(0.0, Unit::Volt)),
+            vec![n, NetId::GROUND],
+        );
+        let pulse = Waveform::Pulse {
+            v1: 0.0,
+            v2: 3.3,
+            delay: 1e-6,
+            width: 5e-6,
+            period: 1e-5,
+        };
+        assert!(c.set_waveform("V1", pulse.clone()));
+        let back = load(&save(&c)).unwrap();
+        assert_eq!(back.part_by_ref("V1").unwrap().waveform, pulse);
+        assert_eq!(save(&back), save(&c));
+    }
+
+    #[test]
+    fn default_metadata_emits_nothing_extra() {
+        // A circuit with no waveforms/tolerance/tempco and the nominal temperature
+        // serializes with no directive lines beyond `.name` — the existing shape.
+        let (c, _, _) = sample();
+        let text = save(&c);
+        assert!(!text.contains(".wave"), "{text}");
+        assert!(!text.contains(".tol"), "{text}");
+        assert!(!text.contains(".tempco"), "{text}");
+        assert!(!text.contains(".temp"), "{text}");
+    }
+
+    #[test]
+    fn metadata_directive_errors_point_at_the_line() {
+        // A `.tol` naming an unknown part.
+        let e = load("!ee-project v1\nR1 R 1k a b\n.tol R9 0.05").unwrap_err();
+        assert_eq!(e, err(3, ErrorKind::UnknownReference("R9".into())));
+
+        // A `.wave` with a bad kind.
+        let e = load("!ee-project v1\nV1 V 1V a gnd\n.wave V1 ramp 1 2").unwrap_err();
+        assert_eq!(e.line, 3);
+        assert!(matches!(e.kind, ErrorKind::BadDirective(_)), "{e}");
+
+        // A `.wave sine` with the wrong number of parameters.
+        let e = load("!ee-project v1\nV1 V 1V a gnd\n.wave V1 sine 1 2 3").unwrap_err();
+        assert_eq!(e.line, 3);
+        assert!(matches!(e.kind, ErrorKind::BadDirective(_)), "{e}");
+
+        // A non-numeric `.temp`.
+        let e = load("!ee-project v1\n.temp hot\nR1 R 1k a b").unwrap_err();
+        assert_eq!(e.line, 2);
+        assert!(matches!(e.kind, ErrorKind::BadDirective(_)), "{e}");
     }
 
     /// A kind discriminant string for equality checks in tests.

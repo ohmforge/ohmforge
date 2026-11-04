@@ -47,9 +47,31 @@
 //! `+` continuations are joined before parsing. Use [`import_with_notes`] to see
 //! the notes; [`import`] discards them.
 //!
-//! `.model`-backed devices are import-only at this checkpoint — [`export`] still
-//! emits diodes/transistors as a skipped-comment line (they need a matching
-//! `.model` emitter, a later checkpoint).
+//! ## Device + controlled-source export (`CP-AF-M5.1`)
+//!
+//! [`export`] emits real SPICE for the model-backed devices and the four
+//! controlled sources, so a round-trip through [`import`] preserves them:
+//!
+//! ```text
+//! D1 a 0 Dmod_D1          ; a diode, with a matching `.model` card below
+//! Q1 c b e Qmod_Q1        ; an NPN BJT
+//! M1 d g s Mmod_M1        ; an NMOS
+//! E1 o+ o- c+ c- 10       ; VCVS: `Ref out+ out- ctrl+ ctrl- gain`
+//! G1 o+ o- c+ c- 0.01     ; VCCS: same shape, gain is a transconductance
+//! H1 o+ o- Vsense 2000    ; CCVS: `Ref out+ out- Vctrl transresistance`
+//! F1 o+ o- Vsense 0.5     ; CCCS: `Ref out+ out- Vctrl gain`
+//! .model Dmod_D1 D (IS=2.52e-9)
+//! .model Qmod_Q1 NPN (IS=2e-14 BF=250 BR=3)
+//! .model Mmod_M1 NMOS (VTO=1.5 KP=0.002 LAMBDA=0.02)
+//! ```
+//!
+//! Each `D`/`Q`/`M` element names a per-part `.model` card (`Dmod_<ref>`,
+//! `Qmod_<ref>`, `Mmod_<ref>`) carrying the engine parameters the importer reads
+//! back: a diode's `IS` (the part's value, in amperes), a BJT's `IS`/`BF`/`BR`,
+//! and a MOSFET's `VTO`/`KP`/`LAMBDA` (`VTO` is re-signed by the polarity, so a
+//! PMOS writes a negative threshold that `import` reads as a magnitude again).
+//! The `H`/`F` control reference is the name of the sensing voltage source, kept
+//! verbatim. Only [`PartKind::Other`] is still emitted as a skipped comment.
 //!
 //! ## Value suffixes (the `m`-vs-`meg` footgun)
 //!
@@ -153,7 +175,7 @@ impl fmt::Display for ErrorKind {
             ErrorKind::UnknownElement(c) => {
                 write!(
                     f,
-                    "unknown element type '{c}' (expected R, C, L, V, I, D, Q, or M)"
+                    "unknown element type '{c}' (expected R, C, L, V, I, D, Q, M, E, G, H, or F)"
                 )
             }
             ErrorKind::MissingValue => write!(f, "missing value after element nodes"),
@@ -411,6 +433,14 @@ enum ElemClass {
     Bjt,
     /// A MOSFET (`M`): `Ref drain gate source [bulk] MODEL`.
     Mosfet,
+    /// A voltage-controlled voltage source (`E`): `Ref out+ out- ctrl+ ctrl- GAIN`.
+    Vcvs,
+    /// A voltage-controlled current source (`G`): `Ref out+ out- ctrl+ ctrl- GAIN`.
+    Vccs,
+    /// A current-controlled voltage source (`H`): `Ref out+ out- VCTRL GAIN`.
+    Ccvs,
+    /// A current-controlled current source (`F`): `Ref out+ out- VCTRL GAIN`.
+    Cccs,
 }
 
 /// Parse one element line and add it to the circuit. Passives (`R/C/L/V/I`)
@@ -453,7 +483,80 @@ fn parse_element(ctx: &mut Ctx, text: &str, line: usize) -> Result<(), SpiceErro
         // Diode is 2-terminal, BJT/MOSFET 3-terminal (a MOSFET may add a bulk node).
         ElemClass::Diode => parse_device(ctx, &fields, line, 2),
         ElemClass::Bjt | ElemClass::Mosfet => parse_device(ctx, &fields, line, 3),
+        ElemClass::Vcvs => parse_vcontrolled(ctx, &fields, line, PartKind::Vcvs),
+        ElemClass::Vccs => parse_vcontrolled(ctx, &fields, line, PartKind::Vccs),
+        ElemClass::Ccvs => parse_ccontrolled(ctx, &fields, line, true),
+        ElemClass::Cccs => parse_ccontrolled(ctx, &fields, line, false),
     }
+}
+
+/// Parse a voltage-controlled source line (`E`/`G`):
+/// `Ref out+ out- ctrl+ ctrl- GAIN` — four nodes then the gain. `make` wraps the
+/// parsed gain into [`PartKind::Vcvs`] or [`PartKind::Vccs`].
+fn parse_vcontrolled(
+    ctx: &mut Ctx,
+    fields: &[&str],
+    line: usize,
+    make: fn(f64) -> PartKind,
+) -> Result<(), SpiceError> {
+    let reference = fields[0];
+    if fields.len() != 6 {
+        return Err(err(
+            line,
+            ErrorKind::BadDeviceLine {
+                reference: reference.to_string(),
+                got: fields.len(),
+                want: "Ref N+ N- NC+ NC- GAIN",
+            },
+        ));
+    }
+    claim_reference(ctx.seen, reference, line)?;
+    let terminals: Vec<NetId> = fields[1..5]
+        .iter()
+        .map(|n| net_for(ctx.circuit, ctx.nets, n))
+        .collect();
+    let gain = spice_magnitude(fields[5])
+        .ok_or_else(|| err(line, ErrorKind::BadValue(fields[5].to_string())))?;
+    ctx.circuit.add_part(reference, make(gain), None, terminals);
+    Ok(())
+}
+
+/// Parse a current-controlled source line (`H`/`F`): `Ref out+ out- VCTRL GAIN` —
+/// two output nodes, the name of the voltage source whose branch current controls
+/// it (kept verbatim), then the gain. `is_ccvs` picks [`PartKind::Ccvs`] (a
+/// transresistance) vs. [`PartKind::Cccs`] (a current gain).
+fn parse_ccontrolled(
+    ctx: &mut Ctx,
+    fields: &[&str],
+    line: usize,
+    is_ccvs: bool,
+) -> Result<(), SpiceError> {
+    let reference = fields[0];
+    if fields.len() != 5 {
+        return Err(err(
+            line,
+            ErrorKind::BadDeviceLine {
+                reference: reference.to_string(),
+                got: fields.len(),
+                want: "Ref N+ N- VCTRL GAIN",
+            },
+        ));
+    }
+    claim_reference(ctx.seen, reference, line)?;
+    let terminals: Vec<NetId> = fields[1..3]
+        .iter()
+        .map(|n| net_for(ctx.circuit, ctx.nets, n))
+        .collect();
+    let ctrl = fields[3].to_string();
+    let gain = spice_magnitude(fields[4])
+        .ok_or_else(|| err(line, ErrorKind::BadValue(fields[4].to_string())))?;
+    let kind = if is_ccvs {
+        PartKind::Ccvs(gain, ctrl)
+    } else {
+        PartKind::Cccs(gain, ctrl)
+    };
+    ctx.circuit.add_part(reference, kind, None, terminals);
+    Ok(())
 }
 
 /// Reserve a reference designator, erroring if it was already used.
@@ -753,6 +856,10 @@ fn classify(reference: &str) -> Result<ElemClass, ErrorKind> {
         'D' => ElemClass::Diode,
         'Q' => ElemClass::Bjt,
         'M' => ElemClass::Mosfet,
+        'E' => ElemClass::Vcvs,
+        'G' => ElemClass::Vccs,
+        'H' => ElemClass::Ccvs,
+        'F' => ElemClass::Cccs,
         other => return Err(ErrorKind::UnknownElement(other)),
     })
 }
@@ -837,8 +944,9 @@ fn scale_factor(suffix: &str) -> f64 {
 }
 
 /// Export a [`Circuit`] as a SPICE deck. Round-trips through [`import`]: each
-/// part's reference/kind/value and the shared-net topology survive (see the
-/// module docs). Parts whose kind is outside the M1 subset are emitted as a
+/// part's reference/kind/value, its model/gain parameters, and the shared-net
+/// topology survive (see the module docs). Model-backed devices (`D`/`Q`/`M`)
+/// also emit a matching `.model` card; only [`PartKind::Other`] is emitted as a
 /// comment rather than a bogus element.
 pub fn export(circuit: &Circuit) -> String {
     let mut out = String::new();
@@ -852,41 +960,102 @@ pub fn export(circuit: &Circuit) -> String {
     };
     let _ = writeln!(out, "{title}");
 
+    // `.model` cards accumulate here and flush beneath the element lines, so a
+    // reader sees the netlist first and its model library after.
+    let mut models = String::new();
+
     for part in circuit.parts() {
-        if !is_exportable(&part.kind) {
-            let _ = writeln!(
-                out,
-                "* {} skipped (unsupported in SPICE M1)",
-                part.reference
-            );
-            continue;
+        let reference = &part.reference;
+        match &part.kind {
+            PartKind::Resistor
+            | PartKind::Capacitor
+            | PartKind::Inductor
+            | PartKind::VoltageSource
+            | PartKind::CurrentSource => {
+                write_nodes(&mut out, reference, &part.terminals, circuit);
+                let _ = writeln!(out, " {}", export_value(part.value.as_ref()));
+            }
+            PartKind::Diode => {
+                let model = format!("Dmod_{reference}");
+                write_nodes(&mut out, reference, &part.terminals, circuit);
+                let _ = writeln!(out, " {model}");
+                emit_diode_model(&mut models, &model, part.value.as_ref());
+            }
+            PartKind::Bjt(polarity, m) => {
+                let model = format!("Qmod_{reference}");
+                write_nodes(&mut out, reference, &part.terminals, circuit);
+                let _ = writeln!(out, " {model}");
+                let ty = match polarity {
+                    Polarity::N => "NPN",
+                    Polarity::P => "PNP",
+                };
+                let _ = writeln!(
+                    models,
+                    ".model {model} {ty} (IS={} BF={} BR={})",
+                    m.is, m.bf, m.br
+                );
+            }
+            PartKind::Mosfet(polarity, m) => {
+                let model = format!("Mmod_{reference}");
+                write_nodes(&mut out, reference, &part.terminals, circuit);
+                let _ = writeln!(out, " {model}");
+                let ty = match polarity {
+                    Polarity::N => "NMOS",
+                    Polarity::P => "PMOS",
+                };
+                // VTO is signed in SPICE; the engine keeps the magnitude and lets
+                // the polarity carry the sign, so re-apply it on the way out.
+                let vto = m.vth * polarity.sign();
+                let _ = writeln!(
+                    models,
+                    ".model {model} {ty} (VTO={} KP={} LAMBDA={})",
+                    vto, m.kp, m.lambda
+                );
+            }
+            // E/G: `Ref out+ out- ctrl+ ctrl- gain` (four nodes then the gain).
+            PartKind::Vcvs(gain) | PartKind::Vccs(gain) => {
+                write_nodes(&mut out, reference, &part.terminals, circuit);
+                let _ = writeln!(out, " {gain}");
+            }
+            // H/F: `Ref out+ out- Vctrl gain` (two nodes, the sense source, gain).
+            PartKind::Ccvs(gain, ctrl) | PartKind::Cccs(gain, ctrl) => {
+                write_nodes(&mut out, reference, &part.terminals, circuit);
+                let _ = writeln!(out, " {ctrl} {gain}");
+            }
+            PartKind::Other(_) => {
+                let _ = writeln!(out, "* {reference} skipped (unsupported in SPICE)");
+            }
         }
-        let _ = write!(out, "{}", part.reference);
-        for &terminal in &part.terminals {
-            let _ = write!(out, " {}", node_name(circuit.resolve(terminal)));
-        }
-        let _ = writeln!(out, " {}", export_value(part.value.as_ref()));
     }
 
+    out.push_str(&models);
     let _ = writeln!(out, ".end");
     out
 }
 
-/// Whether a part kind maps onto the R/C/L/V/I SPICE subset. Diodes and
-/// transistors need a `.model` card (a later checkpoint), so they're skipped
-/// here rather than emitted as an unparseable line.
-fn is_exportable(kind: &PartKind) -> bool {
-    !matches!(
-        kind,
-        PartKind::Other(_)
-            | PartKind::Diode
-            | PartKind::Bjt(..)
-            | PartKind::Mosfet(..)
-            | PartKind::Vcvs(_)
-            | PartKind::Vccs(_)
-            | PartKind::Ccvs(..)
-            | PartKind::Cccs(..)
-    )
+/// Write an element's reference and its resolved terminal nodes (ground as `0`,
+/// every other net as `n<id>`), with no trailing newline so the caller can append
+/// the element's value or model name.
+fn write_nodes(out: &mut String, reference: &str, terminals: &[NetId], circuit: &Circuit) {
+    let _ = write!(out, "{reference}");
+    for &terminal in terminals {
+        let _ = write!(out, " {}", node_name(circuit.resolve(terminal)));
+    }
+}
+
+/// Emit a diode's `.model` card. The engine's only per-part diode parameter is
+/// its saturation current `IS` (the part's value, in amperes); a valueless diode
+/// writes an empty card so [`import`] still resolves the model (and reads back a
+/// default diode).
+fn emit_diode_model(out: &mut String, name: &str, value: Option<&Value>) {
+    match value {
+        Some(v) => {
+            let _ = writeln!(out, ".model {name} D (IS={})", v.magnitude);
+        }
+        None => {
+            let _ = writeln!(out, ".model {name} D ()");
+        }
+    }
 }
 
 /// The node name for a resolved net: `0` for ground, else `n<id>`.
@@ -1165,11 +1334,180 @@ R2 mid 0   1k
         );
         let deck = export(&c);
         assert!(
-            deck.contains("* D1 skipped (unsupported in SPICE M1)"),
+            deck.contains("* D1 skipped (unsupported in SPICE)"),
             "{deck}"
         );
         // And re-importing the deck simply drops it (comment line).
         assert_eq!(import(&deck).unwrap().parts().len(), 0);
+    }
+
+    // ── device + controlled-source export (CP-AF-M5.1) ───────────────────────
+
+    #[test]
+    fn device_and_controlled_source_round_trip() {
+        // The M5.1 gate: a diode, an NPN BJT, an NMOS, and a VCVS survive
+        // export→import with their kind and model/gain parameters intact.
+        let mut c = Circuit::new("devices");
+        let a = c.new_net();
+        let b = c.new_net();
+        let col = c.new_net();
+        let emi = c.new_net();
+        let cp = c.new_net();
+        let cn = c.new_net();
+
+        c.add_part(
+            "D1",
+            PartKind::Diode,
+            Some(Value::new(2.52e-9, Unit::Ampere)),
+            vec![a, NetId::GROUND],
+        );
+        c.add_part(
+            "Q1",
+            PartKind::Bjt(
+                Polarity::N,
+                BjtModel {
+                    is: 2e-14,
+                    bf: 250.0,
+                    br: 3.0,
+                    vt: BjtModel::default().vt,
+                },
+            ),
+            None,
+            vec![col, b, emi],
+        );
+        c.add_part(
+            "M1",
+            PartKind::Mosfet(
+                Polarity::N,
+                MosfetModel {
+                    vth: 1.5,
+                    kp: 2e-3,
+                    lambda: 0.02,
+                },
+            ),
+            None,
+            vec![a, b, emi],
+        );
+        c.add_part("E1", PartKind::Vcvs(1.0 / 3.0), None, vec![a, b, cp, cn]);
+
+        let deck = export(&c);
+        let back = import(&deck).unwrap();
+
+        // Diode: IS carried as the part value (amperes).
+        let d1 = back.part_by_ref("D1").unwrap();
+        assert!(matches!(d1.kind, PartKind::Diode));
+        assert_eq!(d1.value, Some(Value::new(2.52e-9, Unit::Ampere)));
+
+        // NPN BJT: IS/BF/BR survive exactly; VT stays the engine default.
+        match &back.part_by_ref("Q1").unwrap().kind {
+            PartKind::Bjt(Polarity::N, m) => {
+                assert_eq!(m.is, 2e-14);
+                assert_eq!(m.bf, 250.0);
+                assert_eq!(m.br, 3.0);
+                assert_eq!(m.vt, BjtModel::default().vt);
+            }
+            other => panic!("expected NPN BJT, got {other:?}"),
+        }
+
+        // NMOS: VTO/KP/LAMBDA survive exactly.
+        match &back.part_by_ref("M1").unwrap().kind {
+            PartKind::Mosfet(Polarity::N, m) => {
+                assert_eq!(m.vth, 1.5);
+                assert_eq!(m.kp, 2e-3);
+                assert_eq!(m.lambda, 0.02);
+            }
+            other => panic!("expected NMOS, got {other:?}"),
+        }
+
+        // VCVS: an awkward gain comes back bit-for-bit.
+        let e1 = &back.part_by_ref("E1").unwrap().kind;
+        assert!(matches!(e1, PartKind::Vcvs(g) if *g == 1.0 / 3.0), "{e1:?}");
+
+        // Topology: nets shared in the original are still one net after the trip.
+        let d1 = back.part_by_ref("D1").unwrap();
+        let q1 = back.part_by_ref("Q1").unwrap();
+        let m1 = back.part_by_ref("M1").unwrap();
+        let e1 = back.part_by_ref("E1").unwrap();
+        // `a` is shared by D1[0], M1[0], E1[0].
+        assert_eq!(back.resolve(d1.terminals[0]), back.resolve(m1.terminals[0]));
+        assert_eq!(back.resolve(d1.terminals[0]), back.resolve(e1.terminals[0]));
+        // `b` is shared by Q1[1], M1[1], E1[1].
+        assert_eq!(back.resolve(q1.terminals[1]), back.resolve(m1.terminals[1]));
+        assert_eq!(back.resolve(q1.terminals[1]), back.resolve(e1.terminals[1]));
+        // `emi` is shared by Q1[2] and M1[2]; D1's cathode is ground.
+        assert_eq!(back.resolve(q1.terminals[2]), back.resolve(m1.terminals[2]));
+        assert_eq!(back.resolve(d1.terminals[1]), NetId::GROUND);
+    }
+
+    #[test]
+    fn pmos_vto_sign_round_trips() {
+        // A PMOS writes a negative VTO (the engine stores the magnitude), which
+        // `import` reads back as the same positive threshold magnitude.
+        let mut c = Circuit::new("pmos");
+        let (d, g, s) = (c.new_net(), c.new_net(), c.new_net());
+        c.add_part(
+            "M1",
+            PartKind::Mosfet(
+                Polarity::P,
+                MosfetModel {
+                    vth: 2.0,
+                    kp: 1e-3,
+                    lambda: 0.0,
+                },
+            ),
+            None,
+            vec![d, g, s],
+        );
+        let deck = export(&c);
+        assert!(
+            deck.contains("VTO=-2"),
+            "PMOS VTO is negative in SPICE:\n{deck}"
+        );
+        match &import(&deck).unwrap().part_by_ref("M1").unwrap().kind {
+            PartKind::Mosfet(Polarity::P, m) => assert_eq!(m.vth, 2.0),
+            other => panic!("expected PMOS, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn all_controlled_sources_round_trip() {
+        // E/G carry four nodes + a gain; H/F two nodes, a sense-source name, and a
+        // gain. Kind, gain (exact f64), and the control reference all survive.
+        let mut c = Circuit::new("controlled");
+        let a = c.new_net();
+        let b = c.new_net();
+        let cp = c.new_net();
+        let cn = c.new_net();
+        c.add_part("E1", PartKind::Vcvs(10.0), None, vec![a, b, cp, cn]);
+        c.add_part("G1", PartKind::Vccs(-2.5), None, vec![a, b, cp, cn]);
+        c.add_part(
+            "H1",
+            PartKind::Ccvs(2000.0, "Vsense".into()),
+            None,
+            vec![a, b],
+        );
+        c.add_part(
+            "F1",
+            PartKind::Cccs(0.75, "Vsense".into()),
+            None,
+            vec![a, b],
+        );
+
+        let back = import(&export(&c)).unwrap();
+        let e1 = &back.part_by_ref("E1").unwrap().kind;
+        assert!(matches!(e1, PartKind::Vcvs(g) if *g == 10.0), "{e1:?}");
+        let g1 = &back.part_by_ref("G1").unwrap().kind;
+        assert!(matches!(g1, PartKind::Vccs(g) if *g == -2.5), "{g1:?}");
+        let h1 = &back.part_by_ref("H1").unwrap().kind;
+        assert!(
+            matches!(h1, PartKind::Ccvs(r, ctrl) if *r == 2000.0 && ctrl == "Vsense"),
+            "{h1:?}"
+        );
+        let f1 = &back.part_by_ref("F1").unwrap().kind;
+        assert!(
+            matches!(f1, PartKind::Cccs(f, ctrl) if *f == 0.75 && ctrl == "Vsense"),
+            "{f1:?}"
+        );
     }
 
     #[test]
