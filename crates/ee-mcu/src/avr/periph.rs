@@ -97,6 +97,18 @@ const PORTD: u16 = 0x2B;
 
 const TIFR0: u16 = 0x35;
 const TIFR1: u16 = 0x36;
+
+// External / pin-change interrupt registers. The flag + mask registers sit in
+// the low I/O window (reachable via SBI/CBI/IN/OUT); the control + per-pin mask
+// registers are extended-I/O (STS/LDS only).
+const PCIFR: u16 = 0x3B; // PCIF2:0  — pin-change interrupt flags
+const EIFR: u16 = 0x3C; // INTF1:0  — external interrupt flags
+const EIMSK: u16 = 0x3D; // INT1:0   — external interrupt enables
+const PCICR: u16 = 0x68; // PCIE2:0  — pin-change interrupt bank enables
+const EICRA: u16 = 0x69; // ISC11:00 — external interrupt sense control
+const PCMSK0: u16 = 0x6B; // PCINT7:0   (Port B)
+const PCMSK1: u16 = 0x6C; // PCINT14:8  (Port C)
+const PCMSK2: u16 = 0x6D; // PCINT23:16 (Port D)
 const TCCR0A: u16 = 0x44;
 const TCCR0B: u16 = 0x45;
 const TCNT0: u16 = 0x46;
@@ -158,6 +170,7 @@ const OCF_B: u8 = 1 << 2;
 const ADEN: u8 = 1 << 7;
 const ADSC: u8 = 1 << 6;
 const ADIF: u8 = 1 << 4;
+const ADIE: u8 = 1 << 3;
 
 // UCSR0A bits.
 const TXC0: u8 = 1 << 6;
@@ -638,6 +651,140 @@ fn sar_convert(v: f64, vref: f64) -> u16 {
         }
     }
     code.min(1023)
+}
+
+// --- Interrupt vector numbers (ATmega328P) ---
+//
+// The core multiplies these by the variant's vector stride (two words on the
+// 328P) to land on the flash address the controller jumps to.
+
+/// External interrupt request 0 (`INT0`, pin PD2).
+pub const VECTOR_INT0: u8 = 1;
+/// External interrupt request 1 (`INT1`, pin PD3).
+pub const VECTOR_INT1: u8 = 2;
+/// Pin-change interrupt 0 (`PCINT0`, bank PCMSK0 → Port B pins PCINT7:0).
+pub const VECTOR_PCINT0: u8 = 3;
+/// Pin-change interrupt 1 (`PCINT1`, bank PCMSK1 → Port C pins PCINT14:8).
+pub const VECTOR_PCINT1: u8 = 4;
+/// Pin-change interrupt 2 (`PCINT2`, bank PCMSK2 → Port D pins PCINT23:16).
+pub const VECTOR_PCINT2: u8 = 5;
+/// ADC conversion complete.
+pub const VECTOR_ADC: u8 = 21;
+
+/// `EICRA` sense modes for an external interrupt (`ISCn1:0`).
+///
+/// Mode `00` is a low-level trigger; `01` fires on any logic change; `10` on a
+/// falling edge; `11` on a rising edge.
+fn ext_edge_fires(mode: u8, old: bool, new: bool) -> bool {
+    match mode & 0x03 {
+        0 => !new,        // low level: pending while the pin is low
+        1 => old != new,  // any edge
+        2 => old && !new, // falling edge
+        _ => !old && new, // rising edge
+    }
+}
+
+/// The external (INT0/INT1) and pin-change (PCINT) interrupt controller.
+///
+/// It owns the datasheet mask/flag/control registers and the per-port level
+/// memory used for edge detection. [`Peripherals::sample_inputs`] feeds it the
+/// freshly resolved pin levels each co-sim step; the core polls
+/// [`Peripherals::take_pending_interrupt`] before fetching, so an input edge
+/// vectors like any other interrupt while staying on the engine-agnostic pin
+/// exchange (no `ee-sim` dependency crosses here).
+#[derive(Debug, Clone, Default)]
+struct ExtInt {
+    /// `EIMSK`: INT1/INT0 enables (bits 1:0).
+    eimsk: u8,
+    /// `EIFR`: INT1/INT0 flags (bits 1:0), cleared on service or write-1.
+    eifr: u8,
+    /// `EICRA`: INT1 sense in bits 3:2, INT0 sense in bits 1:0.
+    eicra: u8,
+    /// `PCICR`: pin-change bank enables PCIE2/1/0 (bits 2:0).
+    pcicr: u8,
+    /// `PCIFR`: pin-change bank flags PCIF2/1/0 (bits 2:0).
+    pcifr: u8,
+    /// `PCMSK0/1/2`: per-pin enables for banks B/C/D.
+    pcmsk: [u8; 3],
+    /// Last resolved `PINx` byte per port, the edge-detection memory.
+    prev_pin: [u8; 3],
+    /// The current resolved Port D level (INT0=PD2, INT1=PD3), for low-level
+    /// sense which is evaluated live rather than latched.
+    cur_portd: u8,
+    /// Whether [`prev_pin`](Self::prev_pin) has been primed from a first sample
+    /// (so the initial sample never manufactures a phantom edge).
+    primed: bool,
+}
+
+impl ExtInt {
+    /// Fold the newly resolved per-port pin levels in, raising any external /
+    /// pin-change flags whose enabled pins saw a qualifying change. `live` bounds
+    /// the ports the part bonds out.
+    fn update(&mut self, pins: [u8; 3], live: usize) {
+        self.cur_portd = pins[Port::D as usize];
+        if !self.primed {
+            self.prev_pin = pins;
+            self.primed = true;
+            return;
+        }
+        for (port, &new) in pins.iter().enumerate().take(live.min(3)) {
+            let old = self.prev_pin[port];
+            let changed = old ^ new;
+            // Pin-change banks fire on any change of an enabled pin.
+            if changed & self.pcmsk[port] != 0 {
+                self.pcifr |= 1 << port;
+            }
+            // INT0 (PD2) / INT1 (PD3) live on Port D. Edge senses latch INTFn
+            // here; low-level sense is a live condition handled in `take`.
+            if port == Port::D as usize {
+                for (int_idx, bit) in [2u8, 3u8].into_iter().enumerate() {
+                    let mode = (self.eicra >> (int_idx * 2)) & 0x03;
+                    if mode != 0 && changed & (1 << bit) != 0 {
+                        let o = old & (1 << bit) != 0;
+                        let n = new & (1 << bit) != 0;
+                        if ext_edge_fires(mode, o, n) {
+                            self.eifr |= 1 << int_idx;
+                        }
+                    }
+                }
+            }
+            self.prev_pin[port] = new;
+        }
+    }
+
+    /// The highest-priority (lowest-vector) interrupt that is both pending and
+    /// enabled, clearing the latched flag as the controller would on dispatch.
+    /// `adc_pending` carries the ADC's already-latched enable+flag so the
+    /// ADC-complete vector is ordered in alongside.
+    fn take(&mut self, adc_pending: bool) -> Option<u8> {
+        for (idx, vector) in [VECTOR_INT0, VECTOR_INT1].into_iter().enumerate() {
+            let bit = 1 << idx;
+            if self.eimsk & bit == 0 {
+                continue;
+            }
+            let mode = (self.eicra >> (idx * 2)) & 0x03;
+            if mode == 0 {
+                // Low-level: active (and re-triggering) while the pin is low.
+                if self.cur_portd & (1 << (idx + 2)) == 0 {
+                    return Some(vector);
+                }
+            } else if self.eifr & bit != 0 {
+                self.eifr &= !bit;
+                return Some(vector);
+            }
+        }
+        for (idx, vector) in [VECTOR_PCINT0, VECTOR_PCINT1, VECTOR_PCINT2]
+            .into_iter()
+            .enumerate()
+        {
+            let bit = 1 << idx;
+            if self.pcicr & bit != 0 && self.pcifr & bit != 0 {
+                self.pcifr &= !bit;
+                return Some(vector);
+            }
+        }
+        adc_pending.then_some(VECTOR_ADC)
+    }
 }
 
 /// The USART0 transmitter (plus a minimal receive buffer).
@@ -1165,6 +1312,8 @@ pub struct Peripherals {
     usart: Usart,
     spi: Spi,
     twi: Twi,
+    /// External (INT0/INT1) and pin-change (PCINT) interrupt controller.
+    ext: ExtInt,
     /// Digital-input boundary: how a sampled node voltage becomes a logic level.
     thresholds: InputThresholds,
     /// Digital-output boundary: how a driven pin becomes a Thévenin source.
@@ -1281,6 +1430,34 @@ impl Peripherals {
         }
         // The SPI master latches MISO (PB4) from the resolved pin level.
         self.spi.miso_in = self.port(Port::B).pin_level(SPI_MISO_BIT);
+        // Resolve the freshly sampled levels into external / pin-change edges.
+        let live = self.live_port_count();
+        let pins = [
+            self.ports[0].pin_byte(),
+            self.ports[1].pin_byte(),
+            self.ports[2].pin_byte(),
+        ];
+        self.ext.update(pins, live);
+    }
+
+    /// Take the highest-priority peripheral interrupt that is both flagged and
+    /// enabled, clearing its flag as the controller would on dispatch, or `None`
+    /// if nothing is pending.
+    ///
+    /// Covers the external (INT0/INT1) and pin-change (PCINT0..2) controller fed
+    /// by [`sample_inputs`](Self::sample_inputs), plus the ADC-complete interrupt
+    /// (`ADIE`). The core calls this before fetching, so an input edge vectors
+    /// through the same latched path as a manually requested interrupt — the
+    /// analog value only ever crosses as a plain pin voltage, never as an
+    /// `ee-sim` type.
+    pub fn take_pending_interrupt(&mut self) -> Option<u8> {
+        let adc_pending = self.adc.adcsra & ADIE != 0 && self.adc.adcsra & ADIF != 0;
+        let vector = self.ext.take(adc_pending)?;
+        if vector == VECTOR_ADC {
+            // The ADC flag is cleared by hardware when its vector is serviced.
+            self.adc.adcsra &= !ADIF;
+        }
+        Some(vector)
     }
 
     /// The digital-input thresholds this core samples node voltages through.
@@ -1521,6 +1698,15 @@ impl Peripherals {
             ADMUX => self.adc.admux,
             DIDR0 => 0,
 
+            EIMSK => self.ext.eimsk,
+            EIFR => self.ext.eifr,
+            EICRA => self.ext.eicra,
+            PCICR => self.ext.pcicr,
+            PCIFR => self.ext.pcifr,
+            PCMSK0 => self.ext.pcmsk[0],
+            PCMSK1 => self.ext.pcmsk[1],
+            PCMSK2 => self.ext.pcmsk[2],
+
             UCSR0A => self.usart.ucsr_a,
             UCSR0B => self.usart.ucsr_b,
             UCSR0C => self.usart.ucsr_c,
@@ -1604,6 +1790,17 @@ impl Peripherals {
             ADCSRB => self.adc.adcsrb = val,
             ADMUX => self.adc.admux = val,
             DIDR0 => {}
+
+            // External / pin-change interrupts. EIFR/PCIFR flag bits are cleared
+            // by writing a 1 to them; the control/mask registers write through.
+            EIMSK => self.ext.eimsk = val,
+            EIFR => self.ext.eifr &= !val,
+            EICRA => self.ext.eicra = val,
+            PCICR => self.ext.pcicr = val,
+            PCIFR => self.ext.pcifr &= !val,
+            PCMSK0 => self.ext.pcmsk[0] = val,
+            PCMSK1 => self.ext.pcmsk[1] = val,
+            PCMSK2 => self.ext.pcmsk[2] = val,
 
             UCSR0A => {
                 // TXC0 is cleared by writing a 1; the other writable bits follow.
@@ -2026,5 +2223,105 @@ mod tests {
             TW_MT_SLA_NACK,
             "no ACK ⇒ SLA+W NACK status"
         );
+    }
+
+    /// Drive `pin`'s input voltage and re-sample the peripherals (the co-sim
+    /// loop's inbound half), so edge detection sees the change.
+    fn sample_pin(p: &mut Peripherals, io: &mut PinIo, pin: PinId, volts: f64) {
+        io.set_input(pin, volts);
+        p.sample_inputs(io);
+    }
+
+    #[test]
+    fn pin_change_flag_sets_on_an_enabled_pin_edge() {
+        let mut p = Peripherals::new();
+        let mut io = PinIo::new(PIN_COUNT);
+        // Enable PCINT on PD4 (bank 2) only.
+        p.write(PCMSK2, 1 << 4);
+        p.write(PCICR, 1 << 2); // PCIE2
+                                // Prime at low, then rise PD4.
+        sample_pin(&mut p, &mut io, pin_id(Port::D, 4), 0.0);
+        assert_eq!(p.read(PCIFR).unwrap() & (1 << 2), 0, "no edge yet");
+        assert_eq!(p.take_pending_interrupt(), None);
+
+        sample_pin(&mut p, &mut io, pin_id(Port::D, 4), 5.0);
+        assert_eq!(
+            p.read(PCIFR).unwrap() & (1 << 2),
+            1 << 2,
+            "rising edge flags"
+        );
+        assert_eq!(
+            p.take_pending_interrupt(),
+            Some(VECTOR_PCINT2),
+            "PCINT2 vector is taken and the flag cleared on dispatch"
+        );
+        assert_eq!(
+            p.take_pending_interrupt(),
+            None,
+            "flag cleared after service"
+        );
+
+        // A change on a *masked-out* pin does not flag the bank.
+        sample_pin(&mut p, &mut io, pin_id(Port::D, 5), 5.0);
+        assert_eq!(p.read(PCIFR).unwrap() & (1 << 2), 0, "PD5 not in PCMSK2");
+    }
+
+    #[test]
+    fn external_int0_honours_the_eicra_sense() {
+        let mut p = Peripherals::new();
+        let mut io = PinIo::new(PIN_COUNT);
+        // INT0 (PD2), rising-edge sense (ISC01:00 = 11), enabled.
+        p.write(EICRA, 0b11);
+        p.write(EIMSK, 1 << 0);
+        sample_pin(&mut p, &mut io, pin_id(Port::D, 2), 0.0);
+
+        // A falling (held-low) sample must not fire a rising-edge INT0.
+        assert_eq!(p.take_pending_interrupt(), None);
+
+        sample_pin(&mut p, &mut io, pin_id(Port::D, 2), 5.0);
+        assert_eq!(
+            p.take_pending_interrupt(),
+            Some(VECTOR_INT0),
+            "rising edge on PD2 vectors to INT0"
+        );
+        // Falling back does not fire a rising-edge interrupt.
+        sample_pin(&mut p, &mut io, pin_id(Port::D, 2), 0.0);
+        assert_eq!(p.take_pending_interrupt(), None);
+    }
+
+    #[test]
+    fn disabled_banks_never_vector() {
+        let mut p = Peripherals::new();
+        let mut io = PinIo::new(PIN_COUNT);
+        // PCMSK set but PCICR bank disabled: the flag latches, nothing vectors.
+        p.write(PCMSK0, 0xFF);
+        sample_pin(&mut p, &mut io, pin_id(Port::B, 1), 0.0);
+        sample_pin(&mut p, &mut io, pin_id(Port::B, 1), 5.0);
+        assert_eq!(
+            p.read(PCIFR).unwrap() & 1,
+            1,
+            "flag latches even when disabled"
+        );
+        assert_eq!(p.take_pending_interrupt(), None, "no enable ⇒ no vector");
+    }
+
+    #[test]
+    fn adc_complete_vectors_only_with_adie() {
+        let mut p = Peripherals::new();
+        p.set_adc_input(0, 2.5);
+        // Enable + interrupt-enable + start a conversion (prescaler /2).
+        p.write(ADCSRA, ADEN | ADIE | ADSC);
+        p.tick(13 * 2);
+        assert_eq!(
+            p.read(ADCSRA).unwrap() & ADIF,
+            ADIF,
+            "conversion done, ADIF set"
+        );
+        assert_eq!(
+            p.take_pending_interrupt(),
+            Some(VECTOR_ADC),
+            "ADIE + ADIF vectors to the ADC handler and clears ADIF"
+        );
+        assert_eq!(p.read(ADCSRA).unwrap() & ADIF, 0, "ADIF cleared on service");
     }
 }

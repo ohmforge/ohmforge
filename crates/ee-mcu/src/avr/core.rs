@@ -802,8 +802,15 @@ impl Avr {
 impl McuCore for Avr {
     fn step(&mut self) {
         // Service a pending interrupt before fetching the next instruction.
+        // Peripheral-sourced requests (external / pin-change edges, ADC-complete)
+        // take priority over a manually requested vector, matching the datasheet
+        // ordering since they carry the lower vector numbers.
         if self.sreg.i {
-            if let Some(v) = self.take_pending() {
+            if let Some(v) = self
+                .periph
+                .take_pending_interrupt()
+                .or_else(|| self.take_pending())
+            {
                 self.service_interrupt(v);
                 self.periph.tick(5); // the 5 dispatch cycles drive peripherals too
                 return;
