@@ -147,7 +147,7 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 
 - [~] **CP-SIM-M6.1** (sim-core) Mutual inductance / transformers (coupled inductors via coupling coefficient K), stamped in transient + AC. Circuit-level relation (e.g. `Circuit::couple`), no new data-carrying `PartKind`. — *gate:* ideal 2:1 transformer (K=1) steps 10 Vpp → ~5 Vpp in transient; K<1 shows leakage; AC transfer matches the turns ratio.
 - [~] **CP-SIM-M6.2** (sim-core) Nonlinear convergence aids: gmin stepping + source ramping fallback for the op-point. — *gate:* a circuit that fails plain Newton converges via gmin stepping to the correct solution; easy circuits unchanged (no extra iterations) and the golden suite stays bit-for-bit.
-- [~] **CP-BRD-M6.1** (boards) Closed-loop MCU↔analog co-sim: AVR ADC samples a real `ee-sim` node and firmware reacts (threshold → GPIO) + external pin-change interrupts. ADC injected via the `PinIo`/co-sim bridge — no `ee-sim` dep in `ee-mcu`. — *gate:* firmware reads an ADC value tracking an analog divider and sets a GPIO at a threshold; a pin-change ISR fires on an input edge.
+- [x] **CP-BRD-M6.1** (boards) Closed-loop MCU↔analog co-sim: AVR ADC samples a real `ee-sim` node and firmware reacts (threshold → GPIO) + external pin-change interrupts. ADC injected via the `PinIo`/co-sim bridge — no `ee-sim` dep in `ee-mcu`. — *gate:* `adc_threshold_drives_a_gpio_{high_above,low_below}_the_threshold` + `adc_threshold_tracks_a_moving_analog_node` close the loop (A0 → ADC → threshold → D8); `rising_edge_fires_int0_isr` + `pin_change_isr_fires_on_either_edge` vector INT0/PCINT2 handlers on input edges (`ee-mcu/tests/closed_loop.rs` + periph unit tests); `ee/tests/closed_loop_cosim.rs` wires a real `ee-sim` divider node to the ADC (3.33 V→HIGH, 1.67 V→LOW). An `ExtInt` controller (EICRA/EIMSK/EIFR/PCICR/PCMSK0-2/PCIFR + ADIE) feeds the core via `Peripherals::take_pending_interrupt`; `ee-mcu` stays `ee-sim`-free.
 - [x] **CP-AF-M6.1** (ai-fmt) Native-project device-model param round-trip: diode `IS/N/RS`, BJT `IS/BF/BR`, MOSFET `VTO/KP/LAMBDA` survive `save`→`load` byte-identically (`.model`-style directive). — *gate:* `custom_device_models_round_trip_exactly` — a custom diode+BJT+MOSFET save→load→save is byte-identical and the loaded models equal the originals. _(Closes the documented M5 follow-up.)_
 - [x] **CP-AF-M6.2** (ai-fmt) AI auto-tune: closed-loop component-value optimization against a measured spec via the verify loop (deterministic gradient-free search), offline. — *gate:* `auto_tune_converges_on_the_divider_target` — from a wrong R2 the bisection lands v(out) within 1e-4 V of 3.3 V on a real sim, deterministically, no network/key.
 - [~] **CP-UX-M6.1** (ui-shell) Live interactive tuning + current-flow animation: adjust a selected component through the app event loop and re-solve live; animate branch-current direction/magnitude on the overlay (deferred since M1). — *gate:* a tune event changes a component and the recomputed op-point/overlay reflects it; current-flow arrows computed from branch currents; asserted on data, no tty.
@@ -161,12 +161,12 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 | Track | Done | In progress | Total |
 |---|---|---|---|
 | sim-core | 21 | 2 | 23 |
-| boards | 15 | 1 | 16 |
+| boards | 16 | 0 | 16 |
 | ui-shell | 16 | 1 | 17 |
-| ai-fmt | 14 | 2 | 16 |
-| platform | 6 | 1 | 7 |
+| ai-fmt | 16 | 0 | 16 |
+| platform | 6 | 0 | 7 |
 | web | 5 | 0 | 5 |
-| **Total** | **77** | **7** | **84** |
+| **Total** | **80** | **3** | **84** |
 
 _**67/67 — M0 through M4 all complete** (M0–M3 tagged v0.1.0; M4 adds the rest). M4 delivered the **plugin device-model API** + an **instrument/block plugin trait**, a **KLU-class ordered/reusable sparse solver** and **multithreaded analyses**, a **Cortex-M3/M4 (Thumb-2)** core with an STM32 board, **SPICE `.model` import** + a vendor model library, and **shareable circuit links** in the browser. Deferred by design: real-time collaboration, the QEMU full-SBC bridge, and full vendor-SPICE `.model` fidelity — the standing M-next horizon._
 
