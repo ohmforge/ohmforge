@@ -172,17 +172,32 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 
 ---
 
+## M8 — hardening & reach  🚧 in progress → plan: [`M8-PLAN.md`](M8-PLAN.md)
+
+_Post-v0.5.0 refinement after hands-on use. A four-track read-only QA audit found zero crashes; M8 fixes the confirmed defects and closes the reachability gaps._
+
+- [~] **CP-SIM-M8.1** (sim-core) Linear AC/noise/`.TF`/DC-sweep solve circuits with a DC-floating node (capacitive divider, AC-coupled subnode, open line) instead of spuriously erroring `Singular` — skip the DC-bias gate for linear circuits and/or carry a residual `GMIN`; also guard the lossless line against a step coarser than its delay. — *gate:* a 1 nF–1 nF capacitive divider's AC gives `v(mid)=0.5`; a source-matched open line solves in AC; golden/determinism suite stays bit-for-bit.
+- [~] **CP-UX-M8.1** (ui-shell) TUI hardening: kill the 8 fps full-`Clear` flicker (diff/redraw-on-change, no idle tick churn); separate playback from the live overlay (scrubbing flag — DC op-point + live-tune feedback work again); size the scope to its pane (no 72×16 truncation); edit chrome over overlay; input caret; palette click handling. — *gate:* tests prove no idle redraw churn, overlay reflects a tune with a transient loaded, scope renders in 80×24 without clipping the axis.
+- [~] **CP-UX-M8.2** (ui-shell) Shell reach + correctness: `run ac/dc/noise/mc/tf` (+ `tran`/`op`); multi-terminal parts (BJT/MOSFET/controlled sources) + a waveform verb + tolerance/tempco/temp; fix the O(N²) undo (bounded/diff snapshots, capped `repeat`); correct the `expected R/C/L/V` message, dup-`probe` undo no-op, duration validation, degenerate `add`, tab-completion, `help`. — *gate:* tests drive `run ac`/`dc`/`tf`, place+solve a BJT amp from eesh, a 100k-part script finishes fast, edge cases return clean errors.
+- [~] **CP-UX-M8.3** (ui-shell) Instrument rendering: FFT rejects/resamples a non-uniform (adaptive-transient) grid; Bode `−3 dB` corner references the passband peak (high-/band-pass correct); scope axis width counts chars not bytes (`µs`/`Ω` align). — *gate:* tests on a non-uniform grid, a high-pass Bode, and a `µs` timebase.
+- [~] **CP-AF-M8.1** (ai-fmt) AI correctness: LED-no-series-resistor DRC requires a resistor on the LED's conduction path (exclude `GROUND`, reject parallel-only); `no_path_to_ground` treats a cap as a DC open; log-symmetric debug fault ranking; tool-loop cap returns the partial transcript; response parser tolerates unknown blocks (`thinking`). — *gate:* regression tests — unprotected LED over a shared ground is flagged; an AC-coupled-only node reported floating; parser survives a `thinking` block.
+- [~] **CP-AF-M8.2** (ai-fmt) Live-transport robustness + honest docs: request/connect timeout on the `http` client (a stalled server can't hang the CLI); fix the stale guide/crate docs that call the live transport a non-sending stub. — *gate:* a timeout test (unresponsive socket → bounded `AiError::Transport`, no hang); docs updated.
+- [ ] **CP-PLAT.6** (platform) Wire the copilot + analyses into the `ee` binary (on `main` during reconcile): `ee ask`, `ee review`/`ee drc` (offline, no key), `ee design`/`ee debug`/`ee tune` (offline default when `ANTHROPIC_API_KEY` absent); new `run` analyses reachable end-to-end; guides refreshed. — *gate:* `ee ask …` runs offline with no key and returns a grounded answer; help lists the AI subcommands.
+- [ ] **CP-SHIP.4** (platform) Polish & tag **v0.6.0**: full CI-parity gate sweep (incl. `http`/`relay` feature jobs), README refreshed to M0–M8, tag.
+
+---
+
 ### Progress summary
 
 | Track | Done | In progress | Total |
 |---|---|---|---|
-| sim-core | 25 | 0 | 25 |
+| sim-core | 25 | 1 | 26 |
 | boards | 17 | 0 | 17 |
-| ui-shell | 18 | 0 | 18 |
-| ai-fmt | 17 | 0 | 17 |
-| platform | 8 | 0 | 8 |
+| ui-shell | 18 | 3 | 21 |
+| ai-fmt | 17 | 2 | 19 |
+| platform | 8 | 0 | 10 |
 | web | 6 | 0 | 6 |
-| **Total** | **91** | **0** | **91** |
+| **Total** | **91** | **6** | **99** |
 
 _**67/67 — M0 through M4 all complete** (M0–M3 tagged v0.1.0; M4 adds the rest). M4 delivered the **plugin device-model API** + an **instrument/block plugin trait**, a **KLU-class ordered/reusable sparse solver** and **multithreaded analyses**, a **Cortex-M3/M4 (Thumb-2)** core with an STM32 board, **SPICE `.model` import** + a vendor model library, and **shareable circuit links** in the browser. Deferred by design: real-time collaboration, the QEMU full-SBC bridge, and full vendor-SPICE `.model` fidelity — the standing M-next horizon._
 
