@@ -69,6 +69,10 @@ pub struct Shell {
     undo_stack: Vec<Snapshot>,
     /// Named checkpoints the user can `restore` to at any time.
     checkpoints: HashMap<String, Snapshot>,
+    /// The signals from the most recent transient `run`, cached so the live TUI can
+    /// scrub them as a playback (`CP-UX-M7.1`). Not part of a [`Snapshot`] — it is a
+    /// derived result, like the op-point, so `undo`/`restore` leave it untouched.
+    last_transient: Vec<ee_core::signal::Signal>,
 }
 
 /// A restorable capture of the shell's mutable session state.
@@ -98,6 +102,7 @@ impl Shell {
             probes: Vec::new(),
             undo_stack: Vec::new(),
             checkpoints: HashMap::new(),
+            last_transient: Vec::new(),
         }
     }
 
@@ -546,7 +551,7 @@ impl Shell {
     }
 
     /// `run [tran [<dur>]]` / `run op` — simulate and render.
-    fn cmd_run(&self, args: &[&str]) -> Result<String, ShellError> {
+    fn cmd_run(&mut self, args: &[&str]) -> Result<String, ShellError> {
         match args {
             [] | ["tran"] => self.run_transient(DEFAULT_DURATION),
             ["tran", dur] => {
@@ -566,9 +571,12 @@ impl Shell {
 
     // ── run: parse → sim → plot ───────────────────────────────────────────
 
-    /// Simulate a transient and render each probed node as a braille scope.
-    fn run_transient(&self, duration: f64) -> Result<String, ShellError> {
+    /// Simulate a transient and render each probed node as a braille scope. The
+    /// solved signals are also cached in `last_transient` so the live TUI can scrub
+    /// them as a playback (`CP-UX-M7.1`).
+    fn run_transient(&mut self, duration: f64) -> Result<String, ShellError> {
         if self.probes.is_empty() {
+            self.last_transient.clear();
             return Ok("nothing probed — add `probe <node>` to see a waveform.".to_string());
         }
         let signals = Engine::new()
@@ -597,6 +605,15 @@ impl Shell {
                 None => out.push_str(&format!("  v({node}) is ground (0 V) — nothing to plot.\n")),
             }
         }
+        // Cache the probed-node series for the scrubbable playback, keeping only the
+        // signals the user probed (the overlay annotates them by `v(n<net>)` name).
+        let cached: Vec<ee_core::signal::Signal> = self
+            .probes
+            .iter()
+            .map(|node| self.signal_name(node))
+            .filter_map(|name| signals.iter().find(|s| s.name == name).cloned())
+            .collect();
+        self.last_transient = cached;
         Ok(out)
     }
 
@@ -747,6 +764,13 @@ impl ee_tui::Backend for Shell {
             Ok(signals) => ee_tui::NodeVoltages::from_signals(&signals),
             Err(_) => ee_tui::NodeVoltages::new(),
         }
+    }
+
+    /// Hand the live TUI the signals from the most recent transient `run` so it can
+    /// scrub them as a playback (`CP-UX-M7.1`). Empty until a transient has run (or
+    /// after one that probed nothing); the cache is refreshed by `run_transient`.
+    fn transient(&self) -> Vec<ee_core::signal::Signal> {
+        self.last_transient.clone()
     }
 }
 
