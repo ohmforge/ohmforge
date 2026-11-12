@@ -513,8 +513,8 @@ fn repl(shell: &mut Shell) -> rustyline::Result<()> {
         .completion_type(CompletionType::List)
         .auto_add_history(true)
         .build();
-    let mut rl: Editor<EeHelper, DefaultHistory> = Editor::with_config(config)?;
-    rl.set_helper(Some(EeHelper::new()));
+    let mut rl: Editor<EeshHelper, DefaultHistory> = Editor::with_config(config)?;
+    rl.set_helper(Some(EeshHelper::new()));
     let history = history_path();
     let _ = rl.load_history(&history);
 
@@ -557,13 +557,13 @@ fn repl(shell: &mut Shell) -> rustyline::Result<()> {
     Ok(())
 }
 
-/// Where the persistent command history lives (`~/.ee_history`).
+/// Where the persistent command history lives (`~/.eesh_history`).
 fn history_path() -> PathBuf {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_default()
-        .join(".ee_history")
+        .join(".eesh_history")
 }
 
 /// The analysis keywords completed after `run` (mirrors the shell's `run` verbs).
@@ -572,14 +572,14 @@ const RUN_ANALYSES: &[&str] = &["tran", "op", "ac", "dc", "noise", "mc", "tf"];
 /// Tab completion: commands in the first position; after that, node names, part
 /// references, checkpoint names, or `run`'s analysis keywords, as the context
 /// warrants (`CP-UX-M8.2`).
-struct EeHelper {
+struct EeshHelper {
     commands: Vec<String>,
     nodes: Vec<String>,
     parts: Vec<String>,
     checkpoints: Vec<String>,
 }
 
-impl EeHelper {
+impl EeshHelper {
     fn new() -> Self {
         Self {
             commands: Shell::COMMANDS.iter().map(|s| (*s).to_string()).collect(),
@@ -608,7 +608,7 @@ impl EeHelper {
     }
 }
 
-impl Completer for EeHelper {
+impl Completer for EeshHelper {
     type Candidate = Pair;
 
     fn complete(
@@ -652,9 +652,9 @@ impl Completer for EeHelper {
 }
 
 // The remaining Helper facets use their default (no-op) behaviour.
-impl Hinter for EeHelper {
+impl Hinter for EeshHelper {
     type Hint = String;
 }
-impl Highlighter for EeHelper {}
-impl Validator for EeHelper {}
-impl Helper for EeHelper {}
+impl Highlighter for EeshHelper {}
+impl Validator for EeshHelper {}
+impl Helper for EeshHelper {}
