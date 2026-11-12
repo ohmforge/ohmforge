@@ -268,7 +268,13 @@ impl Oscilloscope {
             .zip(&bounds)
             .flat_map(|(ch, &(lo, hi))| {
                 let sym = ch.unit.symbol();
-                [fmt_num(hi).len() + sym.len(), fmt_num(lo).len() + sym.len()]
+                // Count display columns (chars), not bytes: `µ`/`Ω` unit symbols
+                // are multi-byte in UTF-8, so `.len()` would over-size the gutter.
+                let w = sym.chars().count();
+                [
+                    fmt_num(hi).chars().count() + w,
+                    fmt_num(lo).chars().count() + w,
+                ]
             })
             .max()
             .unwrap_or(1)
@@ -329,7 +335,11 @@ impl Oscilloscope {
         out.push('\n');
         let xlo = fmt_eng(0.0, "s");
         let xhi = fmt_eng(span, "s");
-        let pad = plot_w.saturating_sub(xlo.len() + xhi.len()).max(1);
+        // Count chars, not bytes: a `µs`/`ms` label is multi-byte, so a byte count
+        // would under-pad and push the right label past the plot edge.
+        let pad = plot_w
+            .saturating_sub(xlo.chars().count() + xhi.chars().count())
+            .max(1);
         out.push_str(&fit(
             &format!("{:>gutter$}  {xlo}{}{xhi}", "", " ".repeat(pad)),
             self.width,
@@ -711,6 +721,62 @@ mod tests {
     fn empty_scope_renders_without_panicking() {
         let out = Oscilloscope::new("empty").size(24, 4).render();
         assert!(out.contains("empty"));
+    }
+
+    /// Regression (`CP-UX-M8.3`): a `µs`-scale timebase produces a multi-byte `µ`
+    /// in the x-axis label. The axis width math must count display *chars*, not
+    /// UTF-8 *bytes*, or the right-hand time label falls short of the rule's right
+    /// edge. The x-label line and the axis rule line must span the same number of
+    /// cells (before this fix the label line was one char short per `µ`).
+    #[test]
+    fn micro_timebase_axis_labels_align_to_the_rule() {
+        // 40 µs span → `fmt_eng` renders "40µs" (a multi-byte `µ`).
+        let (f, dt, n) = (100_000.0, 1e-7, 600);
+        let out = Oscilloscope::new("scope")
+            .size(48, 6)
+            .timebase(Timebase::new(40e-6))
+            .trigger(Trigger::FreeRun)
+            .channel(sine("v(sig)", f, dt, n, 0.0))
+            .render();
+        let lines: Vec<&str> = out.lines().collect();
+        let label = *lines.last().expect("an x-label line");
+        let rule = lines[lines.len() - 2];
+        assert!(label.contains('µ'), "the span label uses µs: {label:?}");
+        assert!(rule.contains('\u{2514}'), "the rule row uses └: {rule:?}");
+        assert_eq!(
+            label.chars().count(),
+            rule.chars().count(),
+            "x-label must span the same cells as the rule:\n{rule}\n{label}"
+        );
+    }
+
+    /// Regression (`CP-UX-M8.3`): a channel whose unit symbol is multi-byte (`Ω`)
+    /// must not over-size the y-axis gutter. The gutter width is measured in chars,
+    /// so an `Ω` channel and an identical `V` channel leave the same plot width —
+    /// i.e. the braille plot interior is the same number of cells wide.
+    #[test]
+    fn ohm_unit_gutter_matches_an_ascii_unit() {
+        let (f, dt, n) = (1_000.0, 1e-5, 600);
+        let plot_cols = |unit: Unit| {
+            let x: Vec<f64> = (0..n).map(|j| j as f64 * dt).collect();
+            let y: Vec<f64> = (0..n).map(|j| (TAU * f * j as f64 * dt).sin()).collect();
+            let out = Oscilloscope::new("scope")
+                .size(48, 6)
+                .timebase(Timebase::new(2e-3))
+                .trigger(Trigger::FreeRun)
+                .channel(Signal::time("v(sig)", unit, x, y))
+                .render();
+            // The axis rule row's ─ run is the plot interior width.
+            out.lines()
+                .find(|l| l.contains('\u{2514}'))
+                .map(|l| l.chars().filter(|&c| c == '\u{2500}').count())
+                .unwrap()
+        };
+        assert_eq!(
+            plot_cols(Unit::Ohm),
+            plot_cols(Unit::Volt),
+            "a multi-byte unit symbol must not steal plot columns"
+        );
     }
 
     // Captured from a passing run; regenerate by printing `a` in the trigger test.

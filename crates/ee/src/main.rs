@@ -456,10 +456,17 @@ fn history_path() -> PathBuf {
         .join(".ee_history")
 }
 
-/// Tab completion: commands in the first position, known node names after.
+/// The analysis keywords completed after `run` (mirrors the shell's `run` verbs).
+const RUN_ANALYSES: &[&str] = &["tran", "op", "ac", "dc", "noise", "mc", "tf"];
+
+/// Tab completion: commands in the first position; after that, node names, part
+/// references, checkpoint names, or `run`'s analysis keywords, as the context
+/// warrants (`CP-UX-M8.2`).
 struct EeHelper {
     commands: Vec<String>,
     nodes: Vec<String>,
+    parts: Vec<String>,
+    checkpoints: Vec<String>,
 }
 
 impl EeHelper {
@@ -467,17 +474,27 @@ impl EeHelper {
         Self {
             commands: Shell::COMMANDS.iter().map(|s| (*s).to_string()).collect(),
             nodes: Vec::new(),
+            parts: Vec::new(),
+            checkpoints: Vec::new(),
         }
     }
 
-    /// Pull the latest named nodes from the shell so completion stays current.
+    /// Pull the latest nodes, part references, and checkpoint names from the shell
+    /// so completion stays current after every command.
     fn refresh(&mut self, shell: &Shell) {
-        self.nodes = shell
-            .node_names()
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect();
-        self.nodes.sort();
+        let sorted = |mut v: Vec<String>| {
+            v.sort();
+            v
+        };
+        self.nodes = sorted(shell.node_names().iter().map(|s| s.to_string()).collect());
+        self.parts = sorted(shell.part_refs().iter().map(|s| s.to_string()).collect());
+        self.checkpoints = sorted(
+            shell
+                .checkpoint_names()
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
     }
 }
 
@@ -492,18 +509,32 @@ impl Completer for EeHelper {
     ) -> rustyline::Result<(usize, Vec<Pair>)> {
         let start = line[..pos].rfind(char::is_whitespace).map_or(0, |i| i + 1);
         let word = &line[start..pos];
-        // First token → a command; later tokens → a node name.
-        let pool: &[String] = if start == 0 {
-            &self.commands
+        // Which token are we on, and what was the command (first token)?
+        let before: Vec<&str> = line[..start].split_whitespace().collect();
+        let token_index = before.len();
+        let command = before.first().copied().unwrap_or("");
+
+        // Build the candidate pool from the context.
+        let pool: Vec<&str> = if token_index == 0 {
+            self.commands.iter().map(String::as_str).collect()
+        } else if command == "run" && token_index == 1 {
+            RUN_ANALYSES.to_vec()
+        } else if command == "restore" {
+            self.checkpoints.iter().map(String::as_str).collect()
         } else {
-            &self.nodes
+            // add/wire/probe/remove/set operate on nodes and part references.
+            self.nodes
+                .iter()
+                .chain(&self.parts)
+                .map(String::as_str)
+                .collect()
         };
         let candidates = pool
             .iter()
             .filter(|c| c.starts_with(word))
             .map(|c| Pair {
-                display: c.clone(),
-                replacement: c.clone(),
+                display: (*c).to_string(),
+                replacement: (*c).to_string(),
             })
             .collect();
         Ok((start, candidates))

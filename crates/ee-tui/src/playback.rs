@@ -77,6 +77,12 @@ impl Playback {
         self.len() == 0
     }
 
+    /// The loaded transient series (for re-plotting the scope at the live pane
+    /// size). Real, time-domain only — the same signals the playhead scrubs.
+    pub fn signals(&self) -> &[Signal] {
+        &self.signals
+    }
+
     /// The number of playable frames — the shortest common sample count, so every
     /// loaded series has a value at every playhead position.
     pub fn len(&self) -> usize {

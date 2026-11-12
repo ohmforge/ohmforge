@@ -151,16 +151,33 @@ impl<'a> Bode<'a> {
     }
 }
 
-/// The −3 dB corner frequency: where the magnitude first falls 3 dB below its
-/// low-frequency (passband) level. Interpolated in log-frequency space. `None`
-/// for a non-frequency input or a response that never drops 3 dB.
+/// The −3 dB corner frequency: the first frequency at which the magnitude is
+/// 3 dB below the **passband peak**. Interpolated in log-frequency space. `None`
+/// for a non-frequency input or a response that never departs 3 dB from its peak.
+///
+/// The reference is the peak magnitude, not the lowest-frequency bin, so the
+/// corner is correct for high-pass and band-pass responses too (`CP-UX-M8.3`): a
+/// low-pass crosses the −3 dB level *falling* as frequency rises, a high-pass
+/// crosses it *rising*, and either direction is detected. For a monotonic
+/// low-pass the peak is the DC bin, so this reduces to the former behaviour.
 pub fn corner_3db(sig: &Signal) -> Option<f64> {
     let c = curves(sig)?;
-    let reference = c.mag_db[0];
-    let target = reference - 3.0;
+    let peak = c
+        .mag_db
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .fold(f64::NEG_INFINITY, f64::max);
+    if !peak.is_finite() {
+        return None;
+    }
+    let target = peak - 3.0;
     for i in 1..c.mag_db.len() {
         let (m0, m1) = (c.mag_db[i - 1], c.mag_db[i]);
-        if m0 > target && m1 <= target {
+        // A crossing of the −3 dB level in either direction: falling (low-pass) or
+        // rising (high-pass). `>=`/`<` on one side and the mirror on the other.
+        let crosses = (m0 >= target && m1 < target) || (m0 < target && m1 >= target);
+        if crosses {
             let dm = m1 - m0;
             let lf = if dm.abs() < f64::EPSILON {
                 c.log_f[i]
@@ -400,6 +417,43 @@ mod tests {
         let db_at = |f: f64| (Complex::ONE / Complex::new(1.0, f / fc)).magnitude_db();
         let slope = db_at(100.0 * fc) - db_at(10.0 * fc);
         assert!((slope + 20.0).abs() < 0.2, "roll-off {slope} dB/decade");
+    }
+
+    /// A first-order RC high-pass response `H(f) = (j f/fc) / (1 + j f/fc)` on the
+    /// same log grid. Its passband is at *high* frequency, so the −3 dB corner is
+    /// found by crossing the (peak − 3 dB) level *rising*, not by the lowest bin.
+    fn rc_highpass(fc: f64) -> Signal {
+        let freqs: Vec<f64> = (0..=60).map(|i| 10f64.powf(i as f64 / 10.0)).collect();
+        let data: Vec<Complex> = freqs
+            .iter()
+            .map(|&f| {
+                let jw = Complex::new(0.0, f / fc);
+                jw / (Complex::ONE + jw)
+            })
+            .collect();
+        Signal::freq("H", Unit::None, freqs, data)
+    }
+
+    /// Regression (`CP-UX-M8.3`): the corner of a **high-pass** must land near `fc`.
+    /// Referencing the lowest-frequency bin (the old behaviour) put the passband in
+    /// the stopband and never found a −3 dB crossing (or found a spurious one).
+    #[test]
+    fn highpass_corner_references_the_passband_peak() {
+        let fc = 1_000.0;
+        let sig = rc_highpass(fc);
+        let corner = corner_3db(&sig).expect("a high-pass corner");
+        assert!(
+            (corner - fc).abs() / fc < 0.05,
+            "high-pass corner {corner} Hz vs fc {fc}"
+        );
+        // The passband is at high frequency (≈0 dB), the DC bin is deep in the stop
+        // band — so a lowest-bin reference would have been ~−60 dB, not the peak.
+        let c = sig.complex().unwrap();
+        assert!(
+            c[0].magnitude_db() < -40.0,
+            "DC bin is in the stopband: {} dB",
+            c[0].magnitude_db()
+        );
     }
 
     #[test]
