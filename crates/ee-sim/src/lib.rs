@@ -13,6 +13,7 @@
 //! This crate takes no clock, no filesystem, and no unseeded randomness, and
 //! stays `wasm32`-clean — the same rules as `ee-core`.
 
+mod eig;
 mod expr;
 mod mna;
 mod mna_complex;
@@ -23,8 +24,8 @@ use std::f64::consts::TAU;
 use std::fmt;
 
 use ee_core::graph::{
-    BjtModel, Circuit, DiodeModel, MosfetModel, NetId, Part, PartKind, Polarity, Waveform,
-    NOMINAL_TEMP_C,
+    BjtModel, Circuit, DiodeModel, Line, LineKind, MosfetModel, NetId, Part, PartKind, Polarity,
+    Waveform, NOMINAL_TEMP_C,
 };
 use ee_core::value::Value;
 use ee_core::{Complex, Domain, Signal, SignalData, Unit};
@@ -292,13 +293,24 @@ impl Layout {
     fn build(circuit: &Circuit) -> Self {
         let mut index = BTreeMap::new();
         let mut inv = Vec::new();
+        let see = |index: &mut BTreeMap<u32, usize>, inv: &mut Vec<u32>, t: NetId| {
+            let r = circuit.resolve(t).0;
+            if r != NetId::GROUND.0 && !index.contains_key(&r) {
+                index.insert(r, inv.len());
+                inv.push(r);
+            }
+        };
         for part in circuit.parts() {
             for &t in &part.terminals {
-                let r = circuit.resolve(t).0;
-                if r != NetId::GROUND.0 && !index.contains_key(&r) {
-                    index.insert(r, inv.len());
-                    inv.push(r);
-                }
+                see(&mut index, &mut inv, t);
+            }
+        }
+        // Transmission-line ports are nets too, even if only a line touches them,
+        // so they get a node row (`CP-SIM-M7.2`). No lines ⇒ this loop is empty and
+        // the node numbering is exactly as before.
+        for line in circuit.lines() {
+            for t in [line.a1, line.a2, line.b1, line.b2] {
+                see(&mut index, &mut inv, t);
             }
         }
         let kind_indices = |want: fn(&PartKind) -> bool| {
@@ -1484,9 +1496,22 @@ const ADAPTIVE_ITER_CAP: usize = 5_000_000;
 /// a history source `i_prev` oriented `a → b`, with `i_prev` refreshed from the
 /// solved node voltages. At `t = 0` capacitors are held at their initial voltage
 /// (a 0 V source) and inductors are open (`i(0) = 0`), per [`initial`](Self::initial).
-/// One Backward-Euler step's outcome: the node solution, the refreshed capacitor
-/// voltages, and the refreshed inductor currents — the state the next step reads.
-type StepResult = (Vec<f64>, Vec<f64>, Vec<f64>);
+/// One Backward-Euler step's outcome — the node solution and the refreshed
+/// reactive and transmission-line state the next step reads.
+struct StepOut {
+    /// The node (and branch) solution at the step's end time.
+    x: Vec<f64>,
+    /// Refreshed capacitor voltages.
+    caps: Vec<f64>,
+    /// Refreshed inductor currents.
+    inds: Vec<f64>,
+    /// Refreshed lossless-line port samples `[v1, i1, v2, i2]` (lossless-line
+    /// order); empty when the circuit has no lossless lines. (`CP-SIM-M7.2`.)
+    lossless: Vec<[f64; 4]>,
+    /// Refreshed lossy-line companion state `[series_i, cap_a_v, cap_b_v]`
+    /// (lossy-line order); empty when the circuit has no lossy lines.
+    lossy: Vec<[f64; 3]>,
+}
 
 // ---------------------------------------------------------------------------
 // Mutual inductance / coupled inductors (CP-SIM-M6.1)
@@ -1624,6 +1649,117 @@ fn couplings_of(circuit: &Circuit, ind_refs: &[String], ind_l: &[f64]) -> Coupli
     }
 }
 
+/// A transmission line resolved for the **transient** engine (`CP-SIM-M7.2`).
+///
+/// A lossless line is Branin's travelling-wave companion: each port is a resistor
+/// `Z₀` in series with a history voltage source `E` read from the *other* port one
+/// delay ago, so it takes two branch rows (`branch = Some(first row)`) and a
+/// history buffer. A lossy line is a lumped single-π — a series `R + L`
+/// Norton companion between the `+` nodes and a shunt `C/2 + G/2` at each port
+/// (`L = Z₀·T`, `C = T/Z₀`) — carrying its own running state, no branch row
+/// (`branch = None`).
+struct TLine {
+    a1: Option<usize>,
+    a2: Option<usize>,
+    b1: Option<usize>,
+    b2: Option<usize>,
+    z0: f64,
+    delay: f64,
+    /// `None` = lossless; `Some((r, g, l, c))` = lumped-LC lossy.
+    loss: Option<(f64, f64, f64, f64)>,
+    /// For a lossless line, the first of its two branch rows; `None` for a lossy
+    /// line (which adds no branch row).
+    branch: Option<usize>,
+}
+
+/// The committed transmission-line state the fixed-step transient driver threads
+/// across steps (`CP-SIM-M7.2`). A lossless line reads its delayed port history
+/// from here; a lossy line reads its previous companion state.
+struct LineState {
+    /// Committed sample times, ascending, with `times[0] = 0`.
+    times: Vec<f64>,
+    /// `lossless[s][i] = [v1, i1, v2, i2]` of lossless line `i` (in lossless-line
+    /// order) at committed sample `s`. `i`/`i…` are the branch currents *into* the
+    /// line at each port.
+    lossless: Vec<Vec<[f64; 4]>>,
+    /// `lossy[i] = [series_current, cap_a_v, cap_b_v]` — lossy line `i`'s running
+    /// companion state (previous step only, in lossy-line order).
+    lossy: Vec<[f64; 3]>,
+}
+
+impl LineState {
+    /// The port state `[v1, i1, v2, i2]` of lossless line `i` interpolated at time
+    /// `tq`, or all-zero for `tq` before the first sample (the quiescent line before
+    /// a wave has had time to arrive). Linear interpolation between the committed
+    /// samples bracketing `tq`; clamped to the last sample for `tq` past the end.
+    fn port_at(&self, i: usize, tq: f64) -> [f64; 4] {
+        if tq < self.times[0] {
+            return [0.0; 4];
+        }
+        let last = *self.times.last().expect("≥1 committed sample");
+        if tq >= last {
+            return self.lossless.last().expect("≥1 sample")[i];
+        }
+        let mut hi = 1;
+        while self.times[hi] < tq {
+            hi += 1;
+        }
+        let lo = hi - 1;
+        let (t0, t1) = (self.times[lo], self.times[hi]);
+        let f = if t1 > t0 { (tq - t0) / (t1 - t0) } else { 0.0 };
+        let (a, b) = (self.lossless[lo][i], self.lossless[hi][i]);
+        let mut out = [0.0; 4];
+        for k in 0..4 {
+            out[k] = a[k] + f * (b[k] - a[k]);
+        }
+        out
+    }
+}
+
+/// Stamp a lossless transmission line's two Branin companion branches into the
+/// real transient system: port A on branch `ka` with history voltage `e1`, port B
+/// on branch `kb` with `e2`. Branch currents are the currents *into the line*, so
+/// the port equation is `v − Z₀·i = e` with the node coupling `−i` at the `+`
+/// node (the current leaves it into the line). (`CP-SIM-M7.2`.)
+fn stamp_lossless_line(sys: &mut System, ln: &TLine, ka: usize, kb: usize, e1: f64, e2: f64) {
+    sys.stamp_matrix(Some(ka), ln.a1, 1.0);
+    sys.stamp_matrix(Some(ka), ln.a2, -1.0);
+    sys.stamp_matrix(Some(ka), Some(ka), -ln.z0);
+    // The branch current `i1` leaves node a1 into the line (returns at a2), exactly
+    // a voltage source's node coupling (+1 at the `+` node).
+    sys.stamp_matrix(ln.a1, Some(ka), 1.0);
+    sys.stamp_matrix(ln.a2, Some(ka), -1.0);
+    sys.stamp_current(Some(ka), None, e1);
+
+    sys.stamp_matrix(Some(kb), ln.b1, 1.0);
+    sys.stamp_matrix(Some(kb), ln.b2, -1.0);
+    sys.stamp_matrix(Some(kb), Some(kb), -ln.z0);
+    sys.stamp_matrix(ln.b1, Some(kb), 1.0);
+    sys.stamp_matrix(ln.b2, Some(kb), -1.0);
+    sys.stamp_current(Some(kb), None, e2);
+}
+
+/// Stamp a lossy (lumped single-π) line's Backward-Euler companions into the real
+/// transient step system: a series `R + L` Norton between the `+` nodes
+/// (conductance `1/(R + L/h)` plus the inductive history current) and a shunt
+/// `C/2 + G/2` at each port, from the previous state `[series_i, cap_a_v, cap_b_v]`.
+/// (`CP-SIM-M7.2`.)
+fn stamp_lossy_line(sys: &mut System, ln: &TLine, h: f64, state: [f64; 3]) {
+    let (r, g, l, c) = ln.loss.expect("lossy line carries its RLGC");
+    let [is_prev, ca_prev, cb_prev] = state;
+    let lh = l / h;
+    let g_eq = 1.0 / (r + lh);
+    sys.stamp_conductance(ln.a1, ln.b1, g_eq);
+    // Inductive history current, flowing a1 → b1.
+    sys.stamp_current(ln.b1, ln.a1, g_eq * lh * is_prev);
+    let g_c = 0.5 * c / h;
+    let g_sh = 0.5 * g;
+    sys.stamp_conductance(ln.a1, ln.a2, g_c + g_sh);
+    sys.stamp_current(ln.a1, ln.a2, g_c * ca_prev);
+    sys.stamp_conductance(ln.b1, ln.b2, g_c + g_sh);
+    sys.stamp_current(ln.b1, ln.b2, g_c * cb_prev);
+}
+
 struct TransientModel<'a> {
     circuit: &'a Circuit,
     layout: &'a Layout,
@@ -1636,11 +1772,18 @@ struct TransientModel<'a> {
     /// controlled-source branches); isolated inductors keep the conductance
     /// companion, so a circuit with no couplings is unchanged.
     coupling: Couplings,
+    /// Transmission lines (`CP-SIM-M7.2`), resolved. Empty ⇒ the pre-M7 path,
+    /// bit-for-bit. Lossless lines take two branch rows each (after the
+    /// coupled-inductor branches); lossy lines take none.
+    lines: Vec<TLine>,
+    /// Total branch rows the lossless lines add (`2 ×` their count).
+    line_branches: usize,
     /// Nonlinear devices, re-linearized inside each step's Newton loop.
     devices: Vec<Box<dyn NonlinearDevice>>,
     /// Node count and voltage-source branch count. The step system is
-    /// `n + m + cb + coupling.count`, with `cb` the controlled-source (VCVS/CCVS)
-    /// branch rows and `coupling.count` the coupled-inductor branch rows.
+    /// `n + m + cb + coupling.count + line_branches`, with `cb` the
+    /// controlled-source (VCVS/CCVS) branch rows, `coupling.count` the
+    /// coupled-inductor branch rows, and `line_branches` the lossless-line rows.
     n: usize,
     m: usize,
     cb: usize,
@@ -1689,6 +1832,38 @@ impl<'a> TransientModel<'a> {
         }
         let coupling = couplings_of(circuit, &ind_refs, &ind_l);
 
+        // Transmission lines (`CP-SIM-M7.2`): lossless lines get two branch rows
+        // each (right after the coupled-inductor branches); lossy lines get none.
+        let line_base = layout.n_nodes()
+            + layout.vsources.len()
+            + layout.n_controlled_branches()
+            + coupling.count;
+        let mut lines: Vec<TLine> = Vec::with_capacity(circuit.lines().len());
+        let mut line_branches = 0usize;
+        for ln in circuit.lines() {
+            let node = |t| layout.node_of(circuit, t);
+            let (loss, branch) = match ln.kind {
+                LineKind::Lossless => {
+                    let b = Some(line_base + line_branches);
+                    line_branches += 2;
+                    (None, b)
+                }
+                LineKind::Lossy { r, g } => {
+                    (Some((r, g, ln.z0 * ln.delay, ln.delay / ln.z0)), None)
+                }
+            };
+            lines.push(TLine {
+                a1: node(ln.a1),
+                a2: node(ln.a2),
+                b1: node(ln.b1),
+                b2: node(ln.b2),
+                z0: ln.z0,
+                delay: ln.delay,
+                loss,
+                branch,
+            });
+        }
+
         let devices = collect_nonlinear(circuit, registry)?;
         Ok(Self {
             circuit,
@@ -1696,6 +1871,8 @@ impl<'a> TransientModel<'a> {
             caps,
             inds,
             coupling,
+            lines,
+            line_branches,
             devices,
             n: layout.n_nodes(),
             m: layout.vsources.len(),
@@ -1703,13 +1880,23 @@ impl<'a> TransientModel<'a> {
         })
     }
 
+    /// Count of lossy transmission lines (each carrying running companion state).
+    fn n_lossy(&self) -> usize {
+        self.lines.iter().filter(|l| l.loss.is_some()).count()
+    }
+
     /// Solve the `t = 0` start: capacitors held at 0 V (their initial condition,
-    /// each a 0 V source), inductors open. Returns the node solution and the
-    /// initial capacitor voltages (the inductor currents start at 0 A).
-    fn initial(&self) -> Result<(Vec<f64>, Vec<f64>), SimError> {
+    /// each a 0 V source), inductors open, and every transmission line in its
+    /// quiescent matched state (each port presenting `Z₀`, no history). Returns the
+    /// node solution, the initial capacitor voltages (inductor currents start at
+    /// 0 A), and the initial [`LineState`] (the committed `t = 0` sample).
+    fn initial(&self) -> Result<(Vec<f64>, Vec<f64>, LineState), SimError> {
         let (circuit, layout, n, m, cb) = (self.circuit, self.layout, self.n, self.m, self.cb);
-        // Alpha-scaled stamp (for source stepping): independent sources ramp with
-        // `alpha`; the capacitor 0 V initial-condition sources stay at 0 V regardless.
+        // At t = 0 every line is relaxed: with zero history a Branin port reduces to
+        // a plain `Z₀` resistor (`v = Z₀·i`), the correct matched initial condition,
+        // so all lines (lossless and lossy) are stamped that way here. Their branch
+        // rows sit past the capacitor 0 V sources.
+        let init_line_base = n + m + cb + self.caps.len();
         let stamp_at = |sys: &mut System, alpha: f64| -> Result<(), SimError> {
             stamp_resistors(sys, circuit, layout)?;
             // t = 0 uses the waveform bias (sine → offset, pulse → v1).
@@ -1726,6 +1913,11 @@ impl<'a> TransientModel<'a> {
                     0.0,
                 );
             }
+            // Every line as a quiescent `Z₀` port pair (zero history).
+            for (i, ln) in self.lines.iter().enumerate() {
+                let ka = init_line_base + 2 * i;
+                stamp_lossless_line(sys, ln, ka, ka + 1, 0.0, 0.0);
+            }
             Ok(())
         };
         // The t = 0 solve gets the same convergence-aid ladder as the DC operating
@@ -1733,7 +1925,7 @@ impl<'a> TransientModel<'a> {
         // fail a transient just because it is the first sample. Its structure (caps
         // held as 0 V sources) differs from the stepping structure, so it uses its
         // own solver rather than the one the step loop reuses.
-        let init_size = n + m + cb + self.caps.len();
+        let init_size = init_line_base + 2 * self.lines.len();
         let mut solver = ReusableSolver::new(init_size);
         let x0 = solve_aided(
             circuit,
@@ -1754,7 +1946,28 @@ impl<'a> TransientModel<'a> {
                 )
             })
             .collect();
-        Ok((x0, cap_v0))
+
+        // The committed t = 0 line sample: every lossless line's port state read off
+        // the init branches; lossy companion state starts at zero.
+        let mut lossless0 = Vec::new();
+        for (i, ln) in self.lines.iter().enumerate() {
+            if ln.branch.is_none() {
+                continue; // lossy lines keep no history
+            }
+            let (ka, kb) = (init_line_base + 2 * i, init_line_base + 2 * i + 1);
+            lossless0.push([
+                across(&x0, ln.a1, ln.a2),
+                x0[ka],
+                across(&x0, ln.b1, ln.b2),
+                x0[kb],
+            ]);
+        }
+        let line_state = LineState {
+            times: vec![0.0],
+            lossless: vec![lossless0],
+            lossy: vec![[0.0; 3]; self.n_lossy()],
+        };
+        Ok((x0, cap_v0, line_state))
     }
 
     /// One Backward-Euler step of size `h` landing at time `t_end`, from the
@@ -1766,8 +1979,9 @@ impl<'a> TransientModel<'a> {
         h: f64,
         cap_prev: &[f64],
         ind_prev: &[f64],
+        line_prev: &LineState,
         solver: &mut ReusableSolver,
-    ) -> Result<StepResult, SimError> {
+    ) -> Result<StepOut, SimError> {
         let (circuit, layout) = (self.circuit, self.layout);
         // `alpha` ramps the independent sources only (source stepping); the
         // reactive companions carry state from the previous step and stay at full.
@@ -1819,6 +2033,27 @@ impl<'a> TransientModel<'a> {
                     sys.stamp_current(Some(k_col), None, -rhs);
                 }
             }
+            // Transmission lines (`CP-SIM-M7.2`). A lossless line reads its delayed
+            // port history (Branin's E) and takes its two branch rows; a lossy line
+            // stamps its lumped-π Backward-Euler companions from its previous state.
+            let mut ll = 0usize; // lossless-line index
+            let mut ly = 0usize; // lossy-line index
+            for ln in &self.lines {
+                match ln.branch {
+                    Some(b0) => {
+                        let port = line_prev.port_at(ll, t_end - ln.delay);
+                        let [v1, i1, v2, i2] = port;
+                        let e1 = v2 + ln.z0 * i2; // from the far port one delay ago
+                        let e2 = v1 + ln.z0 * i1;
+                        stamp_lossless_line(sys, ln, b0, b0 + 1, e1, e2);
+                        ll += 1;
+                    }
+                    None => {
+                        stamp_lossy_line(sys, ln, h, line_prev.lossy[ly]);
+                        ly += 1;
+                    }
+                }
+            }
             Ok(())
         };
         // Each step gets the aided ladder too (plain NR first, so a convergent step
@@ -1830,7 +2065,7 @@ impl<'a> TransientModel<'a> {
         let x = solve_aided(
             circuit,
             layout,
-            cbase + self.coupling.count,
+            cbase + self.coupling.count + self.line_branches,
             &self.devices,
             &stamp_at,
             solver,
@@ -1855,7 +2090,37 @@ impl<'a> TransientModel<'a> {
                 }
             })
             .collect();
-        Ok((x, new_caps, new_inds))
+
+        // Refresh the transmission-line state from the solved step.
+        let mut new_lossless = Vec::new();
+        let mut new_lossy = Vec::new();
+        let mut ly = 0usize;
+        for ln in &self.lines {
+            match ln.branch {
+                Some(b0) => new_lossless.push([
+                    across(&x, ln.a1, ln.a2),
+                    x[b0],
+                    across(&x, ln.b1, ln.b2),
+                    x[b0 + 1],
+                ]),
+                None => {
+                    let (r, _, l, _) = ln.loss.expect("lossy carries RLGC");
+                    let [is_prev, ..] = line_prev.lossy[ly];
+                    let g_eq = 1.0 / (r + l / h);
+                    let is_new = g_eq * (across(&x, ln.a1, ln.b1) + (l / h) * is_prev);
+                    new_lossy.push([is_new, across(&x, ln.a1, ln.a2), across(&x, ln.b1, ln.b2)]);
+                    ly += 1;
+                }
+            }
+        }
+
+        Ok(StepOut {
+            x,
+            caps: new_caps,
+            inds: new_inds,
+            lossless: new_lossless,
+            lossy: new_lossy,
+        })
     }
 
     /// Package recorded `times` × per-node `traces` into one [`Signal`] per node.
@@ -1890,9 +2155,17 @@ fn transient(
         return Err(SimError::BadValue("transient duration/step".into()));
     }
     let model = TransientModel::build(circuit, layout, registry)?;
-    let (x0, cap_v0) = model.initial()?;
+    // Transmission lines need the uniform history grid the fixed step provides (the
+    // delayed port state is interpolated from committed samples), so a circuit with
+    // a line requires an explicit timestep; the adaptive driver rejects it cleanly.
+    if !model.lines.is_empty() && !matches!(step, Some(h) if h > 0.0) {
+        return Err(SimError::Unsupported(
+            "a transmission line needs a fixed transient timestep",
+        ));
+    }
+    let (x0, cap_v0, line0) = model.initial()?;
     match step {
-        Some(h) if h > 0.0 => fixed_transient(&model, duration, h, x0, cap_v0),
+        Some(h) if h > 0.0 => fixed_transient(&model, duration, h, x0, cap_v0, line0),
         Some(_) => Err(SimError::BadValue("transient duration/step".into())),
         None => adaptive_transient(&model, duration, x0, cap_v0),
     }
@@ -1906,6 +2179,7 @@ fn fixed_transient(
     h: f64,
     x0: Vec<f64>,
     cap_v0: Vec<f64>,
+    mut line_state: LineState,
 ) -> Result<Vec<Signal>, SimError> {
     let steps = (duration / h).round().max(1.0) as usize;
     let n = model.n;
@@ -1919,16 +2193,26 @@ fn fixed_transient(
     let mut ind_prev = vec![0.0; model.inds.len()];
     // One solver for the whole run: every step stamps the same structure, so a
     // large net analyzes the fill-reducing ordering once and refactors per step.
-    let mut solver = ReusableSolver::new(model.n + model.m + model.cb + model.coupling.count);
+    let mut solver = ReusableSolver::new(
+        model.n + model.m + model.cb + model.coupling.count + model.line_branches,
+    );
     for k in 1..=steps {
         let t = k as f64 * h;
-        let (x, caps, inds) = model.step(t, h, &cap_prev, &ind_prev, &mut solver)?;
+        let out = model.step(t, h, &cap_prev, &ind_prev, &line_state, &mut solver)?;
         times.push(t);
         for (d, trace) in traces.iter_mut().enumerate() {
-            trace.push(x[d]);
+            trace.push(out.x[d]);
         }
-        cap_prev = caps;
-        ind_prev = inds;
+        cap_prev = out.caps;
+        ind_prev = out.inds;
+        // Commit this step's transmission-line state: append the lossless history
+        // sample (so later steps can read it one delay back) and advance the lossy
+        // companion state.
+        if !model.lines.is_empty() {
+            line_state.times.push(t);
+            line_state.lossless.push(out.lossless);
+            line_state.lossy = out.lossy;
+        }
     }
     Ok(model.signals(times, traces))
 }
@@ -1986,6 +2270,14 @@ fn adaptive_transient(
     // Shared across every accept/reject attempt (coarse + two half steps): all stamp
     // the same structure, so a large net reuses one symbolic factorization throughout.
     let mut solver = ReusableSolver::new(model.n + model.m + model.cb + model.coupling.count);
+    // The adaptive driver never runs with transmission lines (the dispatcher routes
+    // a line-bearing circuit to the fixed step), so a quiescent, never-read line
+    // state suffices here.
+    let no_lines = LineState {
+        times: vec![0.0],
+        lossless: vec![Vec::new()],
+        lossy: Vec::new(),
+    };
 
     let mut iters = 0usize;
     while t < duration * (1.0 - 1e-12) {
@@ -1998,22 +2290,34 @@ fn adaptive_transient(
         let at_floor = h_try <= h_min * (1.0 + 1e-9);
 
         // Coarse: one step of h_try. Fine: two steps of h_try/2.
-        let (x_coarse, _, _) = model.step(t + h_try, h_try, &cap_prev, &ind_prev, &mut solver)?;
+        let coarse = model.step(
+            t + h_try,
+            h_try,
+            &cap_prev,
+            &ind_prev,
+            &no_lines,
+            &mut solver,
+        )?;
         let half = 0.5 * h_try;
-        let (_, caps_mid, inds_mid) =
-            model.step(t + half, half, &cap_prev, &ind_prev, &mut solver)?;
-        let (x_fine, caps_fine, inds_fine) =
-            model.step(t + h_try, half, &caps_mid, &inds_mid, &mut solver)?;
+        let mid = model.step(t + half, half, &cap_prev, &ind_prev, &no_lines, &mut solver)?;
+        let fine = model.step(
+            t + h_try,
+            half,
+            &mid.caps,
+            &mid.inds,
+            &no_lines,
+            &mut solver,
+        )?;
 
-        let err = lte_norm(&x_fine, &x_coarse);
+        let err = lte_norm(&fine.x, &coarse.x);
         if err <= 1.0 || at_floor {
             // Accept the finer solution and advance.
             t += h_try;
-            cap_prev = caps_fine;
-            ind_prev = inds_fine;
+            cap_prev = fine.caps;
+            ind_prev = fine.inds;
             times.push(t);
             for (d, trace) in traces.iter_mut().enumerate() {
-                trace.push(x_fine[d]);
+                trace.push(fine.x[d]);
             }
             h = (h_try * lte_step_factor(err)).clamp(h_min, h_max);
         } else {
@@ -2129,7 +2433,25 @@ fn ac(
     // stay admittances in `inds`; coupled ones get a branch row and are stamped in
     // their group below. With no couplings this is the pre-M6 path, bit-for-bit.
     let coupling = couplings_of(circuit, &ind_refs, &ind_l);
-    let size = ac_base + coupling.count;
+    // Transmission lines (`CP-SIM-M7.2`): a lossless line adds two branch rows
+    // (its travelling-wave companion in the `e^{−jωT}` form), placed right after
+    // the coupled-inductor branches; a lossy line adds none (it is pure lumped-LC
+    // admittances). No lines ⇒ `line_base == size` and the pre-M7 layout stands.
+    let line_base = ac_base + coupling.count;
+    let lines: Vec<AcLine> = circuit
+        .lines()
+        .iter()
+        .map(|ln| AcLine::resolve(circuit, layout, ln))
+        .collect();
+    let mut n_line_branches = 0usize;
+    let mut line_branch_of: Vec<usize> = Vec::with_capacity(lines.len());
+    for ln in &lines {
+        line_branch_of.push(line_base + n_line_branches);
+        if ln.loss.is_none() {
+            n_line_branches += 2;
+        }
+    }
+    let size = line_base + n_line_branches;
     let inds: Vec<(Option<usize>, Option<usize>, f64)> = all_inds
         .iter()
         .enumerate()
@@ -2229,6 +2551,10 @@ fn ac(
         for &(a, b, g) in &device_g {
             sys.stamp_matrix(a, b, Complex::new(g, 0.0));
         }
+        // Transmission lines (`CP-SIM-M7.2`).
+        for (li, ln) in lines.iter().enumerate() {
+            ln.stamp_ac(&mut sys, w, line_branch_of[li]);
+        }
         for &(plus, minus, k, drive) in &vsource_stamps {
             sys.stamp_vsource(plus, minus, k, drive);
         }
@@ -2256,6 +2582,500 @@ fn ac(
             )
         })
         .collect())
+}
+
+// ---------------------------------------------------------------------------
+// Transmission lines — AC stamp (CP-SIM-M7.2)
+// ---------------------------------------------------------------------------
+
+/// A transmission line resolved to MNA node indices for **AC** stamping
+/// (`CP-SIM-M7.2`). The lossless line is Branin's travelling-wave companion in
+/// phasor form — each port a resistor `Z₀` coupled to the other port one delay ago
+/// through `e^{−jωT}`; the lossy line is a lumped single-π of `R + jωL` series and
+/// `(G + jωC)/2` shunt admittances, with `L = Z₀·T`, `C = T/Z₀`.
+struct AcLine {
+    a1: Option<usize>,
+    a2: Option<usize>,
+    b1: Option<usize>,
+    b2: Option<usize>,
+    z0: f64,
+    delay: f64,
+    /// `None` = lossless; `Some((r, g, l, c))` = lumped-LC lossy.
+    loss: Option<(f64, f64, f64, f64)>,
+}
+
+impl AcLine {
+    fn resolve(circuit: &Circuit, layout: &Layout, ln: &Line) -> Self {
+        let node = |t| layout.node_of(circuit, t);
+        let loss = match ln.kind {
+            LineKind::Lossless => None,
+            LineKind::Lossy { r, g } => Some((r, g, ln.z0 * ln.delay, ln.delay / ln.z0)),
+        };
+        Self {
+            a1: node(ln.a1),
+            a2: node(ln.a2),
+            b1: node(ln.b1),
+            b2: node(ln.b2),
+            z0: ln.z0,
+            delay: ln.delay,
+            loss,
+        }
+    }
+
+    /// Stamp this line into the complex AC system at angular frequency `w`, using
+    /// branch rows `kbase` / `kbase + 1` (lossless only; a lossy line ignores them).
+    fn stamp_ac(&self, sys: &mut ComplexSystem, w: f64, kbase: usize) {
+        match self.loss {
+            None => {
+                // Branch currents `i1`, `i2` are the currents *into the line*; the
+                // two port equations are `v1 − Z₀·i1 = E(v2 + Z₀·i2)` and its B↔A
+                // twin, with `E = e^{−jωT}`.
+                let wt = w * self.delay;
+                let e = Complex::new(wt.cos(), -wt.sin());
+                let z0 = Complex::new(self.z0, 0.0);
+                let one = Complex::ONE;
+                let (ka, kb) = (kbase, kbase + 1);
+
+                // Port A branch row.
+                sys.stamp_matrix(Some(ka), self.a1, one);
+                sys.stamp_matrix(Some(ka), self.a2, -one);
+                sys.stamp_matrix(Some(ka), Some(ka), -z0);
+                sys.stamp_matrix(Some(ka), self.b1, -e);
+                sys.stamp_matrix(Some(ka), self.b2, e);
+                sys.stamp_matrix(Some(ka), Some(kb), -e * z0);
+                // Port A node coupling: `i1` leaves node a1, returns at a2 (the +1
+                // sense of a voltage source's branch current).
+                sys.stamp_matrix(self.a1, Some(ka), one);
+                sys.stamp_matrix(self.a2, Some(ka), -one);
+
+                // Port B branch row.
+                sys.stamp_matrix(Some(kb), self.b1, one);
+                sys.stamp_matrix(Some(kb), self.b2, -one);
+                sys.stamp_matrix(Some(kb), Some(kb), -z0);
+                sys.stamp_matrix(Some(kb), self.a1, -e);
+                sys.stamp_matrix(Some(kb), self.a2, e);
+                sys.stamp_matrix(Some(kb), Some(ka), -e * z0);
+                sys.stamp_matrix(self.b1, Some(kb), one);
+                sys.stamp_matrix(self.b2, Some(kb), -one);
+            }
+            Some((r, g, l, c)) => {
+                // Lumped single-π: series admittance `1/(R + jωL)` between a1,b1 and
+                // shunt `(G + jωC)/2` at each port.
+                let series = Complex::new(r, w * l).inv();
+                sys.stamp_admittance(self.a1, self.b1, series);
+                let half = Complex::new(0.5 * g, 0.5 * w * c);
+                sys.stamp_admittance(self.a1, self.a2, half);
+                sys.stamp_admittance(self.b1, self.b2, half);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Small-signal transfer function + pole/zero analysis (CP-SIM-M7.1)
+// ---------------------------------------------------------------------------
+
+/// Upper bound on the linearized MNA system size the pole/zero + transfer-function
+/// analysis ([`Engine::transfer_function`]) will attempt.
+///
+/// The pole extraction runs a dense `O(N³)` hand-rolled eigensolver
+/// (a compact in-crate dense eigensolver), so the analysis is deliberately capped at a **modest size**:
+/// a larger circuit is reported [`SimError::Unsupported`] rather than solved
+/// slowly. This covers every lumped circuit a `.TF` is realistically asked for
+/// (the gate RC / divider are size ≤ 3); the augmented zero pencil adds one row,
+/// so the bound is enforced against `size + 1`.
+pub const PZ_MAX_SYSTEM: usize = 128;
+
+/// The result of a small-signal transfer-function / pole-zero analysis
+/// ([`Engine::transfer_function`], `CP-SIM-M7.1`): a circuit linearized about its
+/// DC operating point and probed between one input source and one output node.
+///
+/// The gain and port impedances are DC (`s = 0`) small-signal quantities, exactly
+/// as a SPICE `.TF` reports; the poles are intrinsic to the circuit (independent
+/// of the chosen port), while the zeros are the transmission zeros of the chosen
+/// input→output path.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TransferFunction {
+    /// The DC small-signal gain from the input source to the output node:
+    /// `V(output)/V(input)` for a voltage-source input (dimensionless), or
+    /// `V(output)/I(input)` (a transresistance, in ohms) for a current-source input.
+    pub dc_gain: f64,
+    /// The DC resistance looking into the input source's port (ohms): the applied
+    /// test level over the current it delivers.
+    pub input_impedance: f64,
+    /// The DC resistance looking into the output port to ground, with every
+    /// independent source quieted (ohms): a 1 A probe injected at the output node
+    /// over the voltage it develops.
+    pub output_impedance: f64,
+    /// The pole locations in the Laplace `s`-plane (rad/s) — the finite `s` solving
+    /// `det(G + sC) = 0`. Real poles carry a zero imaginary part; complex poles come
+    /// in conjugate pairs. A purely resistive circuit has none.
+    pub poles: Vec<Complex>,
+    /// The finite transmission zeros (rad/s), *where tractable*: `Some(vec)` — the
+    /// zeros of the input→output path, possibly empty (no finite zeros, as for a
+    /// first-order low-pass) — or `None` when the augmented zero pencil is singular
+    /// (e.g. a zero exactly at the origin, or a feed-through the reduction cannot
+    /// isolate) or the output is ground.
+    pub zeros: Option<Vec<Complex>>,
+}
+
+impl Engine {
+    /// Small-signal transfer-function / pole-zero analysis (`CP-SIM-M7.1`): the
+    /// `.TF` report between an independent `input_source` and the `output` node.
+    ///
+    /// The circuit is linearized about its DC operating point (reusing the
+    /// Newton–Raphson bias, so nonlinear devices enter by their small-signal
+    /// conductance, exactly as [`Analysis::Ac`] does). From the linearized MNA it
+    /// reports the DC gain, the input/output port resistances, and the pole (and,
+    /// where tractable, zero) locations.
+    ///
+    /// **Poles** are the finite roots of `det(G + sC) = 0` for the conductance
+    /// matrix `G` and the capacitance/inductance matrix `C` — a generalized
+    /// eigenproblem. Because `C` is singular in MNA (branch rows and purely
+    /// resistive nodes carry no reactance), the problem is reduced to a *standard*
+    /// eigenproblem on `G⁻¹C` (`G` is nonsingular at a valid operating point): the
+    /// finite poles are `s = −1/μ` over the nonzero eigenvalues `μ`, with the
+    /// `μ ≈ 0` eigenvalues (poles at infinity) discarded. The eigenvalues come from
+    /// the hand-rolled QR iteration in a compact in-crate dense eigensolver — **no external
+    /// linear-algebra crate**.
+    ///
+    /// Bounded to systems of at most [`PZ_MAX_SYSTEM`] unknowns (the dense
+    /// eigensolver is `O(N³)`); a larger circuit returns [`SimError::Unsupported`].
+    /// A circuit carrying a transmission line is also [`SimError::Unsupported`]
+    /// here (a distributed delay has no finite-dimensional pole set). The
+    /// `input_source` must name an independent voltage or current source present in
+    /// the circuit, else [`SimError::UnknownPart`] / [`SimError::Unsupported`].
+    pub fn transfer_function(
+        &self,
+        circuit: &Circuit,
+        output: NetId,
+        input_source: &str,
+    ) -> Result<TransferFunction, SimError> {
+        let reg = &self.registry;
+        validate(circuit, reg)?;
+        if !circuit.lines().is_empty() {
+            return Err(SimError::Unsupported(
+                "transfer function with a transmission line",
+            ));
+        }
+        let layout = Layout::build(circuit);
+
+        // Classify the input source and locate how it enters the system.
+        let in_part = circuit
+            .part_by_ref(input_source)
+            .ok_or_else(|| SimError::UnknownPart(input_source.to_string()))?;
+        let input = match in_part.kind {
+            PartKind::VoltageSource => {
+                let pos = layout
+                    .vsources
+                    .iter()
+                    .position(|&pi| circuit.parts()[pi].reference == input_source)
+                    .expect("a voltage source is always in the layout");
+                TfInput::Volt(layout.n_nodes() + pos)
+            }
+            PartKind::CurrentSource => {
+                let (a, b) = terminals2(in_part)?;
+                TfInput::Curr(layout.node_of(circuit, a), layout.node_of(circuit, b))
+            }
+            _ => {
+                return Err(SimError::Unsupported(
+                    "transfer-function input is not an independent source",
+                ))
+            }
+        };
+        let out_node = layout.node_of(circuit, output);
+
+        // Linearize about the DC operating point and assemble the (G, C) pencil.
+        let x_dc = solve_dc(circuit, &layout, reg)?;
+        let (g, c, size) = assemble_pencil(circuit, &layout, &x_dc, reg)?;
+        if size + 1 > PZ_MAX_SYSTEM {
+            return Err(SimError::Unsupported(
+                "circuit too large for pole/zero analysis",
+            ));
+        }
+
+        // DC gain + port impedances: two solves of the real G matrix (s = 0). The
+        // first excites the input (unit drive); the second injects a unit probe
+        // current at the output with every independent source quiet.
+        let mut b_in = vec![0.0; size];
+        match input {
+            TfInput::Volt(k) => b_in[k] = 1.0, // a 1 V source
+            TfInput::Curr(a, b) => {
+                // 1 A forced into node a and out of node b (the source's direction).
+                if let Some(i) = a {
+                    b_in[i] += 1.0;
+                }
+                if let Some(j) = b {
+                    b_in[j] -= 1.0;
+                }
+            }
+        }
+        let mut b_out = vec![0.0; size];
+        if let Some(o) = out_node {
+            b_out[o] = 1.0;
+        }
+        let sols = eig::solve_multi(&g, size, &[b_in.clone(), b_out]).ok_or(SimError::Singular)?;
+        let x_in = &sols[0];
+        let x_out = &sols[1];
+
+        let out_v = out_node.map_or(0.0, |o| x_in[o]);
+        let (dc_gain, input_impedance) = match input {
+            TfInput::Volt(k) => {
+                // Gain = V(out)/1 V. R_in = 1 V / delivered current (= −branch current).
+                let i_branch = x_in[k];
+                let r_in = if i_branch != 0.0 {
+                    1.0 / (-i_branch)
+                } else {
+                    f64::INFINITY
+                };
+                (out_v, r_in)
+            }
+            TfInput::Curr(a, b) => {
+                // Gain = V(out)/1 A (transresistance). R_in = V(port)/1 A.
+                let v_port = a.map_or(0.0, |i| x_in[i]) - b.map_or(0.0, |j| x_in[j]);
+                (out_v, v_port)
+            }
+        };
+        let output_impedance = out_node.map_or(0.0, |o| x_out[o]);
+
+        // Poles: s = −1/μ over the finite (nonzero) eigenvalues μ of G⁻¹C.
+        let poles = finite_poles(&g, &c, size)?;
+        // Zeros (where tractable): the augmented Rosenbrock pencil.
+        let zeros = transmission_zeros(&g, &c, size, &b_in, out_node);
+
+        Ok(TransferFunction {
+            dc_gain,
+            input_impedance,
+            output_impedance,
+            poles,
+            zeros,
+        })
+    }
+}
+
+/// How a chosen `.TF` input source enters the linearized system.
+enum TfInput {
+    /// An independent voltage source, by its absolute MNA branch-row index.
+    Volt(usize),
+    /// An independent current source, by its `(plus, minus)` node indices
+    /// (`None` = ground).
+    Curr(Option<usize>, Option<usize>),
+}
+
+/// Assemble the linearized small-signal `(G, C)` matrix pencil about the DC
+/// operating point `x_dc`, as dense row-major `size × size` arrays, plus `size`.
+///
+/// `G` is the DC conductance / MNA matrix — resistors, controlled sources, the ±1
+/// couplings of voltage sources and (shorted) inductors, and every nonlinear
+/// device's small-signal Jacobian at the bias — assembled through the ordinary
+/// stamp API so each device's contribution is byte-identical to the AC/DC path.
+/// `C` is the reactive matrix: a capacitor adds `C` to its node block, and an
+/// inductor branch `k` adds `−L` on `C[k][k]` (with `−M = −k√(LᵢLⱼ)` off-diagonal
+/// for a coupled pair), so that `G + sC` is the Laplace-domain system. Every
+/// inductor takes a branch row here (the short's ±1 in `G`, its reactance in `C`),
+/// matching the inductor-branch placement [`solve_dc`] uses.
+fn assemble_pencil(
+    circuit: &Circuit,
+    layout: &Layout,
+    x_dc: &[f64],
+    registry: &DeviceRegistry,
+) -> Result<(Vec<f64>, Vec<f64>, usize), SimError> {
+    let n = layout.n_nodes();
+    let m = layout.vsources.len();
+    let cb = layout.n_controlled_branches();
+    let ind_base = layout.controlled_base() + cb; // first inductor branch row
+    let n_ind = layout.inductors.len();
+    let size = n + m + cb + n_ind;
+
+    // G through the ordinary stamp API (forced dense), reusing the device stamps.
+    let mut gsys = System::dense(size);
+    stamp_resistors(&mut gsys, circuit, layout)?;
+    stamp_controlled_sources(&mut gsys, circuit, layout)?;
+    // Voltage-source ±1 couplings (the RHS is irrelevant to G, so stamp 0 V — no
+    // value lookup, so a source carrying only a waveform is fine).
+    for (branch, &pi) in layout.vsources.iter().enumerate() {
+        let (plus, minus) = terminals2(&circuit.parts()[pi])?;
+        gsys.stamp_vsource(
+            layout.node_of(circuit, plus),
+            layout.node_of(circuit, minus),
+            n + branch,
+            0.0,
+        );
+    }
+    // Inductor shorts: the ±1 branch couplings (the sL term lives in C).
+    for (bi, &pi) in layout.inductors.iter().enumerate() {
+        let (a, b) = terminals2(&circuit.parts()[pi])?;
+        gsys.stamp_vsource(
+            layout.node_of(circuit, a),
+            layout.node_of(circuit, b),
+            ind_base + bi,
+            0.0,
+        );
+    }
+    // Nonlinear devices → their small-signal Jacobian at the bias (as in `ac`).
+    let devices = collect_nonlinear(circuit, registry)?;
+    for dev in &devices {
+        let nodes: Vec<Option<usize>> = dev
+            .terminals()
+            .iter()
+            .map(|&t| layout.node_of(circuit, t))
+            .collect();
+        let v: Vec<f64> = nodes
+            .iter()
+            .map(|&nd| nd.map_or(0.0, |i| x_dc[i]))
+            .collect();
+        let comp = dev.linearize(&v, &mut vec![0.0; dev.state_len()], false);
+        for (a, &na) in nodes.iter().enumerate() {
+            for (b, &nb) in nodes.iter().enumerate() {
+                gsys.stamp_matrix(na, nb, comp.g[a][b]);
+            }
+        }
+    }
+    let g = gsys.dense_matrix();
+
+    // C: capacitor node admittances + the inductance matrix on the branch rows.
+    let mut c = vec![0.0; size * size];
+    let put = |c: &mut [f64], r: usize, col: usize, val: f64| c[r * size + col] += val;
+    for part in circuit.parts() {
+        if matches!(part.kind, PartKind::Capacitor) {
+            let cap = magnitude(part)?;
+            if cap <= 0.0 {
+                return Err(SimError::BadValue(part.reference.clone()));
+            }
+            let (a, b) = terminals2(part)?;
+            let (ia, ib) = (layout.node_of(circuit, a), layout.node_of(circuit, b));
+            if let Some(i) = ia {
+                put(&mut c, i, i, cap);
+            }
+            if let Some(j) = ib {
+                put(&mut c, j, j, cap);
+            }
+            if let (Some(i), Some(j)) = (ia, ib) {
+                put(&mut c, i, j, -cap);
+                put(&mut c, j, i, -cap);
+            }
+        }
+    }
+    // Self-inductances on the branch diagonal; mutuals from the couplings.
+    let mut ind_l = vec![0.0; n_ind];
+    for (bi, &pi) in layout.inductors.iter().enumerate() {
+        let l = magnitude(&circuit.parts()[pi])?;
+        if l <= 0.0 {
+            return Err(SimError::BadValue(circuit.parts()[pi].reference.clone()));
+        }
+        ind_l[bi] = l;
+        put(&mut c, ind_base + bi, ind_base + bi, -l);
+    }
+    for cpl in circuit.couplings() {
+        let pos = |r: &str| {
+            layout
+                .inductors
+                .iter()
+                .position(|&pi| circuit.parts()[pi].reference == r)
+        };
+        if let (Some(i), Some(j)) = (pos(&cpl.a), pos(&cpl.b)) {
+            if i != j {
+                let mutual = cpl.k * (ind_l[i] * ind_l[j]).sqrt();
+                put(&mut c, ind_base + i, ind_base + j, -mutual);
+                put(&mut c, ind_base + j, ind_base + i, -mutual);
+            }
+        }
+    }
+    Ok((g, c, size))
+}
+
+/// The finite poles `s = −1/μ` over the nonzero eigenvalues `μ` of `G⁻¹C`.
+///
+/// `G⁻¹C` is formed by one multi-RHS solve (a column of `C` per solve); its
+/// eigenvalues come from the hand-rolled QR iteration. The `μ ≈ 0` eigenvalues are
+/// the poles at infinity (the `C`-nullspace directions) and are filtered out
+/// relative to the largest eigenvalue magnitude.
+fn finite_poles(g: &[f64], c: &[f64], size: usize) -> Result<Vec<Complex>, SimError> {
+    let rhs: Vec<Vec<f64>> = (0..size)
+        .map(|col| (0..size).map(|r| c[r * size + col]).collect())
+        .collect();
+    let cols = eig::solve_multi(g, size, &rhs).ok_or(SimError::Singular)?;
+    let mut m = vec![0.0; size * size];
+    for (col, xc) in cols.iter().enumerate() {
+        for (r, &v) in xc.iter().enumerate() {
+            m[r * size + col] = v;
+        }
+    }
+    let evals = eig::eigenvalues(&m, size)
+        .ok_or(SimError::Unsupported("pole eigensolver did not converge"))?;
+    Ok(finite_reciprocals(&evals, true))
+}
+
+/// The transmission zeros of the input→output path, *where tractable*.
+///
+/// They are the finite `s` making the Rosenbrock system pencil
+/// `[[−G − sC, b], [lᵀ, 0]]` drop rank, with `b` the input excitation column and
+/// `l` the output selector. Reduced (exactly as the poles are) to a standard
+/// eigenproblem on `M₁⁻¹M₂` where `M₁ = [[−G, b],[lᵀ, 0]]` and `M₂ = diag(C, 0)`:
+/// the zeros are `s = 1/ν` over the nonzero eigenvalues `ν`. Returns `None` when
+/// the output is ground or `M₁` is singular (a zero at the origin, or a path the
+/// reduction cannot isolate) — the documented "where tractable" boundary.
+fn transmission_zeros(
+    g: &[f64],
+    c: &[f64],
+    size: usize,
+    b: &[f64],
+    out_node: Option<usize>,
+) -> Option<Vec<Complex>> {
+    let out = out_node?;
+    let aug = size + 1;
+    // M₁ = [[−G, b], [eₒᵤₜᵀ, 0]].
+    let mut m1 = vec![0.0; aug * aug];
+    for r in 0..size {
+        for col in 0..size {
+            m1[r * aug + col] = -g[r * size + col];
+        }
+        m1[r * aug + size] = b[r];
+    }
+    m1[size * aug + out] = 1.0;
+    // M₂ columns: Cₖ padded with a zero last row, and an all-zero last column.
+    let mut rhs: Vec<Vec<f64>> = (0..size)
+        .map(|col| {
+            let mut v = vec![0.0; aug];
+            for (r, slot) in v.iter_mut().enumerate().take(size) {
+                *slot = c[r * size + col];
+            }
+            v
+        })
+        .collect();
+    rhs.push(vec![0.0; aug]);
+    let cols = eig::solve_multi(&m1, aug, &rhs)?; // None ⇒ M₁ singular ⇒ no tractable zeros
+    let mut prod = vec![0.0; aug * aug];
+    for (col, xc) in cols.iter().enumerate() {
+        for (r, &v) in xc.iter().enumerate() {
+            prod[r * aug + col] = v;
+        }
+    }
+    let evals = eig::eigenvalues(&prod, aug)?;
+    Some(finite_reciprocals(&evals, false))
+}
+
+/// Map eigenvalues to the finite reciprocals a pole/zero reduction needs: drop the
+/// `≈ 0` eigenvalues (reciprocal at infinity) relative to the largest magnitude,
+/// then return `1/z` (zeros) or `−1/z` (poles, `negate = true`) for the rest.
+fn finite_reciprocals(evals: &[Complex], negate: bool) -> Vec<Complex> {
+    let max_mag = evals.iter().map(|z| z.magnitude()).fold(0.0, f64::max);
+    if max_mag == 0.0 {
+        return Vec::new();
+    }
+    let thresh = 1e-9 * max_mag;
+    evals
+        .iter()
+        .filter(|z| z.magnitude() > thresh)
+        .map(|z| {
+            let inv = z.inv();
+            if negate {
+                Complex::new(-inv.re, -inv.im)
+            } else {
+                inv
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -6376,5 +7196,463 @@ mod tests {
             direct, aided,
             "an easy circuit must take the direct NR path, bit-for-bit (no aid engaged)"
         );
+    }
+
+    // --- CP-SIM-M7.1: transfer function + pole/zero -------------------------
+
+    /// The RC low-pass `.TF` gate: a single real pole at `s = −1/(RC)` (the −3 dB
+    /// corner), a unity DC gain, and no finite zeros. `R = 1 kΩ`, `C = 1 µF` →
+    /// pole at exactly `−1000 rad/s`.
+    #[test]
+    fn tf_rc_lowpass_reports_its_single_pole() {
+        let (r, cap) = (1_000.0, 1e-6);
+        let mut c = Circuit::new("rc");
+        let vin = c.new_net();
+        let out = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("1", Unit::Volt),
+            vec![vin, NetId::GROUND],
+        );
+        c.add_part(
+            "R1",
+            PartKind::Resistor,
+            Some(Value::new(r, Unit::Ohm)),
+            vec![vin, out],
+        );
+        c.add_part(
+            "C1",
+            PartKind::Capacitor,
+            Some(Value::new(cap, Unit::Farad)),
+            vec![out, NetId::GROUND],
+        );
+
+        let tf = Engine::new()
+            .transfer_function(&c, out, "V1")
+            .expect("RC transfer function");
+
+        // Exactly one finite pole, real, at −1/(RC) = −1000 rad/s.
+        assert_eq!(tf.poles.len(), 1, "RC low-pass has one pole");
+        let p = tf.poles[0];
+        assert!(p.im.abs() < 1e-6, "the RC pole is real, got {p:?}");
+        let expected = -1.0 / (r * cap);
+        assert!(
+            (p.re - expected).abs() < 1e-6 * expected.abs(),
+            "RC pole {} not at −1/(RC) = {expected}",
+            p.re
+        );
+        // DC gain is unity (the capacitor is open at DC), and no finite zeros.
+        assert!((tf.dc_gain - 1.0).abs() < 1e-12, "RC DC gain is 1");
+        assert_eq!(
+            tf.zeros,
+            Some(Vec::new()),
+            "a first-order low-pass has no finite zeros"
+        );
+        // The −3 dB corner frequency follows from the pole: fc = |p|/(2π) ≈ 159 Hz.
+        let fc = expected.abs() / TAU;
+        assert!((fc - 159.154_943).abs() < 1e-3, "corner fc ≈ 159.15 Hz");
+    }
+
+    /// The resistive-divider `.TF` gate: gain, input resistance, and output
+    /// resistance all match hand analysis **exactly** (resistive, so IEEE-exact).
+    /// `R1 = 1 kΩ`, `R2 = 3 kΩ`: gain `R2/(R1+R2) = 0.75`, `R_in = R1+R2 = 4 kΩ`,
+    /// `R_out = R1‖R2 = 750 Ω`, and no poles (purely resistive).
+    #[test]
+    fn tf_resistive_divider_matches_hand_analysis() {
+        let mut c = Circuit::new("divider");
+        let vin = c.new_net();
+        let mid = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("10", Unit::Volt),
+            vec![vin, NetId::GROUND],
+        );
+        c.add_part("R1", PartKind::Resistor, v("1k", Unit::Ohm), vec![vin, mid]);
+        c.add_part(
+            "R2",
+            PartKind::Resistor,
+            v("3k", Unit::Ohm),
+            vec![mid, NetId::GROUND],
+        );
+
+        let tf = Engine::new()
+            .transfer_function(&c, mid, "V1")
+            .expect("divider transfer function");
+
+        assert_eq!(tf.dc_gain, 0.75, "divider gain R2/(R1+R2)");
+        assert_eq!(tf.input_impedance, 4000.0, "R_in = R1 + R2");
+        assert_eq!(tf.output_impedance, 750.0, "R_out = R1 ‖ R2");
+        assert!(tf.poles.is_empty(), "a resistive divider has no poles");
+    }
+
+    /// A series-RLC `.TF` gives a complex-conjugate pole pair at the undamped
+    /// natural frequency for a lightly-damped choice, sanity-checking the complex
+    /// branch of the eigensolver on a real circuit. `L = 1 mH`, `C = 1 µF` →
+    /// `ω₀ = 1/√(LC) ≈ 31623 rad/s`; a small series `R` keeps the poles complex.
+    #[test]
+    fn tf_series_rlc_has_a_complex_pole_pair() {
+        let (rr, ll, cc) = (10.0, 1e-3, 1e-6);
+        let mut c = Circuit::new("rlc");
+        let vin = c.new_net();
+        let n1 = c.new_net();
+        let out = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("1", Unit::Volt),
+            vec![vin, NetId::GROUND],
+        );
+        c.add_part(
+            "R1",
+            PartKind::Resistor,
+            Some(Value::new(rr, Unit::Ohm)),
+            vec![vin, n1],
+        );
+        c.add_part(
+            "L1",
+            PartKind::Inductor,
+            Some(Value::new(ll, Unit::Henry)),
+            vec![n1, out],
+        );
+        c.add_part(
+            "C1",
+            PartKind::Capacitor,
+            Some(Value::new(cc, Unit::Farad)),
+            vec![out, NetId::GROUND],
+        );
+
+        let tf = Engine::new()
+            .transfer_function(&c, out, "V1")
+            .expect("RLC transfer function");
+
+        assert_eq!(tf.poles.len(), 2, "RLC has two poles");
+        // A lightly-damped pair: complex conjugates, |s| ≈ ω₀ = 1/√(LC).
+        let w0 = 1.0 / (ll * cc).sqrt();
+        assert!(
+            tf.poles.iter().all(|p| p.im.abs() > 1.0),
+            "lightly-damped RLC poles are complex, got {:?}",
+            tf.poles
+        );
+        for p in &tf.poles {
+            assert!(p.re < 0.0, "a passive circuit's poles are in the LHP");
+            assert!(
+                (p.magnitude() - w0).abs() < 1e-3 * w0,
+                "|pole| {} not ≈ ω₀ = {w0}",
+                p.magnitude()
+            );
+        }
+        // DC gain unity (inductor shorts, capacitor opens at DC → V(out) = V(in)).
+        assert!((tf.dc_gain - 1.0).abs() < 1e-9, "RLC DC gain is 1");
+    }
+
+    /// A `.TF` request naming a missing or non-source input is rejected cleanly.
+    #[test]
+    fn tf_rejects_a_bad_input_source() {
+        let mut c = Circuit::new("divider");
+        let vin = c.new_net();
+        let mid = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("1", Unit::Volt),
+            vec![vin, NetId::GROUND],
+        );
+        c.add_part("R1", PartKind::Resistor, v("1k", Unit::Ohm), vec![vin, mid]);
+        c.add_part(
+            "R2",
+            PartKind::Resistor,
+            v("1k", Unit::Ohm),
+            vec![mid, NetId::GROUND],
+        );
+        let eng = Engine::new();
+        assert!(matches!(
+            eng.transfer_function(&c, mid, "V9"),
+            Err(SimError::UnknownPart(_))
+        ));
+        assert!(matches!(
+            eng.transfer_function(&c, mid, "R1"),
+            Err(SimError::Unsupported(_))
+        ));
+    }
+
+    // --- CP-SIM-M7.2: transmission lines ------------------------------------
+
+    /// The far-end signal of a transmission line (`"v(n{resolved})"`).
+    fn far_sig<'a>(sigs: &'a [Signal], c: &Circuit, net: NetId) -> &'a Signal {
+        let name = format!("v(n{})", c.resolve(net).0);
+        sigs.iter()
+            .find(|s| s.name == name)
+            .expect("far-end signal")
+    }
+
+    /// A step source → Rs → lossless line (Z0, Td) → far end, with ports referenced
+    /// to ground. `rl = Some(r)` loads the far end; `None` leaves it open.
+    fn line_circuit(z0: f64, td: f64, rs: f64, rl: Option<f64>) -> (Circuit, NetId, NetId) {
+        let mut c = Circuit::new("tline");
+        let src = c.new_net();
+        let a1 = c.new_net();
+        let b1 = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("0", Unit::Volt),
+            vec![src, NetId::GROUND],
+        );
+        // A clean 0 → 1 V step at t = 0.
+        c.set_waveform(
+            "V1",
+            Waveform::Pulse {
+                v1: 0.0,
+                v2: 1.0,
+                delay: 0.0,
+                width: 1.0,
+                period: 0.0,
+            },
+        );
+        c.add_part(
+            "Rs",
+            PartKind::Resistor,
+            Some(Value::new(rs, Unit::Ohm)),
+            vec![src, a1],
+        );
+        if let Some(r) = rl {
+            c.add_part(
+                "RL",
+                PartKind::Resistor,
+                Some(Value::new(r, Unit::Ohm)),
+                vec![b1, NetId::GROUND],
+            );
+        }
+        assert!(c.add_line((a1, NetId::GROUND), (b1, NetId::GROUND), z0, td));
+        (c, a1, b1)
+    }
+
+    /// Sample a time signal at the step nearest time `t`.
+    fn sample_at(sig: &Signal, t: f64) -> f64 {
+        let i = sig
+            .x
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| (**a - t).abs().partial_cmp(&(**b - t).abs()).unwrap())
+            .map(|(i, _)| i)
+            .unwrap();
+        sig.real().unwrap()[i]
+    }
+
+    /// Gate: a source-matched lossless line delays a step by its propagation time —
+    /// the far end is quiet until `t = Td`, then settles to the matched half-step.
+    #[test]
+    fn lossless_line_delays_a_matched_step() {
+        let (z0, td) = (50.0, 1e-9);
+        // Matched both ends: Rs = Z0, RL = Z0 → far end rises to Vstep/2 at t = Td.
+        let (c, _a1, b1) = line_circuit(z0, td, z0, Some(z0));
+        let sigs = Engine::new()
+            .run(
+                &c,
+                &Analysis::Transient {
+                    duration: 4.0 * td,
+                    step: Some(td / 100.0),
+                },
+            )
+            .expect("line transient");
+        let far = far_sig(&sigs, &c, b1);
+
+        // Quiet well before the delay, settled to ~0.5 V well after it.
+        assert!(
+            sample_at(far, 0.5 * td).abs() < 0.02,
+            "far end must be quiet before Td, got {}",
+            sample_at(far, 0.5 * td)
+        );
+        assert!(
+            (sample_at(far, 2.5 * td) - 0.5).abs() < 0.02,
+            "matched far end must settle to Vstep/2 after Td, got {}",
+            sample_at(far, 2.5 * td)
+        );
+        // The rise happens around Td: still low at 0.9·Td, risen by 1.1·Td.
+        assert!(
+            sample_at(far, 0.9 * td) < 0.25,
+            "not yet risen just before Td"
+        );
+        assert!(sample_at(far, 1.1 * td) > 0.25, "risen just after Td");
+    }
+
+    /// Gate: an unterminated (open) lossless line reflects — the open far end sees
+    /// the incident half-step *double* to the full step, where the matched line
+    /// held half. A source-matched near end absorbs the return, so it stays there.
+    #[test]
+    fn lossless_line_open_end_reflects() {
+        let (z0, td) = (50.0, 1e-9);
+        let (c, _a1, b1) = line_circuit(z0, td, z0, None); // open far end
+        let sigs = Engine::new()
+            .run(
+                &c,
+                &Analysis::Transient {
+                    duration: 4.0 * td,
+                    step: Some(td / 100.0),
+                },
+            )
+            .expect("open line transient");
+        let far = far_sig(&sigs, &c, b1);
+
+        assert!(
+            sample_at(far, 0.5 * td).abs() < 0.02,
+            "open far end quiet before Td"
+        );
+        // Full reflection: the incident 0.5 V doubles to ~1.0 V (vs. 0.5 matched).
+        assert!(
+            (sample_at(far, 2.5 * td) - 1.0).abs() < 0.03,
+            "open far end must reflect to ~Vstep (doubling), got {}",
+            sample_at(far, 2.5 * td)
+        );
+    }
+
+    /// Gate: an AC sweep shows the line's **periodic** magnitude response. Every
+    /// frequency dependence of a resistor-plus-lossless-line network is carried by
+    /// `e^{−jωT}`, so the response repeats exactly with period `1/T` in frequency
+    /// (and genuinely varies within a period). Each AC run pins its last sample to
+    /// `f_stop`, so three runs read the response at three exact frequencies.
+    #[test]
+    fn lossless_line_ac_is_periodic_in_frequency() {
+        let (z0, td) = (50.0, 1e-9);
+        // Mismatched both ends (Rs ≪ Z0, RL ≫ Z0) → a strongly frequency-dependent
+        // far end whose magnitude repeats with period 1/T.
+        let (mut c, _a1, b1) = line_circuit(z0, td, 10.0, Some(400.0));
+        c.set_waveform(
+            "V1",
+            Waveform::Sine {
+                amplitude: 1.0,
+                freq: 1.0,
+                offset: 0.0,
+                phase_deg: 0.0,
+            },
+        );
+
+        let mag_at = |f_stop: f64| -> f64 {
+            let sigs = Engine::new()
+                .run(
+                    &c,
+                    &Analysis::Ac {
+                        f_start: 1e8,
+                        f_stop,
+                        points_per_decade: 30,
+                    },
+                )
+                .expect("line AC");
+            let far = far_sig(&sigs, &c, b1);
+            far.complex().unwrap().last().unwrap().magnitude()
+        };
+
+        let period = 1.0 / td; // 1 GHz
+        let f0 = 3e8;
+        let base = mag_at(f0);
+        let one_period = mag_at(f0 + period);
+        let quarter = mag_at(f0 + period / 4.0);
+
+        // One full period later, the magnitude is (numerically) the same…
+        assert!(
+            (base - one_period).abs() <= 1e-6 * base.max(1.0),
+            "response not periodic with 1/T: {base} vs {one_period}"
+        );
+        // …while a quarter period away it genuinely differs (not a flat response).
+        assert!(
+            (base - quarter).abs() > 0.05 * base.max(1e-3),
+            "response should vary within a period: {base} vs {quarter}"
+        );
+    }
+
+    /// A lumped-LC **lossy** line stamps and solves in both transient and AC: the
+    /// transient reaches a sensible delayed DC level and the AC sweep returns finite
+    /// magnitudes at every point. (The lossless gates pin the numerics; this fixes
+    /// that the lossy form is wired through both engines.)
+    #[test]
+    fn lossy_line_runs_in_transient_and_ac() {
+        let (z0, td) = (50.0, 1e-9);
+        let mut c = Circuit::new("lossy");
+        let src = c.new_net();
+        let a1 = c.new_net();
+        let b1 = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("1", Unit::Volt),
+            vec![src, NetId::GROUND],
+        );
+        c.add_part(
+            "Rs",
+            PartKind::Resistor,
+            Some(Value::new(z0, Unit::Ohm)),
+            vec![src, a1],
+        );
+        c.add_part(
+            "RL",
+            PartKind::Resistor,
+            Some(Value::new(1e6, Unit::Ohm)),
+            vec![b1, NetId::GROUND],
+        );
+        // A lossy line with small series R and shunt G.
+        assert!(c.add_lossy_line((a1, NetId::GROUND), (b1, NetId::GROUND), z0, td, 5.0, 1e-6));
+
+        // DC source → transient settles; the far end ends between 0 and the rail.
+        let tr = Engine::new()
+            .run(
+                &c,
+                &Analysis::Transient {
+                    duration: 50.0 * td,
+                    step: Some(td / 20.0),
+                },
+            )
+            .expect("lossy line transient");
+        let far = far_sig(&tr, &c, b1);
+        let last = *far.real().unwrap().last().unwrap();
+        assert!(
+            (0.0..=1.0).contains(&last) && last > 0.3,
+            "lossy far end should settle to a sensible DC level, got {last}"
+        );
+
+        // AC: finite magnitudes everywhere (needs a sine drive to excite it).
+        c.set_waveform(
+            "V1",
+            Waveform::Sine {
+                amplitude: 1.0,
+                freq: 1.0,
+                offset: 0.0,
+                phase_deg: 0.0,
+            },
+        );
+        let ac = Engine::new()
+            .run(
+                &c,
+                &Analysis::Ac {
+                    f_start: 1e6,
+                    f_stop: 1e9,
+                    points_per_decade: 10,
+                },
+            )
+            .expect("lossy line AC");
+        let far = far_sig(&ac, &c, b1);
+        assert!(
+            far.complex()
+                .unwrap()
+                .iter()
+                .all(|z| z.magnitude().is_finite()),
+            "lossy AC magnitudes must be finite"
+        );
+    }
+
+    /// A transmission line with the adaptive (stepless) transient is rejected
+    /// cleanly — it needs the uniform history grid of a fixed timestep.
+    #[test]
+    fn line_rejects_adaptive_transient() {
+        let (c, _a1, _b1) = line_circuit(50.0, 1e-9, 50.0, Some(50.0));
+        let err = Engine::new().run(
+            &c,
+            &Analysis::Transient {
+                duration: 4e-9,
+                step: None,
+            },
+        );
+        assert!(matches!(err, Err(SimError::Unsupported(_))));
     }
 }
