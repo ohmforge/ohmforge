@@ -10,12 +10,15 @@ description = "AI copilot: Claude client, tool definitions over the circuit API,
 workspace = true
 
 [features]
-# The real network transport. A std-only, no-network STUB today (CP-AF-M1.2 is
-# the loop, not live calls): it compiles and reads the API key from the env but
-# returns an error if asked to send. The HTTP/TLS stack (native reqwest, wasm
-# fetch) lands with the UI, behind this same flag — so enabling it drags in no
-# async runtime yet and the default build stays dependency-free and wasm-safe.
-http = []
+# The real network transport, OPT-IN. With the feature OFF (the default) the
+# crate is dependency-free and `wasm32`-clean — `reqwest`/`serde_json` appear in
+# the tree only under `--features http`. Enabling it wires `HttpTransport::send`
+# to a live Claude Messages round-trip: a native `reqwest` blocking client
+# (rustls, so no system-TLS/OpenSSL requirement), with the `wasm32` `fetch` path
+# left as a documented TODO stub. `serde_json` builds the request body and
+# parses the response; the crate's own types stay serde-free (they carry no
+# derives — tool input/schema remain opaque JSON text).
+http = ["dep:reqwest", "dep:serde_json"]
 
 [dependencies]
 ee-core = { workspace = true }
@@ -28,8 +31,24 @@ ee-shell = { workspace = true }
 # does not re-export the engine, so the loop reaches it directly. A workspace
 # crate, not a third-party dep — in keeping with the std-only, no-network rule.
 ee-sim = { workspace = true }
-# No third-party deps: the Claude client is hand-rolled std-only (matching
-# ee-fmt's hand-written parsers) so the copilot loop is network-free and the
-# crate compiles for wasm32 without a TLS stack. Tool input/result and JSON
-# schema are carried as opaque JSON *text*, so no serde is needed for the loop;
-# serialization lands with the live HTTP transport under the `http` feature.
+# No third-party deps in the DEFAULT build: the Claude client is hand-rolled
+# std-only (matching ee-fmt's hand-written parsers) so the copilot loop is
+# network-free and the crate compiles for wasm32 without a TLS stack. Tool
+# input/result and JSON schema are carried as opaque JSON *text*, so no serde is
+# needed for the loop; serialization lands with the live HTTP transport, gated
+# behind `http` below.
+
+# Live HTTP transport — NATIVE only and OPT-IN (behind `http`). Keeping these in
+# a `cfg(not(wasm32))` table means the `wasm32` core build never even considers
+# them; the default (feature-off) build pulls neither. `reqwest` is the blocking
+# client (rustls-tls → no OpenSSL/system-TLS dependency); `serde_json` builds the
+# Anthropic request body and parses the response (ee-ai's own types stay
+# serde-free). The `wasm32 + http` combination uses a documented TODO stub and
+# needs no dependency.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+reqwest = { version = "0.12", optional = true, default-features = false, features = [
+    "blocking",
+    "json",
+    "rustls-tls",
+] }
+serde_json = { version = "1", optional = true }
