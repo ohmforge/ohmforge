@@ -425,6 +425,61 @@ impl Circuit {
         self.tempcos.get(reference).copied()
     }
 
+    /// Replace the [`DiodeModel`] of an existing [`PartKind::Diode`] by reference
+    /// designator — the device-model counterpart of [`set_waveform`](Circuit::set_waveform).
+    /// Returns `true` only if a part with that reference exists **and** is a diode;
+    /// a non-diode (or unknown) reference is left untouched and reports `false`.
+    /// This is how the `ee-fmt` project format re-attaches a diode's `IS`/`N`/`RS`
+    /// on load, so a custom model survives a save→load round-trip. (`CP-AF-M6.1`.)
+    pub fn set_diode_model(&mut self, reference: &str, model: DiodeModel) -> bool {
+        match self.parts.iter_mut().find(|p| p.reference == reference) {
+            Some(Part {
+                kind: PartKind::Diode(m),
+                ..
+            }) => {
+                *m = model;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Replace the [`BjtModel`] of an existing [`PartKind::Bjt`] by reference
+    /// designator, preserving its [`Polarity`]. Returns `true` only if a part with
+    /// that reference exists and is a BJT; otherwise the circuit is untouched and
+    /// it reports `false`. The project-format `.model` directive uses this to carry
+    /// a BJT's `IS`/`BF`/`BR` across a save→load. (`CP-AF-M6.1`.)
+    pub fn set_bjt_model(&mut self, reference: &str, model: BjtModel) -> bool {
+        match self.parts.iter_mut().find(|p| p.reference == reference) {
+            Some(Part {
+                kind: PartKind::Bjt(_, m),
+                ..
+            }) => {
+                *m = model;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Replace the [`MosfetModel`] of an existing [`PartKind::Mosfet`] by reference
+    /// designator, preserving its [`Polarity`]. Returns `true` only if a part with
+    /// that reference exists and is a MOSFET; otherwise the circuit is untouched
+    /// and it reports `false`. The project-format `.model` directive uses this to
+    /// carry a MOSFET's `VTO`/`KP`/`LAMBDA` across a save→load. (`CP-AF-M6.1`.)
+    pub fn set_mosfet_model(&mut self, reference: &str, model: MosfetModel) -> bool {
+        match self.parts.iter_mut().find(|p| p.reference == reference) {
+            Some(Part {
+                kind: PartKind::Mosfet(_, m),
+                ..
+            }) => {
+                *m = model;
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn parts(&self) -> &[Part] {
         &self.parts
     }
@@ -534,6 +589,70 @@ mod tests {
         assert!(!c.set_tolerance("R1", f64::NAN));
         // The rejected writes left the earlier value untouched.
         assert_eq!(c.tolerance("R1"), Some(0.05));
+    }
+
+    #[test]
+    fn set_device_models_target_the_matching_kind_only() {
+        let mut c = Circuit::new("models");
+        let (a, b, e) = (c.new_net(), c.new_net(), c.new_net());
+        c.add_part(
+            "D1",
+            PartKind::Diode(DiodeModel::default()),
+            None,
+            vec![a, b],
+        );
+        c.add_part(
+            "Q1",
+            PartKind::Bjt(Polarity::P, BjtModel::default()),
+            None,
+            vec![a, b, e],
+        );
+        c.add_part(
+            "M1",
+            PartKind::Mosfet(Polarity::N, MosfetModel::default()),
+            None,
+            vec![a, b, e],
+        );
+        c.add_part("R1", PartKind::Resistor, None, vec![a, b]);
+
+        // Each setter updates the model of its matching kind and reports true.
+        let dm = DiodeModel {
+            is: 2.52e-9,
+            n: 1.75,
+            rs: 0.5,
+        };
+        assert!(c.set_diode_model("D1", dm));
+        let bm = BjtModel {
+            is: 2e-14,
+            bf: 250.0,
+            br: 3.0,
+            vt: 0.026,
+        };
+        assert!(c.set_bjt_model("Q1", bm));
+        let mm = MosfetModel {
+            vth: 1.5,
+            kp: 2e-3,
+            lambda: 0.02,
+        };
+        assert!(c.set_mosfet_model("M1", mm));
+
+        assert!(matches!(c.part_by_ref("D1").unwrap().kind, PartKind::Diode(m) if m == dm));
+        // Polarity is preserved alongside the new model.
+        assert!(matches!(
+            c.part_by_ref("Q1").unwrap().kind,
+            PartKind::Bjt(Polarity::P, m) if m == bm
+        ));
+        assert!(matches!(
+            c.part_by_ref("M1").unwrap().kind,
+            PartKind::Mosfet(Polarity::N, m) if m == mm
+        ));
+
+        // A wrong kind, or an unknown reference, is rejected and changes nothing.
+        assert!(!c.set_diode_model("Q1", dm));
+        assert!(!c.set_bjt_model("R1", bm));
+        assert!(!c.set_mosfet_model("D1", mm));
+        assert!(!c.set_diode_model("nope", dm));
+        assert!(matches!(c.part_by_ref("D1").unwrap().kind, PartKind::Diode(m) if m == dm));
     }
 
     #[test]
