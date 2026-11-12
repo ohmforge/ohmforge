@@ -33,11 +33,12 @@
 //! trivial mock.
 
 use ee_core::graph::Circuit;
-
+use ee_core::units::Unit;
 use ee_core::value::Value;
 
 use crate::current::{branch_currents, BranchCurrents};
 use crate::overlay::{NodeVoltages, Overlay};
+use crate::playback::Playback;
 use crate::schematic::{fmt_value, Schematic};
 use crate::screen::Pane;
 
@@ -78,6 +79,16 @@ pub trait Backend {
     /// solver crate.
     fn op_point(&self) -> NodeVoltages {
         NodeVoltages::new()
+    }
+
+    /// The cached transient result — the probed-node voltage time series from the
+    /// last transient `run` — for the scrubbable playback (`CP-UX-M7.1`). The
+    /// default is empty (no transient yet); a solver-backed backend overrides it
+    /// so the playhead has frames to scrub. Decoupled from `ee-sim` by the
+    /// [`Signal`](ee_core::signal::Signal) type, exactly as [`op_point`](Backend::op_point)
+    /// is by [`NodeVoltages`].
+    fn transient(&self) -> Vec<ee_core::signal::Signal> {
+        Vec::new()
     }
 }
 
@@ -371,6 +382,9 @@ pub struct App<B: Backend> {
     voltages: NodeVoltages,
     /// Per-branch currents derived from `voltages`, for the flow animation.
     currents: BranchCurrents,
+    /// The cached transient result and its playhead — a scrubbable "play" over the
+    /// last transient `run` (`CP-UX-M7.1`). Empty until a transient is run.
+    playback: Playback,
     /// Animation frame counter — the run loop bumps it so the flow arrows march.
     tick: u64,
     /// Last known terminal size, for mouse hit-testing between renders.
@@ -395,6 +409,7 @@ impl<B: Backend> App<B> {
             edit: Edit::default(),
             voltages,
             currents,
+            playback: Playback::new(),
             tick: 0,
             size: (100, 30),
             should_quit: false,
@@ -462,7 +477,24 @@ impl<B: Backend> App<B> {
             KeyCode::BackTab => self.focus_prev(),
             // `e` on the schematic pane enters interactive edit mode.
             KeyCode::Char('e') if self.focus == PanelId::Schematic => self.enter_edit_mode(),
+            // The scope pane is the transient-playback transport.
+            _ if self.focus == PanelId::Scope => self.on_scope_key(key),
             _ if self.focus == PanelId::Shell => self.on_shell_key(key),
+            _ => {}
+        }
+    }
+
+    /// Transient-playback transport keys on the scope pane (`CP-UX-M7.1`): space
+    /// toggles play/pause, Left/Right step the playhead one sample, and `,`/`.`
+    /// jump to the first/last frame. All clamp at the ends; an empty playback is a
+    /// no-op.
+    fn on_scope_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char(' ') => self.playback.toggle(),
+            KeyCode::Left => self.playback.step(-1),
+            KeyCode::Right => self.playback.step(1),
+            KeyCode::Char(',') => self.playback.seek(0),
+            KeyCode::Char('.') => self.playback.seek(usize::MAX),
             _ => {}
         }
     }
@@ -637,6 +669,7 @@ impl<B: Backend> App<B> {
             Ok(out) if is_scope(&out) => {
                 self.scope = out;
                 self.push_log("scope updated".to_string());
+                self.refresh_playback();
             }
             Ok(out) => {
                 for l in out.lines() {
@@ -657,10 +690,64 @@ impl<B: Backend> App<B> {
         self.currents = branch_currents(self.backend.circuit(), &self.voltages);
     }
 
-    /// Advance the current-flow animation by one frame. The run loop calls this on
-    /// each redraw tick; it is a pure state bump so the flow arrows march.
+    /// Reload the scrubbable playback from the backend's cached transient result.
+    /// Called after a transient `run` updates the scope, so the playhead has the
+    /// just-computed frames to scrub (reset to the start, paused). Pure — the solve
+    /// is the backend's; this only caches its signals (`CP-UX-M7.1`).
+    fn refresh_playback(&mut self) {
+        self.playback = Playback::from_signals(&self.backend.transient());
+    }
+
+    /// Advance the animation one frame: bump the current-flow phase and, when the
+    /// transient playback is playing, march its playhead one sample. The run loop
+    /// calls this on each redraw tick, so a single seam drives both the flow arrows
+    /// and the "play" scrub (`CP-UX-M6.1`/`CP-UX-M7.1`). Pure state bump — no I/O.
     pub fn tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
+        self.playback.advance();
+    }
+
+    // ── transient playback (CP-UX-M7.1) ────────────────────────────────────
+
+    /// The cached transient playback (for tests and the scope/overlay panes).
+    pub fn playback(&self) -> &Playback {
+        &self.playback
+    }
+
+    /// Start the transient playback advancing on each tick.
+    pub fn play(&mut self) {
+        self.playback.play();
+    }
+
+    /// Pause the transient playback, leaving the playhead where it is.
+    pub fn pause(&mut self) {
+        self.playback.pause();
+    }
+
+    /// Toggle the transient playback between playing and paused.
+    pub fn toggle_play(&mut self) {
+        self.playback.toggle();
+    }
+
+    /// Step the playhead by `delta` samples (negative rewinds), clamped at the ends.
+    pub fn step_playhead(&mut self, delta: isize) {
+        self.playback.step(delta);
+    }
+
+    /// Seek the playhead to an absolute sample index, clamped to the last frame.
+    pub fn seek_playhead(&mut self, index: usize) {
+        self.playback.seek(index);
+    }
+
+    /// The node voltages the overlay should paint: the transient sample at the
+    /// playhead while a scrubbable transient is loaded, else the DC op-point. This
+    /// is the seam that makes the live overlay "reflect the sampled instant".
+    fn overlay_voltages(&self) -> NodeVoltages {
+        if self.playback.is_empty() {
+            self.voltages.clone()
+        } else {
+            self.playback.voltages()
+        }
     }
 
     /// The last solved operating-point node voltages (for tests and the overlay).
@@ -928,11 +1015,16 @@ impl<B: Backend> App<B> {
         match id {
             PanelId::Schematic if self.overlay => {
                 let title = focus_title("op-point", focused);
+                // The overlay reflects the sampled instant: the transient sample at
+                // the playhead when scrubbing, else the DC op-point. Currents are
+                // rederived from whichever voltages are shown so the flow matches.
+                let volts = self.overlay_voltages();
+                let currents = branch_currents(self.backend.circuit(), &volts);
                 Overlay::new(&title)
                     .width(rect.w)
                     .color(false)
-                    .flow(&self.currents, self.tick)
-                    .pane_lines(self.backend.circuit(), &self.voltages, rect.h)
+                    .flow(&currents, self.tick)
+                    .pane_lines(self.backend.circuit(), &volts, rect.h)
             }
             PanelId::Schematic => {
                 let rows = Schematic::new("schematic")
@@ -949,12 +1041,8 @@ impl<B: Backend> App<B> {
                 Pane::new(&title, &base).render(rect.w, rect.h)
             }
             PanelId::Scope => {
-                let body = if self.scope.is_empty() {
-                    "(run a transient to plot)".to_string()
-                } else {
-                    self.scope.clone()
-                };
                 let title = focus_title("scope", focused);
+                let body = self.scope_body();
                 Pane::new(&title, &body).render(rect.w, rect.h)
             }
             PanelId::Shell => {
@@ -990,6 +1078,44 @@ impl<B: Backend> App<B> {
         };
         lines.push(hint);
         lines.join("\n")
+    }
+
+    /// The scope pane body: the last waveform frame, with a transient-playback
+    /// transport header prepended while a scrubbable transient is loaded so the
+    /// scope reflects the sampled instant at the playhead (`CP-UX-M7.1`).
+    fn scope_body(&self) -> String {
+        let base = if self.scope.is_empty() {
+            "(run a transient to plot)".to_string()
+        } else {
+            self.scope.clone()
+        };
+        if self.playback.is_empty() {
+            return base;
+        }
+        format!("{}\n{base}", self.transport_line())
+    }
+
+    /// The playback transport status line: play/pause state, the playhead time,
+    /// its frame index, and each probed signal's value at the playhead.
+    fn transport_line(&self) -> String {
+        let state = if self.playback.playing() {
+            "▶"
+        } else {
+            "⏸"
+        };
+        let time = fmt_value(&Value::new(self.playback.time(), Unit::Second));
+        let samples: Vec<String> = self
+            .playback
+            .samples()
+            .into_iter()
+            .map(|(name, v)| format!("{name}={}", fmt_value(&Value::new(v, Unit::Volt))))
+            .collect();
+        format!(
+            "{state} t={time} [{}/{}] {}",
+            self.playback.cursor() + 1,
+            self.playback.len(),
+            samples.join(" ")
+        )
     }
 
     /// The shell pane body: the most recent log lines, then the input prompt.
@@ -1116,6 +1242,7 @@ fn blit(grid: &mut [Vec<char>], lines: &[String], x: usize, y: usize) {
 mod tests {
     use super::*;
     use ee_core::graph::{NetId, PartKind};
+    use ee_core::signal::Signal;
     use ee_core::units::Unit;
     use ee_core::value::Value;
 
@@ -1765,5 +1892,203 @@ mod tests {
         assert_eq!(a.palette_filtered().first().copied(), Some("edit mode"));
         key(&mut a, KeyCode::Enter);
         assert!(a.edit_mode(), "palette command entered edit mode");
+    }
+
+    // ── transient playback (CP-UX-M7.1) ────────────────────────────────────
+
+    /// A backend with a divider circuit and a canned transient result, so the
+    /// playback state machine runs against real `Signal`s + a real `Circuit`
+    /// without the shell or solver. A `run` line returns a scope frame (so the app
+    /// loads the playback through the normal seam), and `transient()` hands back
+    /// the cached ramp. `v(n1)` rises 0→3 V and `v(n2)` 0→1.5 V over four samples
+    /// at 0, 1, 2, 3 ms.
+    struct PlayBackend {
+        circuit: Circuit,
+        transient: Vec<Signal>,
+    }
+
+    impl PlayBackend {
+        fn new() -> Self {
+            let mut circuit = Circuit::new("play");
+            let n1 = circuit.new_net();
+            let n2 = circuit.new_net();
+            circuit.add_part(
+                "V1",
+                PartKind::VoltageSource,
+                Some(Value::new(3.0, Unit::Volt)),
+                vec![n1, NetId::GROUND],
+            );
+            circuit.add_part(
+                "R1",
+                PartKind::Resistor,
+                Some(Value::new(1000.0, Unit::Ohm)),
+                vec![n1, n2],
+            );
+            circuit.add_part(
+                "R2",
+                PartKind::Resistor,
+                Some(Value::new(1000.0, Unit::Ohm)),
+                vec![n2, NetId::GROUND],
+            );
+            let t = vec![0.0, 1e-3, 2e-3, 3e-3];
+            let transient = vec![
+                Signal::time(
+                    format!("v(n{})", circuit.resolve(n1).0),
+                    Unit::Volt,
+                    t.clone(),
+                    vec![0.0, 1.0, 2.0, 3.0],
+                ),
+                Signal::time(
+                    format!("v(n{})", circuit.resolve(n2).0),
+                    Unit::Volt,
+                    t,
+                    vec![0.0, 0.5, 1.0, 1.5],
+                ),
+            ];
+            Self { circuit, transient }
+        }
+    }
+
+    impl Backend for PlayBackend {
+        fn execute(&mut self, line: &str) -> Result<String, String> {
+            if line.starts_with("run") {
+                // A minimal frame carrying the scope axis glyph (treated as a run).
+                return Ok("  tran\n  \u{2524}\u{2801}\n".to_string());
+            }
+            Ok(format!("ok: {line}"))
+        }
+        fn circuit(&self) -> &Circuit {
+            &self.circuit
+        }
+        fn transient(&self) -> Vec<Signal> {
+            self.transient.clone()
+        }
+    }
+
+    /// Running a transient loads the cached result into playback, and advancing the
+    /// playhead one sample at a time reads the exact (nearest-sample) node voltage
+    /// at each sampled time.
+    #[test]
+    fn playhead_samples_the_transient_at_each_step() {
+        let mut a = App::new(PlayBackend::new());
+        a.focus = PanelId::Shell;
+        typ(&mut a, "run tran 3m");
+        key(&mut a, KeyCode::Enter);
+
+        assert_eq!(a.playback().len(), 4, "four cached frames loaded");
+        assert_eq!(a.playback().cursor(), 0, "playhead starts at sample 0");
+
+        // Advancing N steps samples the expected voltage at each step — nearest
+        // sample, i.e. the cursor indexes straight into the cached time series.
+        let expect = [(0.0, 0.0), (1.0, 0.5), (2.0, 1.0), (3.0, 1.5)];
+        for (i, (e1, e2)) in expect.iter().enumerate() {
+            if i > 0 {
+                a.step_playhead(1);
+            }
+            assert_eq!(a.playback().cursor(), i, "cursor at step {i}");
+            assert_eq!(a.playback().sample("v(n1)"), Some(*e1), "v(n1) at step {i}");
+            assert_eq!(a.playback().sample("v(n2)"), Some(*e2), "v(n2) at step {i}");
+            // The playhead's time tracks the cursor (1 ms spacing).
+            assert_eq!(a.playback().time(), i as f64 * 1e-3, "time at step {i}");
+        }
+    }
+
+    /// Play/pause/seek/step and the frame-timeout tick move the cursor as expected
+    /// and clamp at both ends; the scope-pane transport keys drive the same path.
+    #[test]
+    fn play_pause_seek_move_the_cursor_and_clamp() {
+        let mut a = App::new(PlayBackend::new());
+        a.focus = PanelId::Shell;
+        typ(&mut a, "run");
+        key(&mut a, KeyCode::Enter);
+        assert_eq!(a.playback().len(), 4);
+
+        // Play / pause / toggle transitions.
+        assert!(
+            !a.playback().playing(),
+            "a freshly loaded playback is paused"
+        );
+        a.play();
+        assert!(a.playback().playing());
+        a.pause();
+        assert!(!a.playback().playing());
+        a.toggle_play();
+        assert!(a.playback().playing(), "toggle flips play back on");
+
+        // The run loop's tick marches the playhead one sample while playing — the
+        // same tick that advances the current-flow animation.
+        a.tick();
+        assert_eq!(a.playback().cursor(), 1, "a tick advanced the playhead");
+
+        // Seek clamps past the end; step clamps at both ends.
+        a.seek_playhead(99);
+        assert_eq!(a.playback().cursor(), 3, "seek clamps to the last frame");
+        a.step_playhead(5);
+        assert_eq!(a.playback().cursor(), 3, "step past the end clamps");
+        a.step_playhead(-10);
+        assert_eq!(a.playback().cursor(), 0, "step before the start clamps");
+
+        // Playing to the end clamps on the last frame and pauses.
+        a.play();
+        for _ in 0..10 {
+            a.tick();
+        }
+        assert_eq!(a.playback().cursor(), 3, "ticks clamp at the end");
+        assert!(!a.playback().playing(), "reaching the end pauses");
+
+        // The scope-pane transport keys drive the same transitions.
+        a.focus = PanelId::Scope;
+        a.handle_event(AppEvent::Key(KeyEvent::char(','))); // seek start
+        assert_eq!(a.playback().cursor(), 0);
+        a.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Right))); // step forward
+        assert_eq!(a.playback().cursor(), 1);
+        a.handle_event(AppEvent::Key(KeyEvent::new(KeyCode::Left))); // step back
+        assert_eq!(a.playback().cursor(), 0);
+        a.handle_event(AppEvent::Key(KeyEvent::char('.'))); // seek end
+        assert_eq!(a.playback().cursor(), 3);
+        a.handle_event(AppEvent::Key(KeyEvent::char(' '))); // toggle play
+        assert!(
+            a.playback().playing(),
+            "space toggled play on the scope pane"
+        );
+    }
+
+    /// The live overlay at the playhead is annotated with the *instantaneous*
+    /// transient voltages (reusing the op-point `v(n<net>)` path), and scrubbing to
+    /// another sample changes them — it is not a frozen DC op-point.
+    #[test]
+    fn overlay_at_the_playhead_shows_the_instantaneous_voltages() {
+        let mut a = App::new(PlayBackend::new());
+        a.focus = PanelId::Shell;
+        typ(&mut a, "run");
+        key(&mut a, KeyCode::Enter);
+        a.overlay = true;
+
+        // At sample 2 the ramp reads v(n1) = 2 V and v(n2) = 1 V.
+        a.seek_playhead(2);
+        let frame = a.render(80, 24);
+        assert!(
+            frame.contains("n1=2V"),
+            "playhead overlay shows v(n1)=2 V:\n{frame}"
+        );
+        assert!(
+            frame.contains("n2=1V"),
+            "playhead overlay shows v(n2)=1 V:\n{frame}"
+        );
+
+        // Scrubbing to sample 3 moves the annotation to v(n1) = 3 V.
+        a.seek_playhead(3);
+        let frame = a.render(80, 24);
+        assert!(frame.contains("n1=3V"), "scrubbed to v(n1)=3 V:\n{frame}");
+        assert!(
+            !frame.contains("n1=2V"),
+            "the previous sample's annotation is gone:\n{frame}"
+        );
+
+        // The scope pane reflects the sampled instant via its transport header.
+        assert!(
+            frame.contains("t="),
+            "scope transport shows the playhead time:\n{frame}"
+        );
     }
 }

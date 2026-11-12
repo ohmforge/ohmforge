@@ -166,7 +166,7 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 - [~] **CP-SIM-M7.2** (sim-core) Transmission lines (lossless ideal + lossy LC) in transient + AC, as a circuit-level relation (e.g. `Circuit::add_line`), no new `PartKind`. — *gate:* a matched lossless line delays a step by its propagation time; a mismatched line reflects; AC shows the periodic response.
 - [~] **CP-BRD-M7.1** (boards) ESP32 Xtensa LX6 core + `Esp32` board over a correct supported ISA subset (unimplemented → `Unknown`, coverage documented), `ee-mcu` stays `ee-sim`-free. — *gate:* a hand-assembled Xtensa blink toggles a GPIO; the decoder's covered-opcode set is asserted. _(Closes the documented ESP32/Xtensa deferral.)_
 - [~] **CP-AF-M7.1** (ai-fmt) Wire the live HTTP transport behind the `http` feature (native `reqwest`; `wasm32` `fetch`) so the client performs a real Messages round-trip; dependency opt-in, default build stays dependency-free + `wasm32`-clean. — *gate:* a feature-gated test drives one round-trip against a local mock HTTP server (no outbound network) and parses a `ModelResponse`. _(Closes the documented live-transport deferral.)_
-- [~] **CP-UX-M7.1** (ui-shell) Transient "play"/scrub: a time-cursor playback over a cached transient — advance/rewind a playhead, scope + overlay reflect the sampled instant. Pure state machine, no tty. — *gate:* a playhead advanced over a cached transient samples the right value at each step; play/pause/seek asserted on data.
+- [x] **CP-UX-M7.1** (ui-shell) Transient "play"/scrub: a time-cursor playback over a cached transient — advance/rewind a playhead, scope + overlay reflect the sampled instant. Pure state machine, no tty. — *gate:* `playhead_samples_the_transient_at_each_step` (nearest-sample: cursor indexes the cached series; v(n1)/v(n2) exact at each step), `play_pause_seek_move_the_cursor_and_clamp` (play/pause/toggle, the frame-timeout `tick` advances + stops at the end, seek/step clamp at both ends, scope-pane transport keys drive the same path), `overlay_at_the_playhead_shows_the_instantaneous_voltages` (overlay at the playhead shows the transient sample via the op-point `v(n<net>)` annotation path, scrubbing changes it). `Playback` state machine in `ee-tui`; `Backend::transient()` seam wired to `Shell` (caches the last transient run). Full sweep green: fmt + clippy `-D warnings` + `cargo test --workspace` + `wasm32` core + `-D warnings` docs.
 - [~] **CP-WEB.6** (web) Hosted signaling relay so co-edit converges across machines: pure host-tested room/broadcast routing + a thin feature-gated native WebSocket binary (hand-rolled `std::net` upgrade preferred; any WS dep stays behind the native feature). — *gate:* host tests — two clients in a room exchange ops and converge; malformed frames rejected cleanly. _(Closes the documented hosted-relay deferral.)_
 - [ ] **CP-SHIP.3** (platform) Polish & tag **v0.5.0**: refresh docs/examples/README for M7, full CI-parity gate sweep (incl. `http`/relay feature jobs), tag the release. Done on `main` during reconcile.
 
@@ -178,11 +178,11 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 |---|---|---|---|
 | sim-core | 23 | 2 | 25 |
 | boards | 16 | 1 | 17 |
-| ui-shell | 17 | 1 | 18 |
+| ui-shell | 18 | 0 | 18 |
 | ai-fmt | 16 | 1 | 17 |
 | platform | 7 | 0 | 8 |
 | web | 5 | 1 | 6 |
-| **Total** | **84** | **6** | **91** |
+| **Total** | **85** | **5** | **91** |
 
 _**67/67 — M0 through M4 all complete** (M0–M3 tagged v0.1.0; M4 adds the rest). M4 delivered the **plugin device-model API** + an **instrument/block plugin trait**, a **KLU-class ordered/reusable sparse solver** and **multithreaded analyses**, a **Cortex-M3/M4 (Thumb-2)** core with an STM32 board, **SPICE `.model` import** + a vendor model library, and **shareable circuit links** in the browser. Deferred by design: real-time collaboration, the QEMU full-SBC bridge, and full vendor-SPICE `.model` fidelity — the standing M-next horizon._
 

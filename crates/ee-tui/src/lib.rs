@@ -12,6 +12,7 @@ pub mod app;
 pub mod breadboard;
 pub mod current;
 pub mod overlay;
+pub mod playback;
 pub mod plot;
 pub mod run;
 pub mod schematic;
@@ -23,6 +24,7 @@ pub use app::{
 pub use breadboard::Breadboard;
 pub use current::{branch_currents, flow_glyph, BranchCurrent, BranchCurrents};
 pub use overlay::{NodeVoltages, Overlay};
+pub use playback::Playback;
 pub use plot::Plot;
 pub use run::run;
 pub use schematic::Schematic;
