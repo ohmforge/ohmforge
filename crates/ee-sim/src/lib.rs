@@ -1291,6 +1291,13 @@ const STEPPING_STEPS: usize = 16;
 const GMIN_START: f64 = 1e-3;
 /// Smallest non-zero gmin before the final gmin = 0 solve on the real circuit.
 const GMIN_FLOOR: f64 = 1e-12;
+/// Residual SPICE-style GMIN: a tiny node-to-ground conductance stamped into the DC
+/// bias only as a *fallback*, when the plain + aided ladder leaves the system
+/// singular because a node floats at DC (a reactance-only node — e.g. a capacitive
+/// divider's mid-node — that no resistive path pins). It conditions that node so the
+/// bias returns a gmin-pinned point instead of erroring [`SimError::Singular`]. It is
+/// never present on a circuit that already solves, so it cannot move a golden result.
+const GMIN_RESIDUAL: f64 = 1e-12;
 
 /// Solve a (possibly nonlinear) DC-like system with the full convergence-aid
 /// ladder, shared by the DC operating point and the transient's `t = 0` initial
@@ -1358,6 +1365,21 @@ fn solve_dc(
     layout: &Layout,
     registry: &DeviceRegistry,
 ) -> Result<Vec<f64>, SimError> {
+    solve_dc_conditioned(circuit, layout, registry, 0.0)
+}
+
+/// [`solve_dc`] with a residual node-to-ground conductance `gmin` added to every
+/// bias stamp. `gmin = 0.0` is the plain operating point (what [`solve_dc`] runs, so
+/// every existing caller is unchanged to the bit). A small positive `gmin` — the
+/// [`GMIN_RESIDUAL`] fallback [`dc_sweep`] takes on a singular point — conditions a
+/// node that floats at DC so the solve returns a gmin-pinned point instead of
+/// erroring [`SimError::Singular`].
+fn solve_dc_conditioned(
+    circuit: &Circuit,
+    layout: &Layout,
+    registry: &DeviceRegistry,
+    gmin: f64,
+) -> Result<Vec<f64>, SimError> {
     let size = layout.n_nodes()
         + layout.vsources.len()
         + layout.n_controlled_branches()
@@ -1371,6 +1393,14 @@ fn solve_dc(
         stamp_current_sources(sys, circuit, layout, None, alpha)?;
         stamp_controlled_sources(sys, circuit, layout)?;
         stamp_inductor_shorts(sys, circuit, layout)?;
+        // Residual GMIN (fallback only): a tiny conductance from every node to ground,
+        // baked into the stamp so it survives even the linear one-shot path and gmin
+        // stepping's final gmin = 0 step. Left out entirely when `gmin == 0.0`.
+        if gmin > 0.0 {
+            for i in 0..layout.n_nodes() {
+                sys.stamp_conductance(Some(i), None, gmin);
+            }
+        }
         Ok(())
     };
     // A one-shot operating point: its own solver reuses the symbolic factorization
@@ -1379,6 +1409,34 @@ fn solve_dc(
     // stays thread-local.
     let mut solver = ReusableSolver::new(size);
     solve_aided(circuit, layout, size, &devices, &stamp_at, &mut solver)
+}
+
+/// The DC bias a small-signal analysis (AC / noise / `.TF`) linearizes about. A
+/// circuit with **no** nonlinear device has no operating-point dependence — its
+/// small-signal stamps (`G`, `jωC`, `1/jωL`) are constant — so it needs no bias at
+/// all, and we skip the DC solve and return a zero vector. This is what unblocks a
+/// node that floats *only* at DC: a capacitive divider's mid-node, an AC-coupled
+/// subnode, or a source-matched open-ended line all have a perfectly well-conditioned
+/// small-signal matrix, yet the DC gate used to reject them as [`SimError::Singular`].
+/// A genuinely singular small-signal system (no AC path to ground) still surfaces at
+/// the complex solve. The returned vector is never indexed on this path (the
+/// device-linearization loops are empty), and for a circuit that *does* carry
+/// nonlinear devices the real operating point is solved and returned exactly as
+/// before — so every previously-solving analysis is bit-for-bit unchanged.
+fn small_signal_bias(
+    circuit: &Circuit,
+    layout: &Layout,
+    registry: &DeviceRegistry,
+) -> Result<Vec<f64>, SimError> {
+    if collect_nonlinear(circuit, registry)?.is_empty() {
+        let size = layout.n_nodes()
+            + layout.vsources.len()
+            + layout.n_controlled_branches()
+            + layout.inductors.len();
+        Ok(vec![0.0; size])
+    } else {
+        solve_dc(circuit, layout, registry)
+    }
 }
 
 /// gmin stepping: solve with a large node-to-ground conductance first (which
@@ -2163,6 +2221,29 @@ fn transient(
             "a transmission line needs a fixed transient timestep",
         ));
     }
+    // A lossless line reads its delayed port history by interpolating committed
+    // samples one delay back. A timestep coarser than the line delay pushes that
+    // lookback (`t − delay`) past the last committed sample, where `LineState::port_at`
+    // would silently clamp to it — under-resolving the travelling wave. Reject it
+    // explicitly rather than return a quietly wrong waveform. (`CP-SIM-M8.1`.) The
+    // delay-matched step (`h == delay`, lookback = the previous sample exactly) is fine.
+    if let Some(h) = step {
+        if h > 0.0 {
+            if let Some(min_delay) = model
+                .lines
+                .iter()
+                .filter(|l| l.loss.is_none())
+                .map(|l| l.delay)
+                .reduce(f64::min)
+            {
+                if h > min_delay * (1.0 + 1e-9) {
+                    return Err(SimError::Unsupported(
+                        "transient timestep is coarser than a lossless transmission-line delay",
+                    ));
+                }
+            }
+        }
+    }
     let (x0, cap_v0, line0) = model.initial()?;
     match step {
         Some(h) if h > 0.0 => fixed_transient(&model, duration, h, x0, cap_v0, line0),
@@ -2377,8 +2458,10 @@ fn ac(
         return Err(SimError::BadValue("AC sweep range/points".into()));
     }
 
-    // Bias point for linearizing nonlinear devices (and verifying the topology).
-    let x_dc = solve_dc(circuit, layout, registry)?;
+    // Bias point for linearizing nonlinear devices. A linear circuit needs none, so
+    // this skips the DC gate that used to reject a DC-floating node (see
+    // [`small_signal_bias`]); the complex solve below still catches a true singularity.
+    let x_dc = small_signal_bias(circuit, layout, registry)?;
 
     let n = layout.n_nodes();
     let m = layout.vsources.len();
@@ -2785,8 +2868,10 @@ impl Engine {
         };
         let out_node = layout.node_of(circuit, output);
 
-        // Linearize about the DC operating point and assemble the (G, C) pencil.
-        let x_dc = solve_dc(circuit, &layout, reg)?;
+        // Linearize about the DC operating point and assemble the (G, C) pencil. A
+        // linear circuit needs no bias, so this skips the DC gate that used to reject a
+        // DC-floating node (see [`small_signal_bias`]).
+        let x_dc = small_signal_bias(circuit, &layout, reg)?;
         let (g, c, size) = assemble_pencil(circuit, &layout, &x_dc, reg)?;
         if size + 1 > PZ_MAX_SYSTEM {
             return Err(SimError::Unsupported(
@@ -3123,8 +3208,10 @@ fn noise(
         return Err(SimError::BadValue("noise sweep range/points".into()));
     }
 
-    // DC bias, to linearize any nonlinear device (and verify the topology).
-    let x_dc = solve_dc(circuit, layout, registry)?;
+    // DC bias, to linearize any nonlinear device. A linear circuit needs none, so this
+    // skips the DC gate that used to reject a DC-floating node (see
+    // [`small_signal_bias`]); the complex solve below still catches a true singularity.
+    let x_dc = small_signal_bias(circuit, layout, registry)?;
 
     let n = layout.n_nodes();
     let m = layout.vsources.len();
@@ -3579,7 +3666,17 @@ fn dc_sweep(
     let solve_point = |k: usize| -> Result<Vec<f64>, SimError> {
         let mut work = base.clone();
         work.set_value(source, Value::new(values[k], unit));
-        solve_dc(&work, &layout, registry)
+        match solve_dc(&work, &layout, registry) {
+            // A node that floats at DC (a capacitive divider's mid-node, an AC-coupled
+            // subnode) leaves the operating point singular. Condition it with a residual
+            // SPICE-style GMIN and re-solve, so the sweep returns a gmin-pinned trace for
+            // that node instead of erroring. Only the point that would otherwise error
+            // takes this path, so any sweep that already solved is bit-for-bit unchanged.
+            Err(SimError::Singular) => {
+                solve_dc_conditioned(&work, &layout, registry, GMIN_RESIDUAL)
+            }
+            other => other,
+        }
     };
     let points = run_indexed(values.len(), &solve_point)?;
 
@@ -7654,5 +7751,197 @@ mod tests {
             },
         );
         assert!(matches!(err, Err(SimError::Unsupported(_))));
+    }
+
+    /// Gate (`CP-SIM-M8.1`, Finding 2): a fixed timestep coarser than a lossless
+    /// line's delay would push the delayed port lookback past the committed history,
+    /// silently under-resolving the travelling wave. It must be rejected explicitly,
+    /// while a step at or below the delay still runs.
+    #[test]
+    fn line_rejects_timestep_coarser_than_delay() {
+        let td = 1e-9;
+        let (c, _a1, _b1) = line_circuit(50.0, td, 50.0, Some(50.0));
+        // Coarser than the delay → clean rejection, not a quietly wrong waveform.
+        let coarse = Engine::new().run(
+            &c,
+            &Analysis::Transient {
+                duration: 10.0 * td,
+                step: Some(2.0 * td),
+            },
+        );
+        assert!(
+            matches!(coarse, Err(SimError::Unsupported(_))),
+            "a step coarser than the line delay must be rejected, got {coarse:?}"
+        );
+        // A step at the delay (and finer) still solves.
+        assert!(
+            Engine::new()
+                .run(
+                    &c,
+                    &Analysis::Transient {
+                        duration: 10.0 * td,
+                        step: Some(td),
+                    },
+                )
+                .is_ok(),
+            "a delay-matched timestep must still run"
+        );
+    }
+
+    // --- CP-SIM-M8.1: DC-floating-node small-signal analyses ----------------
+
+    /// Gate (`CP-SIM-M8.1`, Finding 1): a `V1(sine)—C1—mid—C2—gnd` capacitive divider
+    /// (C1 = C2 = 1 nF) solves in AC with `v(mid)` at exactly half the 1∠0 input at
+    /// every frequency. The mid-node floats at DC (both caps open), which used to make
+    /// the DC-bias gate error `Singular`; the small-signal matrix (`jωC₁`, `jωC₂`) is
+    /// well-conditioned, so skipping the bias for this device-free circuit lets it solve.
+    #[test]
+    fn ac_solves_a_capacitive_divider() {
+        let mut c = Circuit::new("cap_divider");
+        let inp = c.new_net();
+        let mid = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            None,
+            vec![inp, NetId::GROUND],
+        );
+        c.set_waveform(
+            "V1",
+            Waveform::Sine {
+                amplitude: 1.0,
+                freq: 1_000.0,
+                offset: 0.0,
+                phase_deg: 0.0,
+            },
+        );
+        c.add_part(
+            "C1",
+            PartKind::Capacitor,
+            Some(Value::new(1e-9, Unit::Farad)),
+            vec![inp, mid],
+        );
+        c.add_part(
+            "C2",
+            PartKind::Capacitor,
+            Some(Value::new(1e-9, Unit::Farad)),
+            vec![mid, NetId::GROUND],
+        );
+        let sigs = Engine::new()
+            .run(
+                &c,
+                &Analysis::Ac {
+                    f_start: 10.0,
+                    f_stop: 100_000.0,
+                    points_per_decade: 10,
+                },
+            )
+            .expect("capacitive divider must solve in AC despite the DC-floating mid-node");
+        let name = format!("v(n{})", c.resolve(mid).0);
+        let z = sigs
+            .iter()
+            .find(|s| s.name == name)
+            .expect("mid-node signal")
+            .complex()
+            .unwrap();
+        // C1/(C1+C2) = 0.5 at every frequency (frequency-independent divider).
+        for h in z {
+            assert!(
+                (h.magnitude() - 0.5).abs() < 1e-9,
+                "capacitive divider mid must be 0.5 of the input, got {}",
+                h.magnitude()
+            );
+        }
+    }
+
+    /// Gate (`CP-SIM-M8.1`, Finding 1): a source-matched, open-ended lossless line
+    /// solves in AC. Its far end is connected only through the line, so it floats at
+    /// DC (the DC solve stamps no line) and used to error `Singular`; the AC assembly
+    /// stamps the line's `e^{−jωT}` companion, so the node is well-defined there.
+    #[test]
+    fn ac_solves_a_source_matched_open_line() {
+        let (z0, td) = (50.0, 1e-9);
+        let (mut c, _a1, b1) = line_circuit(z0, td, z0, None); // matched source, open far end
+        c.set_waveform(
+            "V1",
+            Waveform::Sine {
+                amplitude: 1.0,
+                freq: 1.0,
+                offset: 0.0,
+                phase_deg: 0.0,
+            },
+        );
+        let sigs = Engine::new()
+            .run(
+                &c,
+                &Analysis::Ac {
+                    f_start: 1e6,
+                    f_stop: 1e9,
+                    points_per_decade: 10,
+                },
+            )
+            .expect("source-matched open line must solve in AC despite its DC-floating far end");
+        let far = far_sig(&sigs, &c, b1);
+        let z = far.complex().unwrap();
+        assert!(!z.is_empty(), "AC produced no far-end samples");
+        assert!(
+            z.iter()
+                .all(|h| h.magnitude().is_finite() && h.magnitude() > 0.0),
+            "open-line far-end magnitudes must be finite and nonzero"
+        );
+    }
+
+    /// Gate (`CP-SIM-M8.1`, Finding 1): sweeping the source of a capacitive divider in
+    /// DC no longer errors `Singular`. The caps are open at DC so the mid-node floats;
+    /// the residual-GMIN fallback pins it to 0 V and the sweep returns a trace.
+    #[test]
+    fn dc_sweep_solves_a_capacitive_divider() {
+        let mut c = Circuit::new("cap_divider_dc");
+        let inp = c.new_net();
+        let mid = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("0", Unit::Volt),
+            vec![inp, NetId::GROUND],
+        );
+        c.add_part(
+            "C1",
+            PartKind::Capacitor,
+            Some(Value::new(1e-9, Unit::Farad)),
+            vec![inp, mid],
+        );
+        c.add_part(
+            "C2",
+            PartKind::Capacitor,
+            Some(Value::new(1e-9, Unit::Farad)),
+            vec![mid, NetId::GROUND],
+        );
+        let sigs = Engine::new()
+            .run(
+                &c,
+                &Analysis::DcSweep {
+                    source: "V1".into(),
+                    start: 0.0,
+                    stop: 5.0,
+                    step: 1.0,
+                },
+            )
+            .expect("capacitive divider DC sweep must solve via the residual-GMIN fallback");
+        let name = format!("v(n{})", c.resolve(mid).0);
+        let y = sigs
+            .iter()
+            .find(|s| s.name == name)
+            .expect("mid-node sweep trace")
+            .real()
+            .unwrap();
+        assert_eq!(y.len(), 6, "0..=5 V by 1 V is six points");
+        // The floating mid-node is gmin-pinned to ~0 V at every swept level.
+        for &vmid in y {
+            assert!(
+                vmid.abs() < 1e-6,
+                "floating mid should pin to ~0 V, got {vmid}"
+            );
+        }
     }
 }
