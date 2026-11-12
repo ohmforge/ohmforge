@@ -10,6 +10,7 @@
 
 pub mod app;
 pub mod breadboard;
+pub mod current;
 pub mod overlay;
 pub mod plot;
 pub mod run;
@@ -20,6 +21,7 @@ pub use app::{
     App, AppEvent, Backend, EditAction, KeyCode, KeyEvent, MouseEvent, MouseKind, PanelId,
 };
 pub use breadboard::Breadboard;
+pub use current::{branch_currents, flow_glyph, BranchCurrent, BranchCurrents};
 pub use overlay::{NodeVoltages, Overlay};
 pub use plot::Plot;
 pub use run::run;

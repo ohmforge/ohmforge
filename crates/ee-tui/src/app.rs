@@ -34,8 +34,11 @@
 
 use ee_core::graph::Circuit;
 
+use ee_core::value::Value;
+
+use crate::current::{branch_currents, BranchCurrents};
 use crate::overlay::{NodeVoltages, Overlay};
-use crate::schematic::Schematic;
+use crate::schematic::{fmt_value, Schematic};
 use crate::screen::Pane;
 
 /// How far one resize step moves a split boundary, as a fraction of the axis.
@@ -67,6 +70,15 @@ pub trait Backend {
     fn execute(&mut self, line: &str) -> Result<String, String>;
     /// Borrow the circuit being built, for the schematic/overlay pane.
     fn circuit(&self) -> &Circuit;
+    /// Solve the DC operating point of the current circuit, for the live overlay
+    /// (`CP-UX-M6.1`). The default returns an empty solve (every net unknown); a
+    /// backend wired to the solver overrides it so the overlay reflects edits and
+    /// live tuning immediately. Decoupled from `ee-sim` by the [`NodeVoltages`]
+    /// data type, exactly as [`NodeVoltages::from_signals`] is — `ee-tui` names no
+    /// solver crate.
+    fn op_point(&self) -> NodeVoltages {
+        NodeVoltages::new()
+    }
 }
 
 /// The three docked panels, in focus-cycle order.
@@ -215,6 +227,11 @@ pub enum EditAction {
     Wire { node_a: String, node_b: String },
     /// Delete a placed part by reference: `remove <reference>`.
     Remove { reference: String },
+    /// Retarget a component's value: `set <reference>.value <value>`. This is the
+    /// live-tuning mutation (`CP-UX-M6.1`); it lowers to the shell's `set` verb so
+    /// a `+`/`-` nudge and a typed `set` share the one mutation path, and the
+    /// re-solved op-point/overlay reflects it on the next render.
+    Tune { reference: String, value: String },
 }
 
 impl EditAction {
@@ -229,9 +246,13 @@ impl EditAction {
             } => format!("add {reference} {node_a} {node_b} {value}"),
             EditAction::Wire { node_a, node_b } => format!("wire {node_a} {node_b}"),
             EditAction::Remove { reference } => format!("remove {reference}"),
+            EditAction::Tune { reference, value } => format!("set {reference}.value {value}"),
         }
     }
 }
+
+/// The multiplicative step one `+`/`-` tune nudge applies to a component value.
+const TUNE_STEP: f64 = 1.1;
 
 /// What the edit-mode mini-prompt is currently collecting, if anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -345,6 +366,13 @@ pub struct App<B: Backend> {
     overlay: bool,
     /// Interactive schematic-editing sub-state (`CP-UX-M5.1`).
     edit: Edit,
+    /// The last solved operating point, refreshed after every mutation so the
+    /// overlay reflects edits and live tuning (`CP-UX-M6.1`).
+    voltages: NodeVoltages,
+    /// Per-branch currents derived from `voltages`, for the flow animation.
+    currents: BranchCurrents,
+    /// Animation frame counter — the run loop bumps it so the flow arrows march.
+    tick: u64,
     /// Last known terminal size, for mouse hit-testing between renders.
     size: (usize, usize),
     should_quit: bool,
@@ -353,6 +381,8 @@ pub struct App<B: Backend> {
 impl<B: Backend> App<B> {
     /// A fresh app over `backend`, focused on the shell with an empty scope.
     pub fn new(backend: B) -> Self {
+        let voltages = backend.op_point();
+        let currents = branch_currents(backend.circuit(), &voltages);
         Self {
             backend,
             layout: Layout::default(),
@@ -363,6 +393,9 @@ impl<B: Backend> App<B> {
             input: String::new(),
             overlay: false,
             edit: Edit::default(),
+            voltages,
+            currents,
+            tick: 0,
             size: (100, 30),
             should_quit: false,
         }
@@ -612,6 +645,32 @@ impl<B: Backend> App<B> {
             }
             Err(e) => self.push_log(format!("error: {e}")),
         }
+        self.refresh_solution();
+    }
+
+    /// Re-solve the operating point and rederive the branch currents from the
+    /// current circuit. Called after every command/edit so the overlay — voltages
+    /// and the current-flow animation alike — tracks the latest circuit. Pure (the
+    /// solve is the backend's; this only caches its data).
+    fn refresh_solution(&mut self) {
+        self.voltages = self.backend.op_point();
+        self.currents = branch_currents(self.backend.circuit(), &self.voltages);
+    }
+
+    /// Advance the current-flow animation by one frame. The run loop calls this on
+    /// each redraw tick; it is a pure state bump so the flow arrows march.
+    pub fn tick(&mut self) {
+        self.tick = self.tick.wrapping_add(1);
+    }
+
+    /// The last solved operating-point node voltages (for tests and the overlay).
+    pub fn op_voltages(&self) -> &NodeVoltages {
+        &self.voltages
+    }
+
+    /// The branch currents derived from the last solve (for tests and the overlay).
+    pub fn branch_currents(&self) -> &BranchCurrents {
+        &self.currents
     }
 
     // ── interactive editing (CP-UX-M5.1) ──────────────────────────────────
@@ -693,8 +752,38 @@ impl<B: Backend> App<B> {
             KeyCode::Char('a') => self.open_prompt(EditPrompt::Place),
             KeyCode::Char('w') => self.open_prompt(EditPrompt::Wire),
             KeyCode::Char('d') | KeyCode::Backspace => self.remove_selected(),
+            // `+`/`-` nudge the selected component's value and re-solve live.
+            KeyCode::Char('+') | KeyCode::Char('=') => self.tune_selected(true),
+            KeyCode::Char('-') | KeyCode::Char('_') => self.tune_selected(false),
             _ => {}
         }
+    }
+
+    /// Nudge the selected component's value by one fixed step (up when `up`,
+    /// else down) and re-solve. Reads the part's current value, scales it, and
+    /// routes the change through the shared [`EditAction::Tune`] → `set` path, so
+    /// the overlay's op-point and current flow reflect it immediately. A part with
+    /// no numeric value (or no selection) is a clean logged no-op.
+    pub fn tune_selected(&mut self, up: bool) {
+        let Some(reference) = self.selected_part() else {
+            self.push_log("error: no part selected to tune".to_string());
+            return;
+        };
+        let Some(value) = self
+            .backend
+            .circuit()
+            .part_by_ref(&reference)
+            .and_then(|p| p.value)
+        else {
+            self.push_log(format!("error: {reference} has no tunable value"));
+            return;
+        };
+        let factor = if up { TUNE_STEP } else { 1.0 / TUNE_STEP };
+        let tuned = Value::new(value.magnitude * factor, value.unit);
+        self.apply_edit(EditAction::Tune {
+            reference,
+            value: fmt_value(&tuned),
+        });
     }
 
     fn open_prompt(&mut self, prompt: EditPrompt) {
@@ -839,11 +928,11 @@ impl<B: Backend> App<B> {
         match id {
             PanelId::Schematic if self.overlay => {
                 let title = focus_title("op-point", focused);
-                Overlay::new(&title).width(rect.w).color(false).pane_lines(
-                    self.backend.circuit(),
-                    &NodeVoltages::new(),
-                    rect.h,
-                )
+                Overlay::new(&title)
+                    .width(rect.w)
+                    .color(false)
+                    .flow(&self.currents, self.tick)
+                    .pane_lines(self.backend.circuit(), &self.voltages, rect.h)
             }
             PanelId::Schematic => {
                 let rows = Schematic::new("schematic")
@@ -895,7 +984,7 @@ impl<B: Backend> App<B> {
                 .collect()
         };
         let hint = match self.edit.prompt {
-            EditPrompt::None => "[a]dd [w]ire [d]el [esc]".to_string(),
+            EditPrompt::None => "[a]dd [w]ire [d]el [+/-]tune [esc]".to_string(),
             EditPrompt::Place => format!("add> {}", self.edit.buffer),
             EditPrompt::Wire => format!("wire> {}", self.edit.buffer),
         };
@@ -1402,6 +1491,17 @@ mod tests {
                     self.circuit.wire(na, nb);
                     Ok(format!("wired {a} {b}"))
                 }
+                ["set", target, v] => {
+                    // `set <ref>.value <v>` — retarget a component value in place.
+                    let reference = target.split('.').next().unwrap_or(*target).to_string();
+                    let unit = match self.circuit.part_by_ref(&reference) {
+                        Some(p) => p.value.map(|val| val.unit).unwrap_or(Unit::Ohm),
+                        None => return Err(format!("no part named {reference}")),
+                    };
+                    let value = Value::parse(v, unit).map_err(|_| format!("bad value {v:?}"))?;
+                    self.circuit.set_value(&reference, value);
+                    Ok(format!("set {reference}"))
+                }
                 ["remove", r] => {
                     if self.circuit.part_by_ref(r).is_none() {
                         return Err(format!("no part named {r}"));
@@ -1586,6 +1686,74 @@ mod tests {
         // Deleting with nothing selected is a friendly no-op, not a panic.
         a.remove_selected();
         assert_eq!(a.backend().circuit().parts().len(), 0);
+    }
+
+    // ── live tuning (CP-UX-M6.1) ───────────────────────────────────────────
+
+    /// A `+`/`-` nudge on the selected part retargets its value through the shared
+    /// `set` mutation path, and the edited circuit carries the new value.
+    #[test]
+    fn tune_keys_change_the_selected_components_value() {
+        let mut a = edit_app();
+        a.focus = PanelId::Schematic;
+        key(&mut a, KeyCode::Char('e'));
+        key(&mut a, KeyCode::Char('a'));
+        typ(&mut a, "R1 a b 1k");
+        key(&mut a, KeyCode::Enter);
+        assert_eq!(a.selected_part().as_deref(), Some("R1"), "R1 selected");
+
+        let mag = |a: &App<EditBackend>| {
+            a.backend()
+                .circuit()
+                .part_by_ref("R1")
+                .unwrap()
+                .value
+                .unwrap()
+                .magnitude
+        };
+        let before = mag(&a);
+        key(&mut a, KeyCode::Char('+'));
+        let up = mag(&a);
+        assert!(up > before, "+ raised R1's value: {before} -> {up}");
+        assert!((up / before - TUNE_STEP).abs() < 1e-6, "one 10% step: {up}");
+
+        // The nudge lowered to a `set` command on the shared path (logged, echoed).
+        let frame = a.render(80, 24);
+        assert!(
+            frame.contains("set R1.value"),
+            "set command echoed:\n{frame}"
+        );
+
+        // `-` steps back down below the raised value.
+        key(&mut a, KeyCode::Char('-'));
+        let down = mag(&a);
+        assert!(down < up, "- lowered R1's value: {up} -> {down}");
+    }
+
+    /// Tuning with nothing selected, or a part with no numeric value, is a clean
+    /// logged no-op rather than a panic.
+    #[test]
+    fn tune_without_a_value_is_a_clean_no_op() {
+        let mut a = edit_app();
+        // Empty circuit: nothing selected to tune.
+        a.tune_selected(true);
+        let frame = a.render(80, 24);
+        assert!(
+            frame.contains("error"),
+            "friendly error, no panic:\n{frame}"
+        );
+        assert_eq!(a.backend().circuit().parts().len(), 0, "nothing changed");
+    }
+
+    /// The tune `EditAction` lowers to the shell's `set <ref>.value <v>` verb.
+    #[test]
+    fn tune_action_lowers_to_the_set_command() {
+        let line = EditAction::Tune {
+            reference: "R1".into(),
+            value: "2.2k".into(),
+        }
+        .to_command();
+        assert_eq!(line, "set R1.value 2.2k");
     }
 
     /// Opening the palette and running "edit mode" toggles edit mode on.
