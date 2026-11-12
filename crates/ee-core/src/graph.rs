@@ -237,6 +237,56 @@ pub struct Coupling {
     pub k: f64,
 }
 
+/// A transmission line between two ports — the circuit-level record behind an
+/// ideal lossless line or a lumped-LC lossy line (`CP-SIM-M7.2`).
+///
+/// Like [`Coupling`], this is deliberately a *relation on existing nets* recorded
+/// via [`Circuit::add_line`] / [`Circuit::add_lossy_line`], **not** a new
+/// data-carrying [`PartKind`]: the line adds no part, so no exhaustive match arm
+/// anywhere else in the workspace has to learn a new variant. Only the transient
+/// and AC engines read it; it is otherwise inert metadata.
+///
+/// A line joins **port A** `(a1, a2)` to **port B** `(b1, b2)`, each a `(+, −)`
+/// node pair, and carries the characteristic impedance `z0` (Ω) and the one-way
+/// propagation `delay` (s). A lossless line is the ideal delay line (Branin's
+/// travelling-wave companion in transient, `e^{−jωT}` coupling in AC). A lossy
+/// line is a lumped-LC approximation of a short line: its total series inductance
+/// is `L = z0·delay` and total shunt capacitance `C = delay/z0`, with the extra
+/// series resistance `r` (Ω) and shunt conductance `g` (S) of [`LineKind::Lossy`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Line {
+    /// Port A positive node.
+    pub a1: NetId,
+    /// Port A negative (return) node.
+    pub a2: NetId,
+    /// Port B positive node.
+    pub b1: NetId,
+    /// Port B negative (return) node.
+    pub b2: NetId,
+    /// Characteristic impedance `Z₀` (Ω).
+    pub z0: f64,
+    /// One-way propagation delay `T_d` (s).
+    pub delay: f64,
+    /// Lossless ideal, or a lumped-LC lossy approximation.
+    pub kind: LineKind,
+}
+
+/// Whether a [`Line`] is the ideal lossless delay line or a lumped-LC lossy line.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LineKind {
+    /// The ideal lossless line: delay + characteristic impedance only.
+    Lossless,
+    /// A lumped-LC approximation with series resistance `r` (Ω) and shunt
+    /// conductance `g` (S) added to the `L = z0·delay` / `C = delay/z0` the ideal
+    /// parameters imply. `r = 0`, `g = 0` is the lumped stand-in for a lossless line.
+    Lossy {
+        /// Total series resistance (Ω).
+        r: f64,
+        /// Total shunt conductance (S).
+        g: f64,
+    },
+}
+
 /// A part instance: a kind, a human reference (`R1`), a primary value, the nets
 /// its terminals connect to, and (for sources) a time [`Waveform`].
 #[derive(Debug, Clone)]
@@ -285,6 +335,11 @@ pub struct Circuit {
     /// is otherwise inert metadata, like [`tolerances`](Circuit::tolerance).
     /// (`CP-SIM-M6.1`.)
     couplings: Vec<Coupling>,
+    /// Transmission lines recorded by [`add_line`](Circuit::add_line) /
+    /// [`add_lossy_line`](Circuit::add_lossy_line). Empty ⇒ no lines (every pre-M7
+    /// circuit, bit-for-bit). Only the transient and AC engines read it.
+    /// (`CP-SIM-M7.2`.)
+    lines: Vec<Line>,
 }
 
 // `Default` is hand-written (not derived) so net 0 is pre-seeded as ground: the
@@ -300,6 +355,7 @@ impl Default for Circuit {
             tempcos: BTreeMap::new(),
             temp_c: NOMINAL_TEMP_C,
             couplings: Vec::new(),
+            lines: Vec::new(),
         }
     }
 }
@@ -549,6 +605,72 @@ impl Circuit {
         &self.couplings
     }
 
+    /// Record an **ideal lossless** transmission line joining port A to port B,
+    /// each a `(+, −)` net pair, with characteristic impedance `z0` (Ω) and one-way
+    /// propagation `delay` (s) (`CP-SIM-M7.2`).
+    ///
+    /// `z0` and `delay` must both be finite and strictly positive; otherwise the
+    /// call is a no-op returning `false`. Like [`couple`](Circuit::couple), this is
+    /// pure metadata on existing nets — it adds no part and no [`PartKind`] variant.
+    pub fn add_line(&mut self, a: (NetId, NetId), b: (NetId, NetId), z0: f64, delay: f64) -> bool {
+        if !(z0.is_finite() && z0 > 0.0 && delay.is_finite() && delay > 0.0) {
+            return false;
+        }
+        self.lines.push(Line {
+            a1: a.0,
+            a2: a.1,
+            b1: b.0,
+            b2: b.1,
+            z0,
+            delay,
+            kind: LineKind::Lossless,
+        });
+        true
+    }
+
+    /// Record a **lumped-LC lossy** transmission line joining port A to port B,
+    /// each a `(+, −)` net pair (`CP-SIM-M7.2`). The ideal parameters `z0`/`delay`
+    /// set the line's inductance `L = z0·delay` and capacitance `C = delay/z0`;
+    /// `r` (Ω) is the total series resistance and `g` (S) the total shunt
+    /// conductance of the loss.
+    ///
+    /// `z0` and `delay` must be finite and positive and `r`, `g` finite and
+    /// non-negative; otherwise the call is a no-op returning `false`. Like
+    /// [`add_line`](Circuit::add_line) it adds no part and no [`PartKind`].
+    pub fn add_lossy_line(
+        &mut self,
+        a: (NetId, NetId),
+        b: (NetId, NetId),
+        z0: f64,
+        delay: f64,
+        r: f64,
+        g: f64,
+    ) -> bool {
+        if !(z0.is_finite() && z0 > 0.0 && delay.is_finite() && delay > 0.0) {
+            return false;
+        }
+        if !(r.is_finite() && r >= 0.0 && g.is_finite() && g >= 0.0) {
+            return false;
+        }
+        self.lines.push(Line {
+            a1: a.0,
+            a2: a.1,
+            b1: b.0,
+            b2: b.1,
+            z0,
+            delay,
+            kind: LineKind::Lossy { r, g },
+        });
+        true
+    }
+
+    /// The transmission lines recorded by [`add_line`](Circuit::add_line) /
+    /// [`add_lossy_line`](Circuit::add_lossy_line), in insertion order. Empty for a
+    /// circuit with no lines.
+    pub fn lines(&self) -> &[Line] {
+        &self.lines
+    }
+
     pub fn parts(&self) -> &[Part] {
         &self.parts
     }
@@ -796,5 +918,37 @@ mod tests {
         // All rejections left the single valid coupling untouched.
         assert_eq!(c.couplings().len(), 1);
         assert_eq!(c.couplings()[0].k, 1.0);
+    }
+
+    #[test]
+    fn add_line_records_lossless_and_lossy_and_validates() {
+        let mut c = Circuit::new("lines");
+        let (a1, b1) = (c.new_net(), c.new_net());
+
+        // A fresh circuit has no lines.
+        assert!(c.lines().is_empty());
+
+        let (pa, pb) = ((a1, NetId::GROUND), (b1, NetId::GROUND));
+
+        // A valid lossless line is recorded with its parameters and kind.
+        assert!(c.add_line(pa, pb, 50.0, 1e-9));
+        assert_eq!(c.lines().len(), 1);
+        assert_eq!(c.lines()[0].z0, 50.0);
+        assert_eq!(c.lines()[0].delay, 1e-9);
+        assert_eq!(c.lines()[0].kind, LineKind::Lossless);
+
+        // A valid lossy line is recorded with its loss parameters.
+        assert!(c.add_lossy_line(pa, pb, 75.0, 2e-9, 5.0, 1e-6));
+        assert_eq!(c.lines().len(), 2);
+        assert_eq!(c.lines()[1].kind, LineKind::Lossy { r: 5.0, g: 1e-6 });
+
+        // Rejected: non-positive / non-finite z0 or delay, negative loss.
+        assert!(!c.add_line(pa, pb, 0.0, 1e-9));
+        assert!(!c.add_line(pa, pb, 50.0, -1e-9));
+        assert!(!c.add_line(pa, pb, f64::NAN, 1e-9));
+        assert!(!c.add_lossy_line(pa, pb, 50.0, 1e-9, -1.0, 0.0));
+        assert!(!c.add_lossy_line(pa, pb, 50.0, 1e-9, 0.0, -1.0));
+        // Every rejection left the two valid lines untouched.
+        assert_eq!(c.lines().len(), 2);
     }
 }

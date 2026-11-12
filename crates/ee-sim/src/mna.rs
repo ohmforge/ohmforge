@@ -173,6 +173,27 @@ impl System {
         self.z[k] += volts;
     }
 
+    /// A row-major `size × size` dense copy of the assembled coefficient matrix,
+    /// materializing the sparse backing's structural nonzeros into a full array.
+    /// The small-signal pole/zero analysis (`CP-SIM-M7.1`) uses it to pull the
+    /// linearized conductance matrix `G` out through the ordinary stamp API rather
+    /// than re-deriving every device's contribution by hand.
+    pub(crate) fn dense_matrix(&self) -> Vec<f64> {
+        match &self.backing {
+            Backing::Dense(a) => a.clone(),
+            Backing::Sparse(rows) => {
+                let n = self.size;
+                let mut m = vec![0.0; n * n];
+                for (r, row) in rows.iter().enumerate() {
+                    for (&c, &v) in row {
+                        m[r * n + c] = v;
+                    }
+                }
+                m
+            }
+        }
+    }
+
     /// Solve `A·x = z`, consuming the system. Returns `None` if `A` is singular.
     ///
     /// Runs the algorithm matching the backing [`new`](Self::new) chose: dense
