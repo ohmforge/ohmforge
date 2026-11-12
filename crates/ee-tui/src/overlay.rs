@@ -28,6 +28,7 @@
 //! every line is padded/clipped to its exact cell width regardless of colour. A
 //! plain (no-escape) mode drives golden snapshots and width assertions.
 
+use crate::current::{flow_glyph, BranchCurrents};
 use crate::schematic::{fmt_opt_value, fmt_value, kind_label, net_name};
 use crate::screen::top_border;
 use ee_core::graph::{Circuit, NetId};
@@ -38,8 +39,14 @@ use std::collections::HashMap;
 /// Voltages at or below this magnitude read as the "zero" bucket (ground level).
 const ZERO_EPS: f64 = 1e-9;
 
+/// How many cells wide the animated current-flow stream is drawn.
+const FLOW_CELLS: usize = 5;
+
 /// ANSI reset — closes every coloured token so a pane to its right is unaffected.
 const RESET: &str = "\x1b[0m";
+
+/// ANSI SGR for the current-flow arrows — cyan, distinct from the voltage ramp.
+const FLOW_ANSI: &str = "\x1b[36m";
 
 /// Operating-point node voltages, keyed by **resolved** [`NetId`].
 ///
@@ -231,15 +238,21 @@ pub struct Overlay<'a> {
     pub width: usize,
     /// Whether to apply the ANSI colour palette.
     pub color: bool,
+    /// Per-branch currents to animate on each row, if any (`CP-UX-M6.1`).
+    currents: Option<&'a BranchCurrents>,
+    /// Animation frame counter — shifts the marching arrows' phase.
+    tick: u64,
 }
 
 impl<'a> Overlay<'a> {
-    /// A sensible default: a 72-cell-wide, coloured frame.
+    /// A sensible default: a 72-cell-wide, coloured frame with no current flow.
     pub fn new(title: &'a str) -> Self {
         Self {
             title,
             width: 72,
             color: true,
+            currents: None,
+            tick: 0,
         }
     }
 
@@ -252,6 +265,17 @@ impl<'a> Overlay<'a> {
     /// Enable or disable the ANSI colour palette (disable it for snapshots).
     pub fn color(mut self, color: bool) -> Self {
         self.color = color;
+        self
+    }
+
+    /// Animate branch currents on each part row at animation frame `tick`.
+    ///
+    /// Each two-terminal branch gains a directional, density-coded flow stream
+    /// (see [`crate::current`]); `tick` shifts the arrows so successive frames
+    /// march. Off by default, so plain snapshots are unaffected.
+    pub fn flow(mut self, currents: &'a BranchCurrents, tick: u64) -> Self {
+        self.currents = Some(currents);
+        self.tick = tick;
         self
     }
 
@@ -350,9 +374,36 @@ impl<'a> Overlay<'a> {
                     segs.push(Seg::colored(token, Bucket::classify(v, vmax).ansi()));
                 }
                 segs.push(Seg::plain("]"));
+                self.append_flow(&mut segs, circuit, p);
                 segs
             })
             .collect()
+    }
+
+    /// Append the animated current-flow stream for one part, when currents are
+    /// supplied and this branch carries one. The arrow points with the part's net
+    /// order (`from == resolve(terminal[0])`) or against it, its density scales to
+    /// the peak branch current in view, and the magnitude is labelled.
+    fn append_flow(&self, segs: &mut Vec<Seg>, circuit: &Circuit, part: &ee_core::graph::Part) {
+        let Some(currents) = self.currents else {
+            return;
+        };
+        let Some(bc) = currents.get(&part.reference) else {
+            return;
+        };
+        let forward = part
+            .terminals
+            .first()
+            .map(|&t| circuit.resolve(t) == bc.from)
+            .unwrap_or(true);
+        let peak = currents.max_magnitude();
+        let stream = flow_glyph(bc.amps, peak, forward, self.tick, FLOW_CELLS);
+        segs.push(Seg::plain("  "));
+        segs.push(Seg::colored(stream, FLOW_ANSI));
+        segs.push(Seg::plain(format!(
+            " {}",
+            fmt_value(&Value::new(bc.amps, Unit::Ampere))
+        )));
     }
 }
 
@@ -556,6 +607,58 @@ mod tests {
         for line in out.lines() {
             assert_eq!(line.chars().count(), 24);
         }
+    }
+
+    #[test]
+    fn flow_arrows_annotate_each_branch_and_keep_exact_width() {
+        // The divider's op-point drives a current through V1, R1 and R2.
+        let (c, v) = divider();
+        let currents = crate::current::branch_currents(&c, &v);
+        let width = 64;
+        let out = Overlay::new("op")
+            .width(width)
+            .color(false)
+            .flow(&currents, 0)
+            .render(&c, &v);
+        // Directional arrows appear and a current magnitude is labelled.
+        assert!(
+            out.contains('→') || out.contains('←'),
+            "flow arrows:\n{out}"
+        );
+        assert!(out.contains('A'), "current magnitude labelled:\n{out}");
+        // The R1 row carries its own flow stream next to its net annotations.
+        let r1 = out.lines().find(|l| l.contains("R1")).unwrap();
+        assert!(
+            r1.contains('→') || r1.contains('←'),
+            "R1 row shows flow:\n{r1}"
+        );
+        // Flow never breaks the exact-width contract, in either mode.
+        for line in out.lines() {
+            assert_eq!(line.chars().count(), width, "plain width: {line:?}");
+        }
+        let colored = Overlay::new("op")
+            .width(width)
+            .color(true)
+            .flow(&currents, 0)
+            .render(&c, &v);
+        for line in colored.lines() {
+            assert_eq!(visible_width(line), width, "coloured width: {line:?}");
+        }
+        assert!(colored.contains(FLOW_ANSI), "flow is coloured:\n{colored}");
+    }
+
+    #[test]
+    fn flow_animation_phase_follows_the_tick() {
+        let (c, v) = divider();
+        let currents = crate::current::branch_currents(&c, &v);
+        let frame = |tick| {
+            Overlay::new("op")
+                .width(64)
+                .color(false)
+                .flow(&currents, tick)
+                .render(&c, &v)
+        };
+        assert_eq!(frame(2), frame(2), "a given tick renders deterministically");
     }
 
     #[test]

@@ -18,6 +18,7 @@
 //! ```
 
 use std::io::{self, Write};
+use std::time::Duration;
 
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode as CtKeyCode, KeyEvent as CtKey,
@@ -50,7 +51,11 @@ pub fn run<B: Backend>(backend: B) -> io::Result<()> {
     result
 }
 
-/// The draw/read loop: draw the frame, read one event, feed it to the app.
+/// How long a frame waits for input before redrawing to advance the animation.
+const FRAME: Duration = Duration::from_millis(120);
+
+/// The draw/read loop: draw the frame, then either handle an input event or, when
+/// the frame times out with none, advance the current-flow animation one tick.
 fn event_loop<B: Backend>(app: &mut App<B>, out: &mut impl Write) -> io::Result<()> {
     loop {
         let (cols, rows) = crossterm::terminal::size()?;
@@ -62,8 +67,13 @@ fn event_loop<B: Backend>(app: &mut App<B>, out: &mut impl Write) -> io::Result<
             return Ok(());
         }
 
-        if let Some(event) = map_event(event::read()?, w, h) {
-            app.handle_event(event);
+        if event::poll(FRAME)? {
+            if let Some(event) = map_event(event::read()?, w, h) {
+                app.handle_event(event);
+            }
+        } else {
+            // No input this frame — march the flow arrows.
+            app.tick();
         }
     }
 }

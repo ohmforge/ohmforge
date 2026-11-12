@@ -112,6 +112,7 @@ impl Shell {
         "wire",
         "probe",
         "remove",
+        "set",
         "run",
         "show",
         "undo",
@@ -152,12 +153,13 @@ impl Shell {
         match command {
             // Mutating commands snapshot the session first (on success only) so
             // `undo` can revert exactly the last command.
-            "add" | "wire" | "probe" | "remove" => {
+            "add" | "wire" | "probe" | "remove" | "set" => {
                 let before = self.capture();
                 let result = match command {
                     "add" => self.cmd_add(&args),
                     "wire" => self.cmd_wire(&args),
                     "remove" => self.cmd_remove(&args),
+                    "set" => self.cmd_set(&args),
                     _ => self.cmd_probe(&args),
                 };
                 if result.is_ok() {
@@ -417,6 +419,47 @@ impl Shell {
         Ok(msg)
     }
 
+    /// `set <ref>.value <value>` — retarget a placed component's primary value.
+    ///
+    /// This is the shared mutation path the live TUI's component tuning lowers to
+    /// (`CP-UX-M6.1`): a `+`/`-` nudge in the editor and a typed `set` both end up
+    /// here, so re-solving against the changed value is identical either way. A
+    /// bare `<ref>` target means its `.value`; any other dotted param is rejected
+    /// (only the primary value is settable today). The value's unit follows the
+    /// part's existing value, falling back to the kind implied by the reference.
+    fn cmd_set(&mut self, args: &[&str]) -> Result<String, ShellError> {
+        let [target, value] = args else {
+            return Err(ShellError::Usage {
+                command: "set",
+                usage: "set <ref>.value <value>",
+            });
+        };
+        let (reference, param) = match target.split_once('.') {
+            Some((r, p)) => (r, p),
+            None => (*target, "value"),
+        };
+        if !param.eq_ignore_ascii_case("value") {
+            return Err(ShellError::Usage {
+                command: "set",
+                usage: "set <ref>.value <value>",
+            });
+        }
+        let unit = match self.circuit.part_by_ref(reference) {
+            Some(p) => p
+                .value
+                .map(|v| v.unit)
+                .or_else(|| classify(reference).ok().map(|(_, u)| u))
+                .unwrap_or(Unit::None),
+            None => return Err(ShellError::UnknownPart(reference.to_string())),
+        };
+        let parsed = Value::parse(value, unit).map_err(|source| ShellError::BadValue {
+            field: format!("value {value:?}"),
+            source,
+        })?;
+        self.circuit.set_value(reference, parsed);
+        Ok(format!("set {reference}.value = {value}"))
+    }
+
     /// `remove <ref>` — delete a placed part by reference designator.
     fn cmd_remove(&mut self, args: &[&str]) -> Result<String, ShellError> {
         let [reference] = args else {
@@ -617,6 +660,7 @@ impl Shell {
             "  wire <a> <b>                merge two named nodes into one net",
             "  probe <node>                mark a node to plot on the next run",
             "  remove <ref>                delete a placed part",
+            "  set <ref>.value <value>     retarget a component's value (live-tunable)",
             "  run [tran [<dur>]]          transient (default 1 ms), plotting each probe",
             "  run op                      DC operating-point node-voltage table",
             "  show                        list the placed parts",
@@ -691,6 +735,18 @@ impl ee_tui::Backend for Shell {
 
     fn circuit(&self) -> &Circuit {
         Shell::circuit(self)
+    }
+
+    /// Solve the DC operating point so the live overlay reflects the current
+    /// circuit — the data behind the voltage colouring and the current-flow
+    /// animation (`CP-UX-M6.1`). An unsolvable circuit (e.g. mid-edit) yields an
+    /// empty solve rather than an error, so the overlay degrades to `?` instead of
+    /// tearing down the app.
+    fn op_point(&self) -> ee_tui::NodeVoltages {
+        match Engine::new().run(&self.circuit, &Analysis::OperatingPoint) {
+            Ok(signals) => ee_tui::NodeVoltages::from_signals(&signals),
+            Err(_) => ee_tui::NodeVoltages::new(),
+        }
     }
 }
 
@@ -1130,6 +1186,169 @@ mod tests {
         // Esc leaves edit mode cleanly.
         key(&mut app, KeyCode::Esc);
         assert!(!app.edit_mode(), "Esc exits edit mode");
+    }
+
+    /// `set <ref>.value` retargets a component value through the shared mutation
+    /// path, the op-point reflects it, and it is undoable like any mutation.
+    #[test]
+    fn set_retargets_a_value_reflects_in_op_point_and_is_undoable() {
+        let mut sh = Shell::new();
+        sh.execute("add V1 in gnd 10").unwrap();
+        sh.execute("add R1 in out 1k").unwrap();
+        sh.execute("add R2 out gnd 1k").unwrap();
+        // Equal divider: v(out) = 5 V.
+        assert!(sh.execute("run op").unwrap().contains("5.000000 V"));
+
+        // Double R1; the midpoint drops to 10·R2/(R1+R2) = 10·1k/3k = 3.333 V.
+        let msg = sh.execute("set R1.value 2k").unwrap();
+        assert!(msg.contains("set R1.value"), "{msg}");
+        assert_eq!(
+            sh.circuit()
+                .part_by_ref("R1")
+                .unwrap()
+                .value
+                .unwrap()
+                .magnitude,
+            2000.0
+        );
+        assert!(
+            sh.execute("run op").unwrap().contains("3.333333 V"),
+            "op-point reflects the new R1"
+        );
+
+        // A bare `<ref>` target also means `.value`.
+        sh.execute("set R1 4k").unwrap();
+        assert_eq!(
+            sh.circuit()
+                .part_by_ref("R1")
+                .unwrap()
+                .value
+                .unwrap()
+                .magnitude,
+            4000.0
+        );
+
+        // Undo reverts the last set.
+        sh.execute("undo").unwrap();
+        assert_eq!(
+            sh.circuit()
+                .part_by_ref("R1")
+                .unwrap()
+                .value
+                .unwrap()
+                .magnitude,
+            2000.0,
+            "undo restored the prior value"
+        );
+
+        // Friendly errors: unknown part, unsupported param, bad value.
+        assert!(matches!(
+            sh.execute("set R9.value 1k").unwrap_err(),
+            ShellError::UnknownPart(_)
+        ));
+        assert!(matches!(
+            sh.execute("set R1.freq 1k").unwrap_err(),
+            ShellError::Usage { command: "set", .. }
+        ));
+        assert!(matches!(
+            sh.execute("set R1.value nope").unwrap_err(),
+            ShellError::BadValue { .. }
+        ));
+    }
+
+    /// The CP-UX-M6.1 gate: a live tune through the app event loop re-solves the
+    /// circuit so the op-point and the current-flow animation both reflect the new
+    /// value, and the derived branch currents have the correct direction — current
+    /// leaves the source's `+` terminal and runs through the load. All on data.
+    #[test]
+    fn app_live_tuning_resolves_op_point_and_current_flow() {
+        use ee_tui::{App, AppEvent, KeyCode, KeyEvent, PanelId};
+
+        let key = |app: &mut App<Shell>, code| app.handle_event(AppEvent::Key(KeyEvent::new(code)));
+        let typ = |app: &mut App<Shell>, s: &str| {
+            for c in s.chars() {
+                app.handle_event(AppEvent::Key(KeyEvent::char(c)));
+            }
+        };
+
+        // Build a divider V1=10 (in→gnd), R1 1k (in→out), R2 1k (out→gnd) through
+        // the shared edit path. The empty-circuit solve at construction is refreshed
+        // after each placement.
+        let mut app = App::new(Shell::new());
+        for (r, a, b, v) in [
+            ("V1", "in", "gnd", "10"),
+            ("R1", "in", "out", "1k"),
+            ("R2", "out", "gnd", "1k"),
+        ] {
+            app.apply_edit(ee_tui::EditAction::Place {
+                reference: r.into(),
+                node_a: a.into(),
+                node_b: b.into(),
+                value: v.into(),
+            });
+        }
+
+        // Resolve the nets for assertions straight off the app's circuit.
+        let (in_net, out_net) = {
+            let c = app.backend().circuit();
+            let r1 = c.part_by_ref("R1").unwrap();
+            (c.resolve(r1.terminals[0]), c.resolve(r1.terminals[1]))
+        };
+
+        // Op-point before tuning: equal divider → v(out) = 5 V.
+        let v_out_before = app.op_voltages().get(out_net).unwrap();
+        assert!(
+            (v_out_before - 5.0).abs() < 1e-6,
+            "v(out)=5 V, got {v_out_before}"
+        );
+
+        // Current flow before tuning: it leaves V1's + terminal (in) and runs
+        // through R1 from `in` to `out` (the load).
+        let v1 = app.branch_currents().get("V1").unwrap();
+        assert_eq!(v1.from, in_net, "current leaves V1's + terminal (in)");
+        assert!(
+            (v1.amps - 5e-3).abs() < 1e-9,
+            "V1 sources 5 mA, got {}",
+            v1.amps
+        );
+        let r1_before = app.branch_currents().get("R1").unwrap().clone();
+        assert_eq!(r1_before.from, in_net, "R1 current runs from in");
+        assert_eq!(r1_before.to, out_net, "…through the load to out");
+
+        // Tune R1 up via the keystroke path: focus schematic, edit mode, select R1,
+        // press '+'. The divider midpoint must drop and R1's current must fall.
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.focus(), PanelId::Schematic);
+        key(&mut app, KeyCode::Char('e'));
+        key(&mut app, KeyCode::Down); // V1 -> R1
+        assert_eq!(app.selected_part().as_deref(), Some("R1"));
+        key(&mut app, KeyCode::Char('+'));
+
+        // R1 grew by one 10% step → v(out) = 10·1k/(1.1k+1k) = 4.7619 V (< 5 V).
+        let v_out_after = app.op_voltages().get(out_net).unwrap();
+        assert!(
+            v_out_after < v_out_before && (v_out_after - 4.7619).abs() < 1e-3,
+            "op-point re-solved: {v_out_before} -> {v_out_after}"
+        );
+        let r1_after = app.branch_currents().get("R1").unwrap();
+        assert!(
+            r1_after.amps < r1_before.amps,
+            "a bigger R1 carries less current: {} -> {}",
+            r1_before.amps,
+            r1_after.amps
+        );
+        assert_eq!(r1_after.from, in_net, "direction unchanged (in → out)");
+
+        // The overlay render reflects it too: toggle it on via the palette and the
+        // frame carries the animated flow arrows.
+        app.handle_event(AppEvent::Key(KeyEvent::char('p').with_ctrl()));
+        typ(&mut app, "toggle overlay");
+        key(&mut app, KeyCode::Enter);
+        let frame = app.render(120, 30);
+        assert!(
+            frame.contains('→') || frame.contains('←'),
+            "overlay animates current flow:\n{frame}"
+        );
     }
 
     /// A blank line is a no-op; `help` lists every command.
