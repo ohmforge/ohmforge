@@ -12,6 +12,26 @@ network-free and testable, and how secrets are handled. The worked examples use
 the real public API with a **stub model** (`MockTransport`) so they run with no
 network and no key — exactly how the crate's own tests exercise the loop.
 
+## From the command line (`ee`)
+
+The copilot is reachable from the binary:
+
+| Command | Needs a key? | What it does |
+|---|---|---|
+| `ee review [file.eesh]` / `ee drc …` | **No** | Builds the circuit from an `.eesh` script (a path, else stdin) and prints the grounded, offline design-rule review (DRC + sanity checks). |
+| `ee ask <question>` | Yes | The live copilot — drives a real shell+engine through the tool loop and answers. Build with `--features http` and set `ANTHROPIC_API_KEY`. |
+
+```sh
+# Offline, no key — the AI surface you can always reach:
+printf 'add V1 in gnd 5\nadd R1 in out 1k\nadd D1 out gnd\n' | ee review
+
+# Live copilot (opt-in network transport):
+cargo run -p ee --features http -- ask "design a 5 V to 3.3 V divider and check it"
+```
+
+The live path reads the endpoint from `EE_BASE_URL`/`ANTHROPIC_BASE_URL` (below),
+so it works through a proxy or gateway unchanged.
+
 ## The trust model, in code
 
 Everything above the model lives behind one synchronous trait:

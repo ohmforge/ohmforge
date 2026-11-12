@@ -28,3 +28,9 @@ ee-ai = { workspace = true }
 # Line editing for the interactive REPL (binary only — never the compute core):
 # history, emacs keybindings, Ctrl-R search, and tab completion.
 rustyline = "14"
+
+[features]
+# Opt-in live copilot: forwards to ee-ai's network transport so `ee ask` can
+# reach the Claude API. Off by default — the binary and the offline copilot
+# (`ee review`/`ee drc`) build with no network/TLS stack.
+http = ["ee-ai/http"]

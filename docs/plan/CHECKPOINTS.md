@@ -172,7 +172,7 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 
 ---
 
-## M8 — hardening & reach  🚧 in progress → plan: [`M8-PLAN.md`](M8-PLAN.md)
+## M8 — hardening & reach  ✅ complete (8/8) → plan: [`M8-PLAN.md`](M8-PLAN.md)
 
 _Post-v0.5.0 refinement after hands-on use. A four-track read-only QA audit found zero crashes; M8 fixes the confirmed defects and closes the reachability gaps._
 
@@ -182,8 +182,8 @@ _Post-v0.5.0 refinement after hands-on use. A four-track read-only QA audit foun
 - [x] **CP-UX-M8.3** (ui-shell) Instrument rendering: FFT rejects/resamples a non-uniform (adaptive-transient) grid; Bode `−3 dB` corner references the passband peak (high-/band-pass correct); scope axis width counts chars not bytes (`µs`/`Ω` align). — *gate:* `magnitude_spectrum` detects a non-uniform grid and linear-resamples (uniform grids pass through bit-for-bit); `corner_3db` references the peak with either-direction crossing; oscilloscope gutter/x-label math counts `chars()`. *tests:* `non_uniform_grid_is_resampled_and_peaks_at_the_true_tone`, `highpass_corner_references_the_passband_peak`, `micro_timebase_axis_labels_align_to_the_rule`, `ohm_unit_gutter_matches_an_ascii_unit`.
 - [x] **CP-AF-M8.1** (ai-fmt) AI correctness: LED-no-series-resistor DRC requires a resistor on the LED's conduction path (exclude `GROUND`, reject parallel-only); `no_path_to_ground` treats a cap as a DC open (inductor stays a DC short); log-symmetric debug fault ranking (`|ln scale|`; independent sources dropped as candidates + deterministic tie-break, else the unity-gain supply dominates); tool-loop cap returns the partial transcript via `AiError::ToolLoopExhausted{turns,partial}`; response parser tolerates unknown blocks (`thinking`). — *gate (passing):* `offline::tests::{led_without_series_resistor_is_flagged_over_a_shared_ground, parallel_resistor_does_not_clear_the_led_rule, node_grounded_only_through_a_capacitor_is_floating, led_without_series_resistor_is_flagged_then_cleared}`, `modes::tests::fault_ranking_metric_is_log_symmetric`, `client_loop::runaway_tool_loop_is_capped`, `http_transport::unknown_content_block_is_tolerated` (`--features http`).
 - [x] **CP-AF-M8.2** (ai-fmt) Live-transport robustness + honest docs: request + connect timeout on the native `http` client (default 60 s, `with_timeout` override; a stalled server can't hang the CLI); fixed the stale guide/crate docs that called the live native transport a non-sending stub (only wasm `fetch` is a stub). — *gate (passing):* `http_transport::stalled_server_times_out_instead_of_hanging` (`--features http`; unresponsive socket → bounded `AiError::Transport`, no hang); docs updated.
-- [ ] **CP-PLAT.6** (platform) Wire the copilot + analyses into the `ee` binary (on `main` during reconcile): `ee ask`, `ee review`/`ee drc` (offline, no key), `ee design`/`ee debug`/`ee tune` (offline default when `ANTHROPIC_API_KEY` absent); new `run` analyses reachable end-to-end; guides refreshed. — *gate:* `ee ask …` runs offline with no key and returns a grounded answer; help lists the AI subcommands.
-- [ ] **CP-SHIP.4** (platform) Polish & tag **v0.6.0**: full CI-parity gate sweep (incl. `http`/`relay` feature jobs), README refreshed to M0–M8, tag.
+- [x] **CP-PLAT.6** (platform) Wire the copilot into the `ee` binary: `ee review`/`ee drc` run the **offline, no-key** design-rule review (circuit from an `.eesh` path or stdin); `ee ask <question>` is the live copilot behind an opt-in `http` feature (+`ANTHROPIC_API_KEY`), honoring `EE_BASE_URL`/`ANTHROPIC_BASE_URL`; `ee help` lists them; the new `run ac/dc/noise/mc/tf` analyses are reachable via the shell (CP-UX-M8.2). — *gate (passing):* `crates/ee/tests/cli.rs::{ee_review_runs_offline_on_a_piped_script, ee_drc_is_an_alias_for_review, ee_help_lists_the_ai_subcommands}` spawn the built binary with no key/network; `reqwest` stays absent from the default `ee` build (`cargo tree`). Guide updated with the CLI table.
+- [x] **CP-SHIP.4** (platform) Polish & tag **v0.6.0**: full CI-parity gate sweep (fmt + `clippy -D warnings` default **and** `--features http`/`relay` + `cargo test --workspace` + feature tests + `wasm32` core & `ee-web` + `-D warnings` docs) all green on fully-merged `main`; `reqwest`/relay deps confirmed absent from the default build; README refreshed to M0–M8; **v0.6.0** tagged.
 
 ---
 
@@ -195,9 +195,9 @@ _Post-v0.5.0 refinement after hands-on use. A four-track read-only QA audit foun
 | boards | 17 | 0 | 17 |
 | ui-shell | 21 | 0 | 21 |
 | ai-fmt | 19 | 0 | 19 |
-| platform | 8 | 0 | 10 |
+| platform | 10 | 0 | 10 |
 | web | 6 | 0 | 6 |
-| **Total** | **97** | **0** | **99** |
+| **Total** | **99** | **0** | **99** |
 
 _**67/67 — M0 through M4 all complete** (M0–M3 tagged v0.1.0; M4 adds the rest). M4 delivered the **plugin device-model API** + an **instrument/block plugin trait**, a **KLU-class ordered/reusable sparse solver** and **multithreaded analyses**, a **Cortex-M3/M4 (Thumb-2)** core with an STM32 board, **SPICE `.model` import** + a vendor model library, and **shareable circuit links** in the browser. Deferred by design: real-time collaboration, the QEMU full-SBC bridge, and full vendor-SPICE `.model` fidelity — the standing M-next horizon._
 

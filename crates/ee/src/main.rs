@@ -52,6 +52,9 @@ fn main() {
                 eprintln!("{RED}tui error:{RESET} {e}");
             }
         }
+        Some("review") | Some("drc") => run_review(std::env::args().nth(2)),
+        Some("ask") => run_ask(std::env::args().skip(2).collect::<Vec<_>>()),
+        Some("help") | Some("--help") | Some("-h") => print_usage(),
         _ => {
             let mut shell = Shell::new();
             let stdin = io::stdin();
@@ -78,6 +81,93 @@ fn main() {
             }
         }
     }
+}
+
+/// `ee review [file]` / `ee drc [file]` — the **offline, no-key** copilot. Builds
+/// a circuit from an `.eesh` script (a file path, else stdin) and prints the
+/// grounded design-rule review (DRC findings + sanity checks). Needs no API key
+/// and no network — this is the AI surface a user can always reach.
+fn run_review(path: Option<String>) {
+    let src = match &path {
+        Some(p) => match std::fs::read_to_string(p) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("{RED}cannot read {p}:{RESET} {e}");
+                std::process::exit(1);
+            }
+        },
+        None => {
+            let mut s = String::new();
+            if io::stdin().read_to_string(&mut s).is_err() {
+                eprintln!("{RED}failed to read the script from stdin{RESET}");
+                std::process::exit(1);
+            }
+            s
+        }
+    };
+    let mut shell = Shell::new();
+    if let Err(e) = shell.run_script(&src) {
+        eprintln!("{RED}script error:{RESET} {e}");
+        std::process::exit(1);
+    }
+    println!("{}", ee_ai::offline_review(shell.circuit()));
+}
+
+/// `ee ask <question>` — the **live** copilot: drives a real shell+engine through
+/// the tool loop and answers. Needs the `http` feature (network transport) and
+/// `ANTHROPIC_API_KEY`; without the feature it points the user at the offline
+/// `review`/`drc` commands.
+#[cfg(feature = "http")]
+fn run_ask(args: Vec<String>) {
+    if args.is_empty() {
+        eprintln!("{RED}usage:{RESET} ee ask <question>");
+        std::process::exit(1);
+    }
+    let transport = match ee_ai::transport::HttpTransport::from_env() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{RED}{e}{RESET}");
+            std::process::exit(1);
+        }
+    };
+    let client = ee_ai::Client::new(transport);
+    match ee_ai::ask(&client, args.join(" ")) {
+        Ok(answer) => println!("{answer}"),
+        Err(e) => {
+            eprintln!("{RED}ask failed:{RESET} {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(not(feature = "http"))]
+fn run_ask(_args: Vec<String>) {
+    eprintln!(
+        "{DIM}`ee ask` (live copilot) needs the network transport — rebuild with \
+         `cargo run -p ee --features http` and set ANTHROPIC_API_KEY.{RESET}"
+    );
+    eprintln!(
+        "{DIM}No key needed for the offline copilot: `ee review <file.eesh>` or \
+         `ee drc <file.eesh>` (DRC + sanity checks).{RESET}"
+    );
+    std::process::exit(1);
+}
+
+/// Print the subcommand overview (also the `_`-arm fallback for an unknown verb
+/// would land in the REPL, so this is only shown on explicit `help`).
+fn print_usage() {
+    println!(
+        "ee — the ee-assist EE workbench\n\
+         \n\
+         USAGE:\n\
+         \x20 ee                      interactive eesh REPL (or pipe a script via stdin)\n\
+         \x20 ee tui                  the live dockable TUI\n\
+         \x20 ee demo | bode | amp | cosim | view    built-in showcases\n\
+         \x20 ee review [file.eesh]   offline copilot: design-rule review (no key)\n\
+         \x20 ee drc    [file.eesh]   alias for review\n\
+         \x20 ee ask <question>       live copilot (needs --features http + ANTHROPIC_API_KEY)\n\
+         \x20 ee help                 this message\n"
+    );
 }
 
 /// Parse an engineering-notation value, exiting with a message on failure.
