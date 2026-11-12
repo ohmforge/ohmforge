@@ -20,8 +20,17 @@ pub enum AiError {
     /// order, named a block index that was never opened, or ended mid-message.
     MalformedStream(String),
     /// The model kept requesting tools past the configured turn cap, so the
-    /// loop bailed out rather than spin forever. Carries the cap that was hit.
-    ToolLoopExhausted(usize),
+    /// loop bailed out rather than spin forever. Carries the cap that was hit
+    /// **and the partial run up to it** — the transcript, any text the model
+    /// produced, and the usage so far — so a caller can surface what was gathered
+    /// instead of discarding it.
+    ToolLoopExhausted {
+        /// The `max_tool_turns` cap that was hit.
+        turns: usize,
+        /// The partial [`RunResult`](crate::client::RunResult) accumulated up to
+        /// the cap (boxed to keep [`AiError`] small).
+        partial: Box<crate::client::RunResult>,
+    },
     /// No `ANTHROPIC_API_KEY` is present in the environment. Only the real HTTP
     /// transport needs one; the mock never does.
     MissingApiKey,
@@ -42,8 +51,8 @@ impl fmt::Display for AiError {
         match self {
             AiError::Transport(why) => write!(f, "model transport failed: {why}"),
             AiError::MalformedStream(why) => write!(f, "malformed model stream: {why}"),
-            AiError::ToolLoopExhausted(cap) => {
-                write!(f, "tool-use loop did not settle within {cap} turns")
+            AiError::ToolLoopExhausted { turns, .. } => {
+                write!(f, "tool-use loop did not settle within {turns} turns")
             }
             AiError::MissingApiKey => {
                 write!(

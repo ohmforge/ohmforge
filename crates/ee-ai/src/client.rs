@@ -186,11 +186,17 @@ impl<T: Transport> Client<T> {
         let mut messages = vec![Message::user_text(user_message)];
         let mut tool_calls = 0usize;
         let mut usage = Usage::default();
+        // The most recent assistant turn's text and stop reason, so the partial
+        // run surfaced on a cap hit carries what the model actually produced.
+        let mut last_text = String::new();
+        let mut last_stop = StopReason::EndTurn;
 
         for _turn in 0..self.max_tool_turns {
             let req = self.build_request(system, tools, &messages);
             let resp = self.transport.send_streaming(req, on_event)?;
             usage = usage.saturating_add(resp.usage);
+            last_text = resp.text();
+            last_stop = resp.stop_reason;
 
             // Record the assistant turn verbatim so the model sees its own
             // tool_use ids when we feed results back.
@@ -203,15 +209,27 @@ impl<T: Transport> Client<T> {
             }
 
             return Ok(RunResult {
-                final_text: resp.text(),
-                stop_reason: resp.stop_reason,
+                final_text: last_text,
+                stop_reason: last_stop,
                 messages,
                 tool_calls,
                 usage,
             });
         }
 
-        Err(AiError::ToolLoopExhausted(self.max_tool_turns))
+        // Hit the turn cap. Hand back the partial transcript (and any text the
+        // model produced so far) alongside the cap signal, rather than dropping
+        // everything the run gathered.
+        Err(AiError::ToolLoopExhausted {
+            turns: self.max_tool_turns,
+            partial: Box::new(RunResult {
+                final_text: last_text,
+                stop_reason: last_stop,
+                messages,
+                tool_calls,
+                usage,
+            }),
+        })
     }
 
     /// Run every tool_use block in `resp` through the handler, producing the

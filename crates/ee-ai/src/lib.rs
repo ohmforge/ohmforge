@@ -22,7 +22,9 @@
 //!   streamed-event shape ([`StreamEvent`] + [`StreamAssembler`]).
 //! * [`transport`] — the [`Transport`] trait, a [`MockTransport`] that replays
 //!   canned responses (including tool-use turns) for tests, and a feature-gated
-//!   `HttpTransport` (behind the `http` feature) stub for the real network path.
+//!   `HttpTransport` (behind the `http` feature): a **live** Claude Messages
+//!   round-trip on native (a `reqwest` blocking client with a request timeout),
+//!   with only the `wasm32` `fetch` path left as a documented TODO stub.
 //! * [`client`] — the [`Client`] and the **tool-use loop**: send → dispatch any
 //!   requested tools through a caller-provided [`ToolHandler`] → feed the
 //!   results back → stop on `end_turn`.

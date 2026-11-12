@@ -119,6 +119,7 @@ impl Transport for MockTransport {
 pub struct HttpTransport {
     api_key: String,
     base_url: String,
+    timeout: std::time::Duration,
 }
 
 #[cfg(feature = "http")]
@@ -129,6 +130,11 @@ impl HttpTransport {
     /// The `anthropic-version` header value the Messages API expects.
     pub const ANTHROPIC_VERSION: &'static str = "2023-06-01";
 
+    /// The default whole-request timeout. A stalled server that accepts the
+    /// connection but never replies cannot hang the single-threaded CLI past
+    /// this; override it with [`with_timeout`](Self::with_timeout).
+    pub const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
     /// Build a transport from an explicit key and endpoint. Mainly for tests
     /// (point it at a local mock server); production code usually calls
     /// [`from_env`](Self::from_env). The key is held but never logged.
@@ -136,6 +142,7 @@ impl HttpTransport {
         HttpTransport {
             api_key: api_key.into(),
             base_url: base_url.into(),
+            timeout: Self::DEFAULT_TIMEOUT,
         }
     }
 
@@ -148,12 +155,21 @@ impl HttpTransport {
         Ok(HttpTransport {
             api_key: crate::config::api_key_from_env()?,
             base_url: crate::config::base_url_from_env(Self::DEFAULT_BASE_URL),
+            timeout: Self::DEFAULT_TIMEOUT,
         })
     }
 
     /// Point the transport at a different base URL (e.g. a proxy).
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
+        self
+    }
+
+    /// Override the whole-request timeout (default
+    /// [`DEFAULT_TIMEOUT`](Self::DEFAULT_TIMEOUT)). The connect timeout is this,
+    /// capped at 10 s. Mainly for tests that need a short bound.
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = timeout;
         self
     }
 
@@ -176,7 +192,13 @@ impl Transport for HttpTransport {
         let body = serde_json::to_vec(&http_json::request_to_json(&req))
             .map_err(|e| AiError::Transport(format!("serializing request: {e}")))?;
 
+        // Bound the single-threaded CLI: without a timeout a stalled server (one
+        // that accepts the connection but never replies) hangs `send` forever. A
+        // whole-request cap plus a short connect cap turn that into a bounded
+        // `AiError::Transport` instead.
         let client = reqwest::blocking::Client::builder()
+            .timeout(self.timeout)
+            .connect_timeout(self.timeout.min(std::time::Duration::from_secs(10)))
             .build()
             .map_err(|e| AiError::Transport(format!("building HTTP client: {e}")))?;
 
@@ -346,11 +368,11 @@ mod http_json {
                         .map_or_else(|| "{}".to_string(), Value::to_string);
                     content.push(ContentBlock::tool_use(id, name, input));
                 }
-                other => {
-                    return Err(AiError::Transport(format!(
-                        "unexpected content block type `{other}`"
-                    )));
-                }
+                // Tolerate blocks we don't model (e.g. `thinking`, which current
+                // models can emit): skip them rather than failing the whole
+                // response. We keep only `text`/`tool_use`, the blocks the loop
+                // acts on.
+                _ => {}
             }
         }
 

@@ -180,7 +180,25 @@ fn runaway_tool_loop_is_capped() {
         .run(&sample_system(), &sample_tools(), "loop", &mut handler)
         .expect_err("should hit the cap");
 
-    assert_eq!(err, AiError::ToolLoopExhausted(3));
+    // The cap signal carries the partial run rather than discarding it: the turn
+    // count, the text the model produced, the dispatched tool calls, and the full
+    // transcript are all recoverable.
+    match err {
+        AiError::ToolLoopExhausted { turns, partial } => {
+            assert_eq!(turns, 3);
+            assert_eq!(partial.tool_calls, 3, "three turns each dispatched a tool");
+            assert_eq!(partial.final_text, "let me check");
+            assert_eq!(partial.stop_reason, StopReason::ToolUse);
+            assert!(
+                !partial.messages.is_empty(),
+                "the partial transcript is preserved"
+            );
+            // 8 input + 12 output per turn, summed over the three capped turns.
+            assert_eq!(partial.usage.input_tokens, 24);
+            assert_eq!(partial.usage.output_tokens, 36);
+        }
+        other => panic!("expected ToolLoopExhausted, got {other:?}"),
+    }
 }
 
 #[test]

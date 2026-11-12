@@ -29,7 +29,7 @@
 use std::error::Error;
 use std::fmt;
 
-use ee_core::graph::Circuit;
+use ee_core::graph::{Circuit, PartKind};
 use ee_core::units::Unit;
 use ee_core::value::Value;
 use ee_shell::Shell;
@@ -68,8 +68,11 @@ pub struct Suspect {
     /// The value this part alone would need to meet the spec, holding all other
     /// parts fixed.
     pub corrected_value: f64,
-    /// `|corrected/current - 1|` — the size of the single-part correction. The
-    /// smallest such correction is the most likely fault (Occam's razor).
+    /// `|ln(corrected/current)|` — the size of the single-part correction on a
+    /// **log scale**, so a halving and a doubling rank as equally large (a linear
+    /// `|corrected/current - 1|` would call a doubling, +1.0, twice as severe as a
+    /// halving, −0.5, though both are one factor of two). The smallest such
+    /// correction is the most likely fault (Occam's razor).
     pub relative_change: f64,
 }
 
@@ -192,6 +195,14 @@ pub fn localize_fault(
         if value.magnitude == 0.0 || !value.magnitude.is_finite() {
             continue;
         }
+        // An independent source is the reference you debug *against*, not a
+        // drifting component — and because a node voltage tracks its supply
+        // linearly (unity gain), scaling a source always needs a smaller
+        // *log-correction* than any passive, so a log-symmetric metric would
+        // otherwise blame the supply on nearly every circuit. Skip them.
+        if matches!(part.kind, PartKind::VoltageSource | PartKind::CurrentSource) {
+            continue;
+        }
         if let Some(scale) = required_scale(
             circuit,
             &part.reference,
@@ -204,15 +215,28 @@ pub fn localize_fault(
                 reference: part.reference.clone(),
                 current_value: value.magnitude,
                 corrected_value: value.magnitude * scale,
-                relative_change: (scale - 1.0).abs(),
+                // Log-symmetric: a 2× and a 0.5× correction are equally large.
+                // `scale` is a strictly-positive multiplier from `required_scale`,
+                // so `ln` is finite; a non-finite guard keeps ranking total.
+                relative_change: if scale > 0.0 {
+                    scale.ln().abs()
+                } else {
+                    f64::INFINITY
+                },
             });
         }
     }
     // Smallest correction first — the most economical explanation of the fault.
+    // The key is quantized before comparison so two corrections that differ only
+    // by solver (bisection) noise land in the same bucket and break their tie
+    // deterministically by reference: a divider's two resistors are *genuinely*
+    // equal single-fault explanations under the log-symmetric metric, so the
+    // winner must not hinge on a ~1e-12 float wobble.
     suspects.sort_by(|a, b| {
-        a.relative_change
-            .partial_cmp(&b.relative_change)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        let key = |x: f64| (x * 1e6).round() as i64;
+        key(a.relative_change)
+            .cmp(&key(b.relative_change))
+            .then_with(|| a.reference.cmp(&b.reference))
     });
 
     let suspect = suspects.first().map(|s| s.reference.clone());
@@ -819,6 +843,65 @@ mod tests {
             r1.corrected_value
         );
         assert_eq!(report.suspects[0].reference, "R1", "R1 ranks first");
+    }
+
+    /// The fault-ranking metric is **log-symmetric**: each suspect's
+    /// `relative_change` is `|ln(corrected/current)|`, not the asymmetric linear
+    /// `|corrected/current - 1|`. A halving and a doubling of the same part thus
+    /// carry equal weight, so the ranking does not systematically favor faults
+    /// that need a *decrease* over ones that need an *increase*.
+    #[test]
+    fn fault_ranking_metric_is_log_symmetric() {
+        let base = faulty_divider();
+        let report = localize_fault(&base, "out", 5.0, 0.05).expect("localization runs");
+        assert!(!report.suspects.is_empty(), "the divider is out of spec");
+
+        // The independent supply is not a fault candidate (see the skip in
+        // `localize_fault`); only the passives are ranked.
+        assert!(
+            report.suspects.iter().all(|s| s.reference != "V1"),
+            "the supply is not a drift-fault candidate: {:?}",
+            report.suspects
+        );
+
+        // Each suspect's metric is exactly |ln(corrected/current)|.
+        for s in &report.suspects {
+            let expected = (s.corrected_value / s.current_value).ln().abs();
+            assert!(
+                (s.relative_change - expected).abs() < 1e-9,
+                "{} relative_change {} should be |ln(corrected/current)| = {}",
+                s.reference,
+                s.relative_change,
+                expected
+            );
+        }
+
+        // The symmetry that the old `|scale - 1|` broke: R1 must shrink 3k -> ~1k
+        // (scale 1/3) and R2 must grow 1k -> ~3k (scale 3) to restore v(out). Both
+        // are one factor of three, so the log-metric scores them **equally**
+        // (~ln 3) — where the old linear metric scored the decrease 0.667 but the
+        // increase 2.0, three times larger, purely for being an increase.
+        let r1 = report
+            .suspects
+            .iter()
+            .find(|s| s.reference == "R1")
+            .expect("R1 is a candidate");
+        let r2 = report
+            .suspects
+            .iter()
+            .find(|s| s.reference == "R2")
+            .expect("R2 is a candidate");
+        assert!(
+            (r1.relative_change - 3f64.ln()).abs() < 1e-2,
+            "R1's log-correction should be ~ln(3), got {}",
+            r1.relative_change
+        );
+        assert!(
+            (r1.relative_change - r2.relative_change).abs() < 1e-2,
+            "a decrease and an equal-factor increase must score equally: R1 {} vs R2 {}",
+            r1.relative_change,
+            r2.relative_change
+        );
     }
 
     /// A circuit already within spec reports no fault.
