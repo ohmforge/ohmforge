@@ -191,8 +191,29 @@ part edits broadcast their op; the page feeds inbound messages back through
 (`EditOp::encode`/`decode`), so the exact same tokens would travel over a
 WebSocket unchanged.
 
-**Still deferred: the hosted signaling/relay server.** `BroadcastChannel` only
-reaches tabs on the same origin on one machine. Cross-machine sessions need a
-relay (a WebSocket the tokens flow through); that server is a standalone backend
-effort and stays out of scope — the client binding + merge logic ship here, and
-the WebSocket client would drop straight in where `CoEdit` holds its channel.
+**Hosted signaling relay (CP-WEB.6).** `BroadcastChannel` only reaches tabs on
+the same origin on one machine; cross-machine sessions need a relay (a WebSocket
+the op tokens flow through). That relay now ships. Its brain is a pure,
+host-tested router, `Relay` — clients `JOIN <room>`, an `OP <token>` is
+delivered to every *other* member of that room, join/leave are tracked, and a
+malformed frame (or a garbage op token) is a clean `Err`, never a panic:
+
+```text
+op from one client → every OTHER member of its room (not the sender)
+two clients in a room, relayed ops → identical netlist (fed to each Replica)
+a malformed frame / bad op token   → clean Err (never a panic)
+clients in different rooms          → isolated
+```
+
+The socket server behind it is a thin, **native-only** binary gated behind the
+`relay` cargo feature (so the default workspace build and the `wasm32` bundle
+stay clean and dep-free). The WebSocket upgrade — SHA-1 accept key + frame
+parse/mask — is hand-rolled over `std::net` in the house style, pulling **no new
+dependencies**. Run it with:
+
+```sh
+cargo run -p ee-web --features relay --bin relay -- 127.0.0.1:9001
+```
+
+A browser `CoEdit` client points a WebSocket at `ws://HOST:PORT` in place of its
+`BroadcastChannel` and sends the very same `EditOp` tokens unchanged.

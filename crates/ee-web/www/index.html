@@ -399,8 +399,9 @@ C2 out gnd 100n
       // A thin layer over the host-tested op-merge: `CoEdit` wraps a replica and
       // a same-origin `BroadcastChannel`; local part edits broadcast an op, and a
       // sibling channel feeds incoming ops back through `co.receive`. Two tabs on
-      // the same room converge to one netlist. (A hosted relay for cross-machine
-      // sessions is deferred; the WebSocket client would drop in right here.)
+      // the same room converge to one netlist. (CP-WEB.6 adds the hosted relay for
+      // cross-machine sessions: a WebSocket to `ee-web --features relay` drops in
+      // right here in place of the BroadcastChannel, carrying the same op tokens.)
       let co = null; // active replica, or null when co-edit is off
       let rx = null; // inbound channel
       function toggleCoedit() {
