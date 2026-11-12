@@ -145,8 +145,8 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 
 ## M6 — coupling & closed loops  🚧 in progress → plan: [`M6-PLAN.md`](M6-PLAN.md)
 
-- [~] **CP-SIM-M6.1** (sim-core) Mutual inductance / transformers (coupled inductors via coupling coefficient K), stamped in transient + AC. Circuit-level relation (e.g. `Circuit::couple`), no new data-carrying `PartKind`. — *gate:* ideal 2:1 transformer (K=1) steps 10 Vpp → ~5 Vpp in transient; K<1 shows leakage; AC transfer matches the turns ratio.
-- [~] **CP-SIM-M6.2** (sim-core) Nonlinear convergence aids: gmin stepping + source ramping fallback for the op-point. — *gate:* a circuit that fails plain Newton converges via gmin stepping to the correct solution; easy circuits unchanged (no extra iterations) and the golden suite stays bit-for-bit.
+- [x] **CP-SIM-M6.1** (sim-core) Mutual inductance / transformers via `Circuit::couple(l1, l2, k)` — a circuit-level relation on existing inductors, **no new data-carrying `PartKind`**; coupled inductors stamped with a branch-current row (robust at the ideal K=1, where an admittance companion's inverse-L is singular) in transient **and** AC, `M = k·√(L1·L2)`. — *gate:* `ideal_transformer_steps_2to1_in_transient` (K=1 steps 10 Vpp → 5.0 Vpp, secondary = primary/2 every sample), `coupling_below_unity_shows_leakage` (K=0.8 secondary measurably lower), `ac_transfer_matches_turns_ratio` (V(sec)/V(pri) = √(L2/L1) = 0.5 flat). Isolated inductors keep their exact companion ⇒ golden suite bit-for-bit.
+- [x] **CP-SIM-M6.2** (sim-core) Nonlinear convergence aids for the DC op-point: plain Newton first, gmin stepping + source ramping engaging **only** on non-convergence. — *gate:* `gmin_stepping_cracks_a_tight_nonlinear_loop` (stacked diode-connected NMOS, singular at cold start → lands v(d1)=4 V / v(d2)=2 V via gmin), `easy_circuit_takes_the_direct_path_bit_for_bit` (diode–R solve == plain NR, aids never engage), and `full_golden_suite_runs_twice_identically` stays bit-for-bit.
 - [~] **CP-BRD-M6.1** (boards) Closed-loop MCU↔analog co-sim: AVR ADC samples a real `ee-sim` node and firmware reacts (threshold → GPIO) + external pin-change interrupts. ADC injected via the `PinIo`/co-sim bridge — no `ee-sim` dep in `ee-mcu`. — *gate:* firmware reads an ADC value tracking an analog divider and sets a GPIO at a threshold; a pin-change ISR fires on an input edge.
 - [~] **CP-AF-M6.1** (ai-fmt) Native-project device-model param round-trip: diode `IS/N/RS`, BJT `IS/BF/BR`, MOSFET `VTO/KP/LAMBDA` survive `save`→`load` byte-identically (`.model`-style directive). — *gate:* a circuit with a custom diode/BJT/MOSFET model round-trips exactly. _(Closes the documented M5 follow-up.)_
 - [~] **CP-AF-M6.2** (ai-fmt) AI auto-tune: closed-loop component-value optimization against a measured spec via the verify loop (deterministic gradient-free search), offline. — *gate:* given `v(out)=3.3 V`, the tuner adjusts a divider resistor and converges to the measured target; no network/key.
@@ -160,13 +160,13 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 
 | Track | Done | In progress | Total |
 |---|---|---|---|
-| sim-core | 21 | 2 | 23 |
+| sim-core | 23 | 0 | 23 |
 | boards | 15 | 1 | 16 |
 | ui-shell | 16 | 1 | 17 |
 | ai-fmt | 14 | 2 | 16 |
 | platform | 6 | 1 | 7 |
 | web | 4 | 1 | 5 |
-| **Total** | **76** | **8** | **84** |
+| **Total** | **78** | **6** | **84** |
 
 _**67/67 — M0 through M4 all complete** (M0–M3 tagged v0.1.0; M4 adds the rest). M4 delivered the **plugin device-model API** + an **instrument/block plugin trait**, a **KLU-class ordered/reusable sparse solver** and **multithreaded analyses**, a **Cortex-M3/M4 (Thumb-2)** core with an STM32 board, **SPICE `.model` import** + a vendor model library, and **shareable circuit links** in the browser. Deferred by design: real-time collaboration, the QEMU full-SBC bridge, and full vendor-SPICE `.model` fidelity — the standing M-next horizon._
 

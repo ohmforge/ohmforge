@@ -1488,6 +1488,142 @@ const ADAPTIVE_ITER_CAP: usize = 5_000_000;
 /// voltages, and the refreshed inductor currents — the state the next step reads.
 type StepResult = (Vec<f64>, Vec<f64>, Vec<f64>);
 
+// ---------------------------------------------------------------------------
+// Mutual inductance / coupled inductors (CP-SIM-M6.1)
+// ---------------------------------------------------------------------------
+
+/// A group of magnetically-coupled inductors and the dense inductance matrix
+/// (henries) relating their branch voltages and currents: `lmat[i][i]` is member
+/// `i`'s self-inductance `L`, and `lmat[i][j]` (`i ≠ j`) the mutual inductance
+/// `M = k·√(Lᵢ·Lⱼ)` from a [`Circuit::couple`] relation (`0` when the two are not
+/// directly coupled).
+///
+/// Coupled inductors are solved with a **branch-current formulation** — each gets
+/// its own MNA branch row whose equation is `v = Σⱼ (Lᵢⱼ/h)·(iⱼ − iⱼ_prev)` in a
+/// Backward-Euler transient (and `v = Σⱼ jωLᵢⱼ·iⱼ` in AC). That is the robust way
+/// to stamp mutual coupling: the alternative admittance/Norton companion would need
+/// the *inverse* inductance matrix, which is singular exactly at the ideal `k = 1`
+/// transformer the gate requires. An **isolated** inductor keeps its original
+/// single conductance companion (admittance in AC), so nothing uncoupled moves a
+/// bit.
+struct CoupledGroup {
+    /// Indices (into the caller's inductor list) of this group's members, ascending.
+    members: Vec<usize>,
+    /// Dense inductance matrix in `members` order (henries), symmetric.
+    lmat: Vec<Vec<f64>>,
+}
+
+/// The coupled-inductor structure of a circuit: which inductors are magnetically
+/// coupled (and so need an extra MNA branch row) and the per-group inductance
+/// matrices. Built by [`couplings_of`]; a circuit with no [`Circuit::couple`]
+/// relations yields `count == 0` and all-`None` `branch_of`, i.e. the pre-M6 path
+/// unchanged.
+struct Couplings {
+    /// Per inductor (caller's order): its 0-based offset among the coupled branch
+    /// rows, or `None` if it is uncoupled (keeps the isolated-inductor companion).
+    branch_of: Vec<Option<usize>>,
+    /// Total coupled inductors = number of branch rows the coupling adds.
+    count: usize,
+    /// The coupled groups (each with ≥ 2 members).
+    groups: Vec<CoupledGroup>,
+}
+
+/// Union-find root with path halving, over a flat parent slice.
+fn uf_find(parent: &mut [usize], mut x: usize) -> usize {
+    while parent[x] != x {
+        parent[x] = parent[parent[x]];
+        x = parent[x];
+    }
+    x
+}
+
+/// Union two union-find sets, keeping the smaller index as the root (so grouping
+/// is deterministic regardless of the order edges are added).
+fn uf_union(parent: &mut [usize], a: usize, b: usize) {
+    let (ra, rb) = (uf_find(parent, a), uf_find(parent, b));
+    if ra != rb {
+        parent[ra.max(rb)] = ra.min(rb);
+    }
+}
+
+/// Partition a circuit's inductors — given in `ind_refs` / `ind_l` order (matching
+/// how the transient and AC paths enumerate inductor parts) — into magnetically-
+/// coupled groups per the circuit's [`Circuit::couple`] relations, and assign each
+/// coupled inductor a branch-row offset (`CP-SIM-M6.1`).
+///
+/// A [`Coupling`](ee_core::graph::Coupling) naming two of these inductors adds an
+/// edge between them; connected components of size ≥ 2 become coupled groups, each
+/// with a dense inductance matrix (`L` on the diagonal, `M = k·√(Lᵢ·Lⱼ)` for a
+/// directly-coupled pair). Isolated inductors get `branch_of = None` and keep their
+/// exact single-inductor companion, so a circuit with no couplings is bit-for-bit
+/// unchanged. Grouping is deterministic (union-find to the smaller root; members
+/// and groups in ascending index order).
+fn couplings_of(circuit: &Circuit, ind_refs: &[String], ind_l: &[f64]) -> Couplings {
+    let n = ind_refs.len();
+    let mut branch_of = vec![None; n];
+    if circuit.couplings().is_empty() || n == 0 {
+        return Couplings {
+            branch_of,
+            count: 0,
+            groups: Vec::new(),
+        };
+    }
+
+    let index_of = |r: &str| ind_refs.iter().position(|s| s == r);
+    let mut parent: Vec<usize> = (0..n).collect();
+    // Directly-coupled pairs → their coefficient `k`, keyed by the ordered index
+    // pair so the mutual term is looked up unambiguously below.
+    let mut pair_k: BTreeMap<(usize, usize), f64> = BTreeMap::new();
+    for cpl in circuit.couplings() {
+        if let (Some(i), Some(j)) = (index_of(&cpl.a), index_of(&cpl.b)) {
+            if i != j {
+                pair_k.insert((i.min(j), i.max(j)), cpl.k);
+                uf_union(&mut parent, i, j);
+            }
+        }
+    }
+
+    // Collect members per connected component (BTreeMap keeps roots ascending, and
+    // members are pushed in ascending index order).
+    let mut by_root: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for i in 0..n {
+        let r = uf_find(&mut parent, i);
+        by_root.entry(r).or_default().push(i);
+    }
+
+    let mut groups = Vec::new();
+    let mut offset = 0usize;
+    for members in by_root.into_values() {
+        if members.len() < 2 {
+            continue; // an isolated inductor keeps its single-inductor companion
+        }
+        let sz = members.len();
+        let mut lmat = vec![vec![0.0; sz]; sz];
+        for (li, &gi) in members.iter().enumerate() {
+            lmat[li][li] = ind_l[gi];
+            for (lj, &gj) in members.iter().enumerate().skip(li + 1) {
+                // members ascending ⇒ gi < gj, so the key is already ordered.
+                if let Some(&k) = pair_k.get(&(gi, gj)) {
+                    let m = k * (ind_l[gi] * ind_l[gj]).sqrt();
+                    lmat[li][lj] = m;
+                    lmat[lj][li] = m;
+                }
+            }
+        }
+        for &gi in &members {
+            branch_of[gi] = Some(offset);
+            offset += 1;
+        }
+        groups.push(CoupledGroup { members, lmat });
+    }
+
+    Couplings {
+        branch_of,
+        count: offset,
+        groups,
+    }
+}
+
 struct TransientModel<'a> {
     circuit: &'a Circuit,
     layout: &'a Layout,
@@ -1495,10 +1631,16 @@ struct TransientModel<'a> {
     caps: Vec<(NetId, NetId, f64)>,
     /// Inductors as `(a, b, henries)`.
     inds: Vec<(NetId, NetId, f64)>,
+    /// Magnetic-coupling structure over `inds` (`CP-SIM-M6.1`). Coupled inductors
+    /// are stamped with a branch row each (`coupling.count` of them, right after the
+    /// controlled-source branches); isolated inductors keep the conductance
+    /// companion, so a circuit with no couplings is unchanged.
+    coupling: Couplings,
     /// Nonlinear devices, re-linearized inside each step's Newton loop.
     devices: Vec<Box<dyn NonlinearDevice>>,
     /// Node count and voltage-source branch count. The step system is
-    /// `n + m + cb`, with `cb` the controlled-source (VCVS/CCVS) branch rows.
+    /// `n + m + cb + coupling.count`, with `cb` the controlled-source (VCVS/CCVS)
+    /// branch rows and `coupling.count` the coupled-inductor branch rows.
     n: usize,
     m: usize,
     cb: usize,
@@ -1527,20 +1669,25 @@ impl<'a> TransientModel<'a> {
             })
             .collect::<Result<_, _>>()?;
 
-        // A non-positive inductance would blow up `h/L`.
-        let inds: Vec<(NetId, NetId, f64)> = circuit
-            .parts()
-            .iter()
-            .filter(|p| matches!(p.kind, PartKind::Inductor))
-            .map(|p| {
+        // A non-positive inductance would blow up `h/L`. Collect the references and
+        // values alongside, in the same order, so the coupling structure can map a
+        // `Circuit::couple(l1, l2, …)` relation onto these inductors.
+        let mut inds: Vec<(NetId, NetId, f64)> = Vec::new();
+        let mut ind_refs: Vec<String> = Vec::new();
+        let mut ind_l: Vec<f64> = Vec::new();
+        for p in circuit.parts() {
+            if matches!(p.kind, PartKind::Inductor) {
                 let (a, b) = terminals2(p)?;
                 let l = magnitude(p)?;
                 if l <= 0.0 {
                     return Err(SimError::BadValue(p.reference.clone()));
                 }
-                Ok::<_, SimError>((a, b, l))
-            })
-            .collect::<Result<_, _>>()?;
+                inds.push((a, b, l));
+                ind_refs.push(p.reference.clone());
+                ind_l.push(l);
+            }
+        }
+        let coupling = couplings_of(circuit, &ind_refs, &ind_l);
 
         let devices = collect_nonlinear(circuit, registry)?;
         Ok(Self {
@@ -1548,6 +1695,7 @@ impl<'a> TransientModel<'a> {
             layout,
             caps,
             inds,
+            coupling,
             devices,
             n: layout.n_nodes(),
             m: layout.vsources.len(),
@@ -1635,12 +1783,41 @@ impl<'a> TransientModel<'a> {
                 sys.stamp_conductance(ia, ib, g_eq);
                 sys.stamp_current(ia, ib, g_eq * cap_prev[ci]);
             }
+            // Isolated inductors: the original conductance companion, bit-for-bit.
             for (li, (a, b, l)) in self.inds.iter().enumerate() {
+                if self.coupling.branch_of[li].is_some() {
+                    continue; // coupled — stamped by the branch-row loop below
+                }
                 let g_eq = h / l;
                 let (ia, ib) = (layout.node_of(circuit, *a), layout.node_of(circuit, *b));
                 sys.stamp_conductance(ia, ib, g_eq);
                 // History source `i_prev` oriented a → b: current flows a into b.
                 sys.stamp_current(ib, ia, ind_prev[li]);
+            }
+            // Coupled inductors: a branch-current row each. Branch `k`'s equation is
+            // `(v_a − v_b) − Σⱼ (Lₖⱼ/h)·iⱼ = −Σⱼ (Lₖⱼ/h)·iⱼ_prev` (Backward Euler on
+            // `v = L·di/dt` with the mutual terms), which stamps exactly at `k = 1`
+            // where an admittance companion would need the singular inverse of L.
+            let cbase = self.n + self.m + self.cb;
+            for group in &self.coupling.groups {
+                for (li_local, &li) in group.members.iter().enumerate() {
+                    let (a, b, _) = self.inds[li];
+                    let k_col = cbase + self.coupling.branch_of[li].expect("coupled");
+                    let (ia, ib) = (layout.node_of(circuit, a), layout.node_of(circuit, b));
+                    // The `(v_a − v_b)` term + the branch-current node coupling.
+                    sys.stamp_vsource(ia, ib, k_col, 0.0);
+                    let mut rhs = 0.0;
+                    for (lj_local, &lj) in group.members.iter().enumerate() {
+                        let l_kj = group.lmat[li_local][lj_local];
+                        if l_kj == 0.0 {
+                            continue;
+                        }
+                        let j_col = cbase + self.coupling.branch_of[lj].expect("coupled");
+                        sys.stamp_matrix(Some(k_col), Some(j_col), -l_kj / h);
+                        rhs += (l_kj / h) * ind_prev[lj];
+                    }
+                    sys.stamp_current(Some(k_col), None, -rhs);
+                }
             }
             Ok(())
         };
@@ -1649,10 +1826,11 @@ impl<'a> TransientModel<'a> {
         // The caller's `solver` is shared across steps: every step stamps the same
         // structure (the reactive companions never change shape), so on a large net
         // the fill-reducing ordering is computed once and only refactored per step.
+        let cbase = self.n + self.m + self.cb;
         let x = solve_aided(
             circuit,
             layout,
-            self.n + self.m + self.cb,
+            cbase + self.coupling.count,
             &self.devices,
             &stamp_at,
             solver,
@@ -1666,9 +1844,15 @@ impl<'a> TransientModel<'a> {
             .inds
             .iter()
             .enumerate()
-            .map(|(li, (a, b, l))| {
-                ind_prev[li]
-                    + (h / l) * across(&x, layout.node_of(circuit, *a), layout.node_of(circuit, *b))
+            .map(|(li, (a, b, l))| match self.coupling.branch_of[li] {
+                // A coupled inductor's current is a solved branch unknown.
+                Some(off) => x[cbase + off],
+                // An isolated inductor updates from its companion: `i += (h/L)·v`.
+                None => {
+                    ind_prev[li]
+                        + (h / l)
+                            * across(&x, layout.node_of(circuit, *a), layout.node_of(circuit, *b))
+                }
             })
             .collect();
         Ok((x, new_caps, new_inds))
@@ -1735,7 +1919,7 @@ fn fixed_transient(
     let mut ind_prev = vec![0.0; model.inds.len()];
     // One solver for the whole run: every step stamps the same structure, so a
     // large net analyzes the fill-reducing ordering once and refactors per step.
-    let mut solver = ReusableSolver::new(model.n + model.m + model.cb);
+    let mut solver = ReusableSolver::new(model.n + model.m + model.cb + model.coupling.count);
     for k in 1..=steps {
         let t = k as f64 * h;
         let (x, caps, inds) = model.step(t, h, &cap_prev, &ind_prev, &mut solver)?;
@@ -1801,7 +1985,7 @@ fn adaptive_transient(
     let mut h = (duration / 100.0).clamp(h_min, h_max);
     // Shared across every accept/reject attempt (coarse + two half steps): all stamp
     // the same structure, so a large net reuses one symbolic factorization throughout.
-    let mut solver = ReusableSolver::new(model.n + model.m + model.cb);
+    let mut solver = ReusableSolver::new(model.n + model.m + model.cb + model.coupling.count);
 
     let mut iters = 0usize;
     while t < duration * (1.0 - 1e-12) {
@@ -1894,16 +2078,21 @@ fn ac(
 
     let n = layout.n_nodes();
     let m = layout.vsources.len();
-    // Inductors are admittances in AC — no branch rows. Controlled sources keep
-    // their branch rows (VCVS/CCVS), right after the voltage-source branches.
-    let size = n + m + layout.n_controlled_branches();
+    // Isolated inductors are admittances in AC — no branch rows; coupled inductors
+    // get a branch row each (after the controlled-source branches), because mutual
+    // coupling is singular to invert into an admittance at the ideal k = 1.
+    let ac_base = n + m + layout.n_controlled_branches();
 
     // Precompute every frequency-independent stamp once.
     // Resistors → real conductance G.
     let mut conductances: Vec<(Option<usize>, Option<usize>, f64)> = Vec::new();
-    // Capacitors → jωC; inductors → 1/(jωL). Stored as (nodes, value) in F / H.
+    // Capacitors → jωC. Stored as (nodes, value) in farads.
     let mut caps: Vec<(Option<usize>, Option<usize>, f64)> = Vec::new();
-    let mut inds: Vec<(Option<usize>, Option<usize>, f64)> = Vec::new();
+    // Every inductor, in part order, with its nodes, value, and reference — then
+    // split into isolated (admittance) and coupled (branch-row) below.
+    let mut all_inds: Vec<(Option<usize>, Option<usize>, f64)> = Vec::new();
+    let mut ind_refs: Vec<String> = Vec::new();
+    let mut ind_l: Vec<f64> = Vec::new();
     for part in circuit.parts() {
         match part.kind {
             PartKind::Resistor => {
@@ -1929,11 +2118,24 @@ fn ac(
                     return Err(SimError::BadValue(part.reference.clone()));
                 }
                 let (a, b) = terminals2(part)?;
-                inds.push((layout.node_of(circuit, a), layout.node_of(circuit, b), l));
+                all_inds.push((layout.node_of(circuit, a), layout.node_of(circuit, b), l));
+                ind_refs.push(part.reference.clone());
+                ind_l.push(l);
             }
             _ => {}
         }
     }
+    // Magnetic coupling (`CP-SIM-M6.1`). Isolated inductors (`branch_of == None`)
+    // stay admittances in `inds`; coupled ones get a branch row and are stamped in
+    // their group below. With no couplings this is the pre-M6 path, bit-for-bit.
+    let coupling = couplings_of(circuit, &ind_refs, &ind_l);
+    let size = ac_base + coupling.count;
+    let inds: Vec<(Option<usize>, Option<usize>, f64)> = all_inds
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| coupling.branch_of[*i].is_none())
+        .map(|(_, &t)| t)
+        .collect();
 
     // Nonlinear devices → their small-signal Jacobian at the DC bias (a real
     // admittance block). A diode reduces to one conductance between its nodes; a
@@ -2005,6 +2207,24 @@ fn ac(
         }
         for &(a, b, l) in &inds {
             sys.stamp_admittance(a, b, Complex::new(0.0, -1.0 / (w * l))); // 1/(jωL)
+        }
+        // Coupled-inductor branch rows: `(v_a − v_b) − Σⱼ jωLₖⱼ·iⱼ = 0`, i.e.
+        // `v = jω·L·i` with the mutual terms — the AC twin of the transient branch
+        // stamp, valid at the ideal k = 1 where the admittance form is singular.
+        for group in &coupling.groups {
+            for (li_local, &li) in group.members.iter().enumerate() {
+                let (a, b, _) = all_inds[li];
+                let k_col = ac_base + coupling.branch_of[li].expect("coupled");
+                sys.stamp_vsource(a, b, k_col, Complex::ZERO);
+                for (lj_local, &lj) in group.members.iter().enumerate() {
+                    let l_kj = group.lmat[li_local][lj_local];
+                    if l_kj == 0.0 {
+                        continue;
+                    }
+                    let j_col = ac_base + coupling.branch_of[lj].expect("coupled");
+                    sys.stamp_matrix(Some(k_col), Some(j_col), Complex::new(0.0, -w * l_kj));
+                }
+            }
         }
         for &(a, b, g) in &device_g {
             sys.stamp_matrix(a, b, Complex::new(g, 0.0));
@@ -5856,5 +6076,305 @@ mod tests {
                 .unwrap()[0];
             assert_eq!(got, dense[idx]);
         }
+    }
+
+    // --- Mutual inductance / transformers — CP-SIM-M6.1 --------------------
+
+    /// Peak-to-peak span of a trace — the transient amplitude the transformer gate
+    /// reads off the primary and secondary node waveforms.
+    fn vpp(y: &[f64]) -> f64 {
+        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        for &v in y {
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+        hi - lo
+    }
+
+    /// A 2:1 step-down transformer: a 10 Vpp / 1 kHz sine through a tiny series
+    /// resistor into the primary winding `L1`, a secondary winding `L2` loaded by
+    /// 1 kΩ, with `L1 = 4·L2` so the turns ratio N1:N2 = 2:1 (`√(L2/L1) = 0.5`). The
+    /// two windings are magnetically coupled with coefficient `k`. Returns the
+    /// circuit plus the primary-winding node and secondary-winding node.
+    fn transformer(k: f64) -> (Circuit, NetId, NetId) {
+        let mut c = Circuit::new("xfmr");
+        let vin = c.new_net();
+        let p = c.new_net(); // across L1 (primary winding)
+        let sec = c.new_net(); // across L2 (secondary winding)
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            None,
+            vec![vin, NetId::GROUND],
+        );
+        c.set_waveform(
+            "V1",
+            Waveform::Sine {
+                amplitude: 5.0, // 10 Vpp
+                freq: 1_000.0,
+                offset: 0.0,
+                phase_deg: 0.0,
+            },
+        );
+        c.add_part("Rp", PartKind::Resistor, v("1", Unit::Ohm), vec![vin, p]);
+        c.add_part(
+            "L1",
+            PartKind::Inductor,
+            Some(Value::new(400e-3, Unit::Henry)),
+            vec![p, NetId::GROUND],
+        );
+        c.add_part(
+            "L2",
+            PartKind::Inductor,
+            Some(Value::new(100e-3, Unit::Henry)),
+            vec![sec, NetId::GROUND],
+        );
+        c.add_part(
+            "Rload",
+            PartKind::Resistor,
+            v("1k", Unit::Ohm),
+            vec![sec, NetId::GROUND],
+        );
+        assert!(c.couple("L1", "L2", k), "coupling L1–L2 must succeed");
+        (c, p, sec)
+    }
+
+    fn trace<'a>(sigs: &'a [Signal], c: &Circuit, net: NetId) -> &'a [f64] {
+        let name = format!("v(n{})", c.resolve(net).0);
+        sigs.iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("signal {name} present"))
+            .real()
+            .unwrap()
+    }
+
+    /// The acceptance gate: an ideal (`k = 1`) 2:1 transformer steps a 10 Vpp
+    /// primary sine down to ~5 Vpp on the secondary in transient. With `k = 1` the
+    /// flux linkages are perfectly proportional, so the secondary equals *half the
+    /// primary-winding voltage at every instant* — the exact ideal-transformer
+    /// identity, which the Backward-Euler branch stamp preserves to solver roundoff.
+    #[test]
+    fn ideal_transformer_steps_2to1_in_transient() {
+        let (c, p, sec) = transformer(1.0);
+        let sigs = Engine::new()
+            .run(
+                &c,
+                &Analysis::Transient {
+                    duration: 3e-3, // three 1 kHz periods
+                    step: Some(2e-6),
+                },
+            )
+            .unwrap();
+        let pv = trace(&sigs, &c, p).to_vec();
+        let sv = trace(&sigs, &c, sec).to_vec();
+
+        // Ideal transformer: V(secondary) = V(primary) / 2 at every sample.
+        for (&vp, &vs) in pv.iter().zip(&sv) {
+            assert!(
+                (vs - vp / 2.0).abs() <= 1e-9 * (1.0 + vp.abs()),
+                "secondary {vs} != primary/2 {}",
+                vp / 2.0
+            );
+        }
+
+        // ~10 Vpp in, ~5 Vpp out — and the amplitude ratio is exactly the turns ratio.
+        let (pp, sp) = (vpp(&pv), vpp(&sv));
+        assert!((pp - 10.0).abs() <= 0.3, "primary Vpp {pp}, expected ~10");
+        assert!((sp - 5.0).abs() <= 0.15, "secondary Vpp {sp}, expected ~5");
+        assert!(
+            (sp / pp - 0.5).abs() <= 1e-6,
+            "secondary/primary {} != turns ratio 0.5",
+            sp / pp
+        );
+    }
+
+    /// `k < 1` shows measurable leakage: the same transformer with reduced coupling
+    /// delivers a strictly smaller secondary amplitude (flux that fails to link the
+    /// secondary is lost to leakage inductance).
+    #[test]
+    fn coupling_below_unity_shows_leakage() {
+        let secondary_vpp = |k| {
+            let (c, _p, sec) = transformer(k);
+            let sigs = Engine::new()
+                .run(
+                    &c,
+                    &Analysis::Transient {
+                        duration: 3e-3,
+                        step: Some(2e-6),
+                    },
+                )
+                .unwrap();
+            vpp(trace(&sigs, &c, sec))
+        };
+        let ideal = secondary_vpp(1.0);
+        let leaky = secondary_vpp(0.8);
+        assert!(leaky > 0.0, "secondary still swings with k=0.8 ({leaky})");
+        assert!(
+            leaky < ideal - 0.05,
+            "k=0.8 secondary ({leaky}) should be measurably below the ideal ({ideal})"
+        );
+    }
+
+    /// An AC sweep transfer matches the turns ratio: the ideal (`k = 1`) transformer
+    /// has `V(secondary) = V(primary)/2` at every frequency, i.e. the turns ratio
+    /// `√(L2/L1) = 0.5`, flat across the band (no reactive pole appears in the
+    /// ratio because the coupling is lossless).
+    #[test]
+    fn ac_transfer_matches_turns_ratio() {
+        let (c, p, sec) = transformer(1.0);
+        let sigs = Engine::new()
+            .run(
+                &c,
+                &Analysis::Ac {
+                    f_start: 100.0,
+                    f_stop: 100_000.0,
+                    points_per_decade: 5,
+                },
+            )
+            .unwrap();
+        let name = |net: NetId| format!("v(n{})", c.resolve(net).0);
+        let pz = sigs
+            .iter()
+            .find(|s| s.name == name(p))
+            .unwrap()
+            .complex()
+            .unwrap();
+        let sz = sigs
+            .iter()
+            .find(|s| s.name == name(sec))
+            .unwrap()
+            .complex()
+            .unwrap();
+        let turns = (100e-3_f64 / 400e-3).sqrt(); // √(L2/L1) = 0.5
+        for (zp, zs) in pz.iter().zip(sz) {
+            let half = *zp * Complex::new(0.5, 0.0);
+            assert!(
+                (*zs - half).magnitude() <= 1e-9,
+                "AC secondary {zs:?} != primary/2 {half:?}"
+            );
+            assert!(
+                (zs.magnitude() / zp.magnitude() - turns).abs() <= 1e-9,
+                "AC transfer {} != turns ratio {turns}",
+                zs.magnitude() / zp.magnitude()
+            );
+        }
+    }
+
+    // --- Nonlinear convergence aids (DC op-point) — CP-SIM-M6.2 ------------
+
+    /// The acceptance gate: a tight nonlinear loop plain Newton–Raphson cannot start
+    /// on, but gmin stepping cracks.
+    ///
+    /// Two diode-connected NMOS are stacked between a current source and ground
+    /// (`I1` → `d1`; `M1` drain=gate=`d1`, source=`d2`; `M2` drain=gate=`d2`,
+    /// source=gnd). At the cold-start guess (all nodes 0 V) both channels are cut
+    /// off with zero transconductance, so the `d1`/`d2` rows are all-zero and plain
+    /// NR hits a singular Jacobian. gmin stepping props the nodes up and walks the
+    /// bias onto the channels. Diode-connected ⇒ always saturated: with defaults
+    /// `K = 1 mA/V²`, `Vth = 1 V`, each FET at `I = 1 mA` has `Vov = 1 V`, so
+    /// `v(d2) = Vth + Vov = 2 V` and `v(d1) = 2·(Vth + Vov) = 4 V`.
+    #[test]
+    fn gmin_stepping_cracks_a_tight_nonlinear_loop() {
+        let mut c = Circuit::new("fet_stack");
+        let d1 = c.new_net();
+        let d2 = c.new_net();
+        c.add_part(
+            "I1",
+            PartKind::CurrentSource,
+            v("1m", Unit::Ampere),
+            vec![NetId::GROUND, d1],
+        );
+        c.add_part(
+            "M1",
+            PartKind::Mosfet(Polarity::N, MosfetModel::default()),
+            None,
+            vec![d1, d1, d2],
+        );
+        c.add_part(
+            "M2",
+            PartKind::Mosfet(Polarity::N, MosfetModel::default()),
+            None,
+            vec![d2, d2, NetId::GROUND],
+        );
+
+        // Plain NR alone cannot start (singular at the cold guess).
+        assert!(
+            plain_nr_dc(&c).is_err(),
+            "plain NR unexpectedly solved the stacked loop — the gate proves nothing"
+        );
+
+        let layout = Layout::build(&c);
+        let size = layout.n_nodes() + layout.vsources.len() + layout.inductors.len();
+        let devices = collect_nonlinear(&c).unwrap();
+        let stamp_at = |sys: &mut System, alpha: f64| -> Result<(), SimError> {
+            stamp_resistors(sys, &c, &layout)?;
+            stamp_vsources(sys, &c, &layout, None, alpha)?;
+            stamp_current_sources(sys, &c, &layout, None, alpha)?;
+            stamp_inductor_shorts(sys, &c, &layout)?;
+            Ok(())
+        };
+        // gmin stepping alone reaches the point.
+        let g = gmin_stepping(&c, &layout, size, &devices, &stamp_at)
+            .unwrap()
+            .expect("gmin stepping converged");
+        // …and so does the full aided operating point.
+        let x = solve_dc(&c, &layout).unwrap();
+
+        let m = MosfetModel::default();
+        let vov = (1e-3_f64 / m.kp).sqrt(); // I = K·Vov² ⇒ Vov = 1 V
+        let (want_d1, want_d2) = (2.0 * (m.vth + vov), m.vth + vov); // 4 V, 2 V
+        let (gi1, gi2) = (
+            layout.node_of(&c, d1).unwrap(),
+            layout.node_of(&c, d2).unwrap(),
+        );
+        for (label, sol) in [("gmin", &g), ("aided", &x)] {
+            assert!(
+                (sol[gi1] - want_d1).abs() <= 1e-6,
+                "{label}: v(d1) = {} V, expected {want_d1} V",
+                sol[gi1]
+            );
+            assert!(
+                (sol[gi2] - want_d2).abs() <= 1e-6,
+                "{label}: v(d2) = {} V, expected {want_d2} V",
+                sol[gi2]
+            );
+        }
+    }
+
+    /// An easy (plain-convergent) nonlinear circuit must still take the direct
+    /// Newton path with no extra iterations — the convergence aids never engage.
+    ///
+    /// `solve_dc` tries plain NR first and returns its result verbatim when it
+    /// succeeds; only on failure does it warm-start the gmin / source continuations,
+    /// which would land a *stepped* result. So for a circuit with no controlled
+    /// sources or inductors — where `plain_nr_dc` and `solve_dc`'s first attempt
+    /// stamp the identical system — a **bit-for-bit** match of the two proves the
+    /// direct path was taken and the aids added nothing.
+    #[test]
+    fn easy_circuit_takes_the_direct_path_bit_for_bit() {
+        let mut c = Circuit::new("diode_r");
+        let vin = c.new_net();
+        let mid = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("5", Unit::Volt),
+            vec![vin, NetId::GROUND],
+        );
+        c.add_part("R1", PartKind::Resistor, v("1k", Unit::Ohm), vec![vin, mid]);
+        c.add_part(
+            "D1",
+            PartKind::Diode(DiodeModel::default()),
+            None,
+            vec![mid, NetId::GROUND],
+        );
+
+        let layout = Layout::build(&c);
+        let direct = plain_nr_dc(&c).expect("plain NR cracks an easy bias");
+        let aided = solve_dc(&c, &layout).expect("aided solve");
+        assert_eq!(
+            direct, aided,
+            "an easy circuit must take the direct NR path, bit-for-bit (no aid engaged)"
+        );
     }
 }
