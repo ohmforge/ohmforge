@@ -642,7 +642,7 @@ impl Session {
 // new deps) and is unit-tested in CI without a browser; the `wasm` module adds
 // only a thin [`BroadcastChannel`] outbound binding (see `CoEdit`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A logical clock: a Lamport counter plus the id of the site that stamped it.
 ///
@@ -1039,6 +1039,534 @@ impl EditOp {
             clock: Clock { lamport, site },
             kind,
         })
+    }
+}
+
+// --- Hosted signaling relay: pure room/broadcast routing (CP-WEB.6) --------
+//
+// CP-WEB.5 shipped the op-merge plus a `BroadcastChannel` client, but that only
+// reaches tabs on **one machine** (same origin). To converge two browsers on
+// *different* machines the ops must flow through a server. This is that server's
+// brain — a pure, host-tested router with **no socket/network dependency** — so
+// it is unit-tested in CI without a browser or a real socket, exactly like the
+// merge layer above. The thin, feature-gated [`server`] binds it to real
+// WebSocket sockets; every routing decision lives here.
+//
+// ## The model
+//
+// Clients (one per browser socket) join a [`Room`](Relay) by id. An op a client
+// broadcasts is delivered to **every other** client in that same room — never
+// back to the sender, never to another room. The ops on the wire are the very
+// same base64url [`EditOp`] tokens the `BroadcastChannel` client already sends
+// (see [`EditOp::encode`]), so each client feeds a relayed token straight into
+// its [`Replica`] and the whole set converges by the CP-WEB.5 merge rule.
+//
+// A client speaks to the relay in tiny line-oriented [`Frame`]s (`JOIN <room>`,
+// `OP <token>`, `LEAVE`) in the hand-rolled house style — no JSON dep. A
+// malformed frame (bad tag, missing room/token, or a garbage op token) is a
+// clean `Err`, **never** a panic: the server replies with an error and keeps the
+// connection and the room intact.
+
+/// A relay client's id, assigned by the server as each socket connects. It also
+/// doubles as that client's [`Replica`] site id, so ops from distinct clients
+/// carry distinct clocks and the merge tiebreak stays deterministic.
+pub type ClientId = u64;
+
+/// One protocol message a client sends the relay: a line-oriented text frame in
+/// the house style (`JOIN <room>`, `OP <token>`, `LEAVE`), with no JSON dep.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Frame {
+    /// Join (or switch to) the room with this id. A client is in at most one
+    /// room, so joining a second one leaves the first.
+    Join {
+        /// Room id (a single whitespace-free token).
+        room: String,
+    },
+    /// Broadcast an encoded [`EditOp`] token to the rest of the room.
+    Op {
+        /// The base64url op token from [`EditOp::encode`].
+        token: String,
+    },
+    /// Leave the current room.
+    Leave,
+}
+
+impl Frame {
+    /// Parse one frame. Strict: an unknown tag, a `JOIN` with no / a multi-token
+    /// room, or an `OP` with no token is a clean `Err` — never a panic.
+    pub fn parse(frame: &str) -> Result<Frame, String> {
+        let line = frame.trim_end_matches(['\r', '\n']);
+        let (tag, rest) = line.split_once(' ').unwrap_or((line, ""));
+        match tag {
+            "JOIN" => {
+                let room = rest.trim();
+                check_token("room id", room)?;
+                Ok(Frame::Join {
+                    room: room.to_string(),
+                })
+            }
+            "OP" => {
+                let token = rest.trim();
+                if token.is_empty() {
+                    return Err("OP frame needs an op token".to_string());
+                }
+                Ok(Frame::Op {
+                    token: token.to_string(),
+                })
+            }
+            "LEAVE" => Ok(Frame::Leave),
+            other => Err(format!("unknown relay frame tag: {other:?}")),
+        }
+    }
+
+    /// Render the frame back to its wire text (the inverse of [`parse`](Frame::parse)).
+    pub fn encode(&self) -> String {
+        match self {
+            Frame::Join { room } => format!("JOIN {room}"),
+            Frame::Op { token } => format!("OP {token}"),
+            Frame::Leave => "LEAVE".to_string(),
+        }
+    }
+}
+
+/// The routing outcome of one handled frame: who should receive `payload`, and
+/// what to send them. A join/leave routes nothing (empty `recipients`); an `OP`
+/// routes the bare op token to every other member of the sender's room.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Delivery {
+    /// The client ids to forward `payload` to (never the sender).
+    pub recipients: Vec<ClientId>,
+    /// The bare [`EditOp`] token to send each recipient (empty when there is
+    /// nothing to route), ready to drop into each client's `receive`.
+    pub payload: String,
+}
+
+/// The relay's pure routing core: rooms keyed by id, each a set of client ids,
+/// plus the reverse index of which room each client is in. No sockets — the
+/// feature-gated `server` module wires this to real WebSocket connections. Deterministic and
+/// host-tested: the same joins + the same op produce the same [`Delivery`].
+#[derive(Debug, Default)]
+pub struct Relay {
+    rooms: BTreeMap<String, BTreeSet<ClientId>>,
+    /// A client is in at most one room; this is the reverse index.
+    client_room: BTreeMap<ClientId, String>,
+}
+
+impl Relay {
+    /// A fresh relay with no rooms.
+    pub fn new() -> Relay {
+        Relay::default()
+    }
+
+    /// Put `client` in `room`, creating the room if needed. Because a client is
+    /// in at most one room, this first leaves any room it was already in.
+    pub fn join(&mut self, room: &str, client: ClientId) {
+        if self.client_room.get(&client).map(String::as_str) == Some(room) {
+            return; // already a member — nothing to do
+        }
+        self.leave(client);
+        self.rooms
+            .entry(room.to_string())
+            .or_default()
+            .insert(client);
+        self.client_room.insert(client, room.to_string());
+    }
+
+    /// Remove `client` from its room (a no-op if it is in none). An emptied room
+    /// is dropped so a later broadcast can't find a stale, member-less room.
+    pub fn leave(&mut self, client: ClientId) {
+        if let Some(room) = self.client_room.remove(&client) {
+            if let Some(members) = self.rooms.get_mut(&room) {
+                members.remove(&client);
+                if members.is_empty() {
+                    self.rooms.remove(&room);
+                }
+            }
+        }
+    }
+
+    /// The room `client` is currently in, if any.
+    pub fn room_of(&self, client: ClientId) -> Option<&str> {
+        self.client_room.get(&client).map(String::as_str)
+    }
+
+    /// Route an op token `from` a client to every **other** member of its room.
+    /// The token is validated as a real [`EditOp`] first, so a garbage token is
+    /// a clean `Err` and never reaches the wire. The sender must have joined a
+    /// room.
+    pub fn broadcast(&self, from: ClientId, token: &str) -> Result<Vec<ClientId>, String> {
+        EditOp::decode(token)?; // reject a malformed op token cleanly
+        let room = self
+            .client_room
+            .get(&from)
+            .ok_or("sender has not joined a room")?;
+        let members = self.rooms.get(room).ok_or("sender's room is empty")?;
+        Ok(members.iter().copied().filter(|&c| c != from).collect())
+    }
+
+    /// Parse and dispatch one raw frame from `client`, returning what to route.
+    /// Join/leave mutate the room map and route nothing; an `OP` validates and
+    /// fans the token out to the rest of the room. A malformed frame or op token
+    /// is a clean `Err` (the server reports it and keeps the session alive).
+    pub fn handle(&mut self, client: ClientId, frame: &str) -> Result<Delivery, String> {
+        match Frame::parse(frame)? {
+            Frame::Join { room } => {
+                self.join(&room, client);
+                Ok(Delivery::default())
+            }
+            Frame::Leave => {
+                self.leave(client);
+                Ok(Delivery::default())
+            }
+            Frame::Op { token } => {
+                let recipients = self.broadcast(client, &token)?;
+                Ok(Delivery {
+                    recipients,
+                    payload: token,
+                })
+            }
+        }
+    }
+}
+
+/// The native WebSocket relay server — the thin socket plumbing behind the pure
+/// [`Relay`] router. **Opt-in and native-only:** compiled only with the `relay`
+/// cargo feature, so no server/socket code enters the default workspace build or
+/// the `wasm32` browser bundle. The WebSocket upgrade (SHA-1 accept key + frame
+/// parse/mask) is hand-rolled over `std::net` in the house style — no new deps.
+///
+/// Run it with the companion binary:
+/// `cargo run -p ee-web --features relay --bin relay -- 127.0.0.1:9001`.
+#[cfg(feature = "relay")]
+pub mod server {
+    use crate::{ClientId, Relay};
+    use std::collections::HashMap;
+    use std::io::{self, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
+
+    /// The RFC 6455 magic GUID appended to `Sec-WebSocket-Key` before hashing.
+    const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+    /// Shared relay state: the pure router plus a writable socket per client.
+    struct Hub {
+        relay: Relay,
+        writers: HashMap<ClientId, TcpStream>,
+    }
+
+    /// Bind `addr` (e.g. `"127.0.0.1:9001"`) and serve the relay forever, one
+    /// OS thread per connection. All routing stays in the pure [`Relay`]; this
+    /// only reads frames off sockets and forwards each [`Delivery`](crate::Delivery)
+    /// to the recipients' sockets.
+    pub fn serve(addr: &str) -> io::Result<()> {
+        let listener = TcpListener::bind(addr)?;
+        let hub = Arc::new(Mutex::new(Hub {
+            relay: Relay::new(),
+            writers: HashMap::new(),
+        }));
+        // Client ids start at 1 so 0 is never a live client (distinct sites).
+        for (id, stream) in (1 as ClientId..).zip(listener.incoming()) {
+            let stream = stream?;
+            let hub = Arc::clone(&hub);
+            std::thread::spawn(move || {
+                if let Err(e) = serve_client(id, stream, &hub) {
+                    eprintln!("relay: client {id} ended: {e}");
+                }
+                // Always clean up on exit so a dropped socket frees its room slot.
+                let mut h = hub.lock().expect("relay hub poisoned");
+                h.relay.leave(id);
+                h.writers.remove(&id);
+            });
+        }
+        Ok(())
+    }
+
+    /// Handshake, register the writer, then read-and-route frames until close.
+    fn serve_client(id: ClientId, mut stream: TcpStream, hub: &Arc<Mutex<Hub>>) -> io::Result<()> {
+        let key = read_handshake(&mut stream)?;
+        let resp = format!(
+            "HTTP/1.1 101 Switching Protocols\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Accept: {}\r\n\r\n",
+            accept_key(&key),
+        );
+        stream.write_all(resp.as_bytes())?;
+
+        hub.lock()
+            .expect("relay hub poisoned")
+            .writers
+            .insert(id, stream.try_clone()?);
+
+        while let Some(msg) = read_message(&mut stream)? {
+            // Route under the lock; it returns owned data so no borrow escapes.
+            let routed = hub
+                .lock()
+                .expect("relay hub poisoned")
+                .relay
+                .handle(id, &msg);
+            match routed {
+                // A bad frame: tell just the sender, keep the session alive.
+                Err(e) => send_text(&mut stream, &format!("ERR {e}"))?,
+                Ok(delivery) if !delivery.recipients.is_empty() => {
+                    let mut h = hub.lock().expect("relay hub poisoned");
+                    for rid in &delivery.recipients {
+                        if let Some(w) = h.writers.get_mut(rid) {
+                            // A dead peer socket must not kill this client.
+                            let _ = send_text(w, &delivery.payload);
+                        }
+                    }
+                }
+                Ok(_) => {} // join/leave: nothing to forward
+            }
+        }
+        Ok(())
+    }
+
+    /// Read the HTTP upgrade request and return its `Sec-WebSocket-Key` value.
+    fn read_handshake(stream: &mut TcpStream) -> io::Result<String> {
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            if stream.read(&mut byte)? == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "handshake closed",
+                ));
+            }
+            buf.push(byte[0]);
+            if buf.ends_with(b"\r\n\r\n") {
+                break;
+            }
+            if buf.len() > 16 * 1024 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "handshake too large",
+                ));
+            }
+        }
+        let text = String::from_utf8_lossy(&buf);
+        for line in text.lines() {
+            if let Some((name, value)) = line.split_once(':') {
+                if name.trim().eq_ignore_ascii_case("Sec-WebSocket-Key") {
+                    return Ok(value.trim().to_string());
+                }
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "no Sec-WebSocket-Key header",
+        ))
+    }
+
+    /// Compute the RFC 6455 `Sec-WebSocket-Accept` value: base64(SHA-1(key + GUID)).
+    fn accept_key(key: &str) -> String {
+        let mut data = key.as_bytes().to_vec();
+        data.extend_from_slice(WS_GUID.as_bytes());
+        base64_std(&sha1(&data))
+    }
+
+    /// Read one client message, resolving ping/pong and skipping non-text frames.
+    /// Returns `Ok(None)` on a clean close or EOF.
+    fn read_message(stream: &mut TcpStream) -> io::Result<Option<String>> {
+        loop {
+            let mut header = [0u8; 2];
+            if !read_exact_or_eof(stream, &mut header)? {
+                return Ok(None);
+            }
+            let opcode = header[0] & 0x0F;
+            let masked = header[1] & 0x80 != 0;
+            let mut len = (header[1] & 0x7F) as usize;
+            if len == 126 {
+                let mut ext = [0u8; 2];
+                stream.read_exact(&mut ext)?;
+                len = u16::from_be_bytes(ext) as usize;
+            } else if len == 127 {
+                let mut ext = [0u8; 8];
+                stream.read_exact(&mut ext)?;
+                len = u64::from_be_bytes(ext) as usize;
+            }
+            let mask = if masked {
+                let mut m = [0u8; 4];
+                stream.read_exact(&mut m)?;
+                Some(m)
+            } else {
+                None
+            };
+            let mut payload = vec![0u8; len];
+            stream.read_exact(&mut payload)?;
+            if let Some(m) = mask {
+                for (i, b) in payload.iter_mut().enumerate() {
+                    *b ^= m[i % 4];
+                }
+            }
+            match opcode {
+                0x1 => return Ok(Some(String::from_utf8_lossy(&payload).into_owned())), // text
+                0x8 => return Ok(None),                                                 // close
+                0x9 => send_frame(stream, 0xA, &payload)?, // ping → pong, keep reading
+                _ => {}                                    // binary/continuation/pong → skip
+            }
+        }
+    }
+
+    /// Fill `buf` fully, or return `Ok(false)` if the socket was at EOF first.
+    fn read_exact_or_eof(stream: &mut TcpStream, buf: &mut [u8]) -> io::Result<bool> {
+        let mut filled = 0;
+        while filled < buf.len() {
+            match stream.read(&mut buf[filled..])? {
+                0 if filled == 0 => return Ok(false),
+                0 => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "frame truncated",
+                    ))
+                }
+                n => filled += n,
+            }
+        }
+        Ok(true)
+    }
+
+    /// Send a server→client text frame (unmasked, as RFC 6455 requires).
+    fn send_text(stream: &mut TcpStream, text: &str) -> io::Result<()> {
+        send_frame(stream, 0x1, text.as_bytes())
+    }
+
+    /// Write one unmasked WebSocket frame with the given opcode and payload.
+    fn send_frame(stream: &mut TcpStream, opcode: u8, payload: &[u8]) -> io::Result<()> {
+        let mut frame = Vec::with_capacity(payload.len() + 10);
+        frame.push(0x80 | opcode); // FIN + opcode
+        let len = payload.len();
+        if len < 126 {
+            frame.push(len as u8);
+        } else if len <= u16::MAX as usize {
+            frame.push(126);
+            frame.extend_from_slice(&(len as u16).to_be_bytes());
+        } else {
+            frame.push(127);
+            frame.extend_from_slice(&(len as u64).to_be_bytes());
+        }
+        frame.extend_from_slice(payload);
+        stream.write_all(&frame)
+    }
+
+    /// Hand-rolled SHA-1 (FIPS 180-1) — just enough for the handshake accept key.
+    fn sha1(data: &[u8]) -> [u8; 20] {
+        let mut h: [u32; 5] = [
+            0x6745_2301,
+            0xEFCD_AB89,
+            0x98BA_DCFE,
+            0x1032_5476,
+            0xC3D2_E1F0,
+        ];
+        let bit_len = (data.len() as u64) * 8;
+        let mut msg = data.to_vec();
+        msg.push(0x80);
+        while msg.len() % 64 != 56 {
+            msg.push(0);
+        }
+        msg.extend_from_slice(&bit_len.to_be_bytes());
+
+        for block in msg.chunks_exact(64) {
+            let mut w = [0u32; 80];
+            for (i, word) in block.chunks_exact(4).enumerate() {
+                w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+            }
+            for i in 16..80 {
+                w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+            }
+            let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
+            for (i, &wi) in w.iter().enumerate() {
+                let (f, k) = match i {
+                    0..=19 => ((b & c) | ((!b) & d), 0x5A82_7999),
+                    20..=39 => (b ^ c ^ d, 0x6ED9_EBA1),
+                    40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1B_BCDC),
+                    _ => (b ^ c ^ d, 0xCA62_C1D6),
+                };
+                let tmp = a
+                    .rotate_left(5)
+                    .wrapping_add(f)
+                    .wrapping_add(e)
+                    .wrapping_add(k)
+                    .wrapping_add(wi);
+                e = d;
+                d = c;
+                c = b.rotate_left(30);
+                b = a;
+                a = tmp;
+            }
+            h[0] = h[0].wrapping_add(a);
+            h[1] = h[1].wrapping_add(b);
+            h[2] = h[2].wrapping_add(c);
+            h[3] = h[3].wrapping_add(d);
+            h[4] = h[4].wrapping_add(e);
+        }
+        let mut out = [0u8; 20];
+        for (i, word) in h.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+
+    /// Standard base64 (RFC 4648, `+`/`/` alphabet, `=` padding) — for the 20-byte
+    /// accept digest. The browser-facing share links use base64**url** instead.
+    fn base64_std(data: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+        for chunk in data.chunks(3) {
+            let b0 = chunk[0] as u32;
+            let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+            let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+            let n = (b0 << 16) | (b1 << 8) | b2;
+            out.push(ALPHABET[(n >> 18 & 63) as usize] as char);
+            out.push(ALPHABET[(n >> 12 & 63) as usize] as char);
+            out.push(if chunk.len() > 1 {
+                ALPHABET[(n >> 6 & 63) as usize] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                ALPHABET[(n & 63) as usize] as char
+            } else {
+                '='
+            });
+        }
+        out
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn hex(bytes: &[u8]) -> String {
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        }
+
+        #[test]
+        fn sha1_matches_known_vectors() {
+            assert_eq!(hex(&sha1(b"")), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+            assert_eq!(
+                hex(&sha1(b"abc")),
+                "a9993e364706816aba3e25717850c26c9cd0d89d"
+            );
+        }
+
+        #[test]
+        fn accept_key_matches_rfc6455_example() {
+            // RFC 6455 §1.3 canonical handshake example.
+            assert_eq!(
+                accept_key("dGhlIHNhbXBsZSBub25jZQ=="),
+                "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+            );
+        }
+
+        #[test]
+        fn base64_std_pads_correctly() {
+            assert_eq!(base64_std(b"M"), "TQ==");
+            assert_eq!(base64_std(b"Ma"), "TWE=");
+            assert_eq!(base64_std(b"Man"), "TWFu");
+        }
     }
 }
 
@@ -1873,5 +2401,139 @@ C1 out gnd 1u
             dupes.ops().len(),
             "dedup collapsed dupes"
         );
+    }
+
+    // --- hosted signaling relay routing (CP-WEB.6) -------------------------
+
+    /// A ready-to-send `OP <token>` frame for a single op, so the relay tests
+    /// read like the wire.
+    fn op_frame(op: &EditOp) -> String {
+        Frame::Op { token: op.encode() }.encode()
+    }
+
+    #[test]
+    fn relay_broadcasts_ops_to_other_room_members_not_the_sender() {
+        let mut relay = Relay::new();
+        for c in [1, 2, 3] {
+            // JOIN routes nothing; membership is now tracked.
+            assert!(relay.handle(c, "JOIN lab").unwrap().recipients.is_empty());
+            assert_eq!(relay.room_of(c), Some("lab"));
+        }
+
+        let mut src = Replica::new(1);
+        let op = src.add_part("R1", "in", "out", "1k").unwrap();
+        let d = relay.handle(1, &op_frame(&op)).unwrap();
+
+        assert_eq!(
+            d.recipients,
+            vec![2, 3],
+            "every OTHER member, not the sender"
+        );
+        assert!(!d.recipients.contains(&1));
+        // The forwarded payload is the bare op token each client feeds to receive().
+        assert_eq!(EditOp::decode(&d.payload).unwrap(), op);
+    }
+
+    #[test]
+    fn two_clients_in_a_room_converge_via_the_relay() {
+        let mut relay = Relay::new();
+        relay.handle(1, "JOIN project").unwrap();
+        relay.handle(2, "JOIN project").unwrap();
+
+        // Both clients already share the seeded document (same op set), each with
+        // its own CP-WEB.5 replica keyed by its client/site id.
+        let (mut a, seed_ops) = seed(1);
+        let mut b = Replica::new(2);
+        b.merge_many(&seed_ops);
+        assert_eq!(a.to_netlist(), b.to_netlist(), "equal after seeding");
+
+        // Client 1 edits; the relay forwards the op to client 2, who merges it.
+        let op_a = a.add_part("R2", "out", "gnd", "2k").unwrap();
+        let d = relay.handle(1, &op_frame(&op_a)).unwrap();
+        assert_eq!(d.recipients, vec![2]);
+        b.merge(EditOp::decode(&d.payload).unwrap());
+
+        // Client 2 edits; the relay forwards it back to client 1.
+        let op_b = b.set_value("R1", "4k7").unwrap();
+        let d = relay.handle(2, &op_frame(&op_b)).unwrap();
+        assert_eq!(d.recipients, vec![1]);
+        a.merge(EditOp::decode(&d.payload).unwrap());
+
+        // Two browsers on different machines converge to one netlist via the relay.
+        let na = a.to_netlist();
+        assert_eq!(na, b.to_netlist(), "converge via the relay:\n{na}");
+        assert!(na.contains("R2 out gnd 2k") && na.contains("R1 in out 4k7"));
+        run(&na, 5e-3, Some(5e-6)).expect("relayed-converged netlist simulates");
+    }
+
+    #[test]
+    fn relay_rejects_malformed_frames_cleanly() {
+        let mut relay = Relay::new();
+        relay.handle(1, "JOIN lab").unwrap();
+        let mut peer = Replica::new(2);
+        let good = op_frame(&peer.add_part("R1", "in", "out", "1k").unwrap());
+
+        let bad = [
+            "",                                     // empty frame
+            "BOGUS payload",                        // unknown frame tag
+            "JOIN",                                 // join without a room id
+            "JOIN a b",                             // whitespace in the room id
+            "OP",                                   // op frame without a token
+            "OP has spaces",                        // token is not base64url
+            &format!("OP {}", encode("not an op")), // valid base64url, wrong magic
+            &format!("OP {}", encode("EEOP1\n")),   // right magic, truncated op
+        ];
+        for f in bad {
+            let got = relay.handle(1, f);
+            assert!(
+                got.is_err(),
+                "malformed frame {f:?} must be a clean Err, got {got:?}"
+            );
+        }
+
+        // The relay survived every rejection intact and still routes a good op.
+        relay.handle(2, "JOIN lab").unwrap();
+        assert_eq!(relay.handle(1, &good).unwrap().recipients, vec![2]);
+    }
+
+    #[test]
+    fn clients_in_different_rooms_are_isolated() {
+        let mut relay = Relay::new();
+        relay.handle(1, "JOIN alpha").unwrap();
+        relay.handle(2, "JOIN beta").unwrap();
+        relay.handle(3, "JOIN alpha").unwrap();
+
+        let mut src = Replica::new(1);
+        let op = src.add_part("R1", "in", "out", "1k").unwrap();
+        let d = relay.handle(1, &op_frame(&op)).unwrap();
+
+        assert_eq!(d.recipients, vec![3], "only the same-room peer receives it");
+        assert!(!d.recipients.contains(&2), "room beta stays isolated");
+    }
+
+    #[test]
+    fn relay_tracks_join_switch_and_leave() {
+        let mut relay = Relay::new();
+        relay.handle(1, "JOIN alpha").unwrap();
+        relay.handle(2, "JOIN alpha").unwrap();
+        assert_eq!(relay.room_of(1), Some("alpha"));
+
+        // Switching rooms leaves the old one: client 1 no longer hears alpha.
+        relay.handle(1, "JOIN beta").unwrap();
+        assert_eq!(relay.room_of(1), Some("beta"));
+        let mut src = Replica::new(2);
+        let op = src.add_part("R1", "in", "out", "1k").unwrap();
+        assert!(
+            relay
+                .handle(2, &op_frame(&op))
+                .unwrap()
+                .recipients
+                .is_empty(),
+            "client 1 left alpha, so alpha has no other member to receive"
+        );
+
+        // An explicit LEAVE is tracked too; a left client is in no room.
+        relay.handle(1, "LEAVE").unwrap();
+        assert_eq!(relay.room_of(1), None);
     }
 }
