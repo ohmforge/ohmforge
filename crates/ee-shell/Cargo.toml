@@ -13,6 +13,9 @@ workspace = true
 ee-core = { workspace = true }
 ee-sim = { workspace = true }
 ee-tui = { workspace = true }
+# ee-instruments supplies the Bode widget for rendering `run ac`/`run tf` results
+# (CP-UX-M8.2). The arrow is acyclic: ee-instruments depends only on ee-core/ee-sim.
+ee-instruments = { workspace = true }
 # ee-fmt supplies the native project text for the circuit half of a saved
 # session (CP-UX-M4.1). The arrow is acyclic: ee-fmt depends only on ee-core.
 ee-fmt = { workspace = true }

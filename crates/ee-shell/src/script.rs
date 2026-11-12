@@ -118,7 +118,8 @@ impl Shell {
         let program = parse(src)?;
         let mut env: HashMap<String, String> = HashMap::new();
         let mut commands = Vec::new();
-        flatten(&program, &mut env, &mut commands)?;
+        let mut steps = 0usize;
+        flatten(&program, &mut env, &mut commands, &mut steps)?;
         let transcript = run_lines(self, &commands)?;
         Ok(ScriptRun {
             transcript,
@@ -149,6 +150,22 @@ fn run_lines(shell: &mut Shell, lines: &[String]) -> Result<String, ScriptError>
     Ok(out)
 }
 
+/// The hard cap on expansion work (loop iterations + emitted commands). Well
+/// above any plausible real script — a 100k-part build is fine — but it stops an
+/// absurd `repeat` from running away (`CP-UX-M8.2`).
+const MAX_EXPANSION: usize = 5_000_000;
+
+/// Charge one unit of expansion work, erroring once the budget is spent.
+fn bump(steps: &mut usize) -> Result<(), ScriptError> {
+    *steps += 1;
+    if *steps > MAX_EXPANSION {
+        return Err(ScriptError::TooLarge {
+            limit: MAX_EXPANSION,
+        });
+    }
+    Ok(())
+}
+
 // ── expansion ─────────────────────────────────────────────────────────────
 
 /// Flatten a parsed program into expanded command lines, maintaining `env`.
@@ -160,6 +177,7 @@ fn flatten(
     stmts: &[Stmt],
     env: &mut HashMap<String, String>,
     out: &mut Vec<String>,
+    steps: &mut usize,
 ) -> Result<(), ScriptError> {
     for stmt in stmts {
         match stmt {
@@ -168,6 +186,7 @@ fn flatten(
                 env.insert(name.clone(), expanded);
             }
             Stmt::Command { text, line } => {
+                bump(steps)?;
                 out.push(substitute(text, env, *line)?);
             }
             Stmt::Repeat {
@@ -184,10 +203,13 @@ fn flatten(
                 // Save any binding this loop variable shadows, to restore after.
                 let shadowed = var.as_ref().and_then(|v| env.get(v).cloned());
                 for i in 1..=n {
+                    // Count every iteration — not just emitted commands — so a loop
+                    // with a non-emitting body (only `set`) still terminates fast.
+                    bump(steps)?;
                     if let Some(v) = var {
                         env.insert(v.clone(), i.to_string());
                     }
-                    flatten(body, env, out)?;
+                    flatten(body, env, out, steps)?;
                 }
                 if let Some(v) = var {
                     match &shadowed {
@@ -404,6 +426,10 @@ pub enum ScriptError {
     UndefinedVar { line: usize, name: String },
     /// A command the script expanded to was rejected by the shell.
     Exec { line: String, source: ShellError },
+    /// The script's `repeat` loops would expand to more than `MAX_EXPANSION`
+    /// steps — rejected up front so an absurd count (`repeat 100000000 { … }`)
+    /// fails fast instead of exhausting memory/time (`CP-UX-M8.2`).
+    TooLarge { limit: usize },
 }
 
 impl fmt::Display for ScriptError {
@@ -424,6 +450,12 @@ impl fmt::Display for ScriptError {
             }
             ScriptError::Exec { line, source } => {
                 write!(f, "while running {line:?}: {source}")
+            }
+            ScriptError::TooLarge { limit } => {
+                write!(
+                    f,
+                    "script expands to more than {limit} steps — reduce the repeat counts"
+                )
             }
         }
     }

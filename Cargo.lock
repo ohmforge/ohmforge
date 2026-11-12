@@ -322,6 +322,7 @@ version = "0.0.0"
 dependencies = [
  "ee-core",
  "ee-fmt",
+ "ee-instruments",
  "ee-sim",
  "ee-tui",
 ]

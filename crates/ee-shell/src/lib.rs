@@ -37,18 +37,32 @@ pub mod session;
 pub use script::{Recording, ScriptError, ScriptRun};
 pub use session::SessionError;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 
-use ee_core::graph::{Circuit, DiodeModel, NetId, PartKind, Waveform};
+use ee_core::graph::{
+    BjtModel, Circuit, DiodeModel, MosfetModel, NetId, PartKind, Polarity, Waveform,
+};
+use ee_core::signal::Complex;
 use ee_core::units::Unit;
 use ee_core::value::{ParseError, Value};
+use ee_instruments::Bode;
 use ee_sim::{Analysis, Engine, SimError};
 use ee_tui::Plot;
 
 /// The default transient duration when `run`/`run tran` is given no `<dur>`.
 const DEFAULT_DURATION: f64 = 1e-3;
+
+/// Default AC/noise sweep density (points per decade) when none is given.
+const DEFAULT_PPD: u32 = 20;
+
+/// Default Monte-Carlo seed when none is given (deterministic across runs).
+const DEFAULT_MC_SEED: u64 = 0xEE_A5_51_57;
+
+/// A transient longer than this (seconds) draws an "absurd duration?" warning —
+/// `run tran 1k` is 1000 s, almost always a slipped unit (`CP-UX-M8.2`).
+const ABSURD_DURATION: f64 = 100.0;
 
 /// The interactive-shell state machine.
 ///
@@ -64,11 +78,18 @@ pub struct Shell {
     nets: HashMap<String, NetId>,
     /// Nodes to render on the next transient `run`, in the order probed.
     probes: Vec<String>,
-    /// Session-state snapshots taken before each mutating command, newest last;
-    /// `undo` pops the top to revert the last command (`CP-UX-M2.4`).
-    undo_stack: Vec<Snapshot>,
+    /// Reverse operations recorded for each mutating command, newest last; `undo`
+    /// pops the top to revert the last command (`CP-UX-M2.4`). Most commands record
+    /// a cheap reverse op (an `add` just notes its reference) rather than a full
+    /// circuit clone, so a long batch of edits stays O(N) overall rather than
+    /// O(N²); the depth is bounded by [`UNDO_CAP`] (`CP-UX-M8.2`).
+    undo_stack: Vec<UndoOp>,
     /// Named checkpoints the user can `restore` to at any time.
     checkpoints: HashMap<String, Snapshot>,
+    /// The set of placed part references, mirroring the circuit's parts, so `add`
+    /// can reject a duplicate reference in O(1) instead of scanning every part —
+    /// which kept a long build (100k parts) from being O(N²) (`CP-UX-M8.2`).
+    placed_refs: HashSet<String>,
     /// The signals from the most recent transient `run`, cached so the live TUI can
     /// scrub them as a playback (`CP-UX-M7.1`). Not part of a [`Snapshot`] — it is a
     /// derived result, like the op-point, so `undo`/`restore` leave it untouched.
@@ -87,6 +108,36 @@ struct Snapshot {
     probes: Vec<String>,
 }
 
+/// The reverse of one mutating command, recorded so `undo` can revert exactly
+/// that command without ever deep-cloning the whole circuit on the common edits.
+///
+/// `add`/`set`/`probe` record a cheap, O(1)-capture reverse; `wire` and `remove`
+/// (whose inverses need the prior topology) keep a full [`Snapshot`]. Because the
+/// undo stack is strictly LIFO, the names an `add` introduced can only be used by
+/// later commands, all of which are reverted first — so dropping them on undo is
+/// safe (`CP-UX-M8.2`).
+#[derive(Debug, Clone)]
+enum UndoOp {
+    /// Restore the whole session (used where a compact inverse is impractical).
+    /// Boxed so this large variant does not bloat every cheap reverse op.
+    Full(Box<Snapshot>),
+    /// Reverse of `add <reference> …`: drop the part and the node names this
+    /// command newly introduced.
+    Add {
+        reference: String,
+        added_names: Vec<String>,
+    },
+    /// Reverse of `set <reference>.value …`: restore the prior value.
+    SetValue { reference: String, old_value: Value },
+    /// Reverse of `probe <node>`: drop the node this command appended to the probe
+    /// list (recorded only when the probe actually changed the list).
+    Probe { node: String },
+}
+
+/// Maximum number of undo steps retained. Older steps are dropped in batches so a
+/// very long edit session (or script) keeps undo memory bounded (`CP-UX-M8.2`).
+const UNDO_CAP: usize = 256;
+
 impl Default for Shell {
     fn default() -> Self {
         Self::new()
@@ -102,8 +153,20 @@ impl Shell {
             probes: Vec::new(),
             undo_stack: Vec::new(),
             checkpoints: HashMap::new(),
+            placed_refs: HashSet::new(),
             last_transient: Vec::new(),
         }
+    }
+
+    /// Rebuild the placed-reference set from the circuit after a wholesale replace
+    /// (undo of a snapshot, checkpoint restore, or session import).
+    fn refresh_refs(&mut self) {
+        self.placed_refs = self
+            .circuit
+            .parts()
+            .iter()
+            .map(|p| p.reference.clone())
+            .collect();
     }
 
     /// Borrow the circuit the shell is building (for the TUI/AI to render).
@@ -156,10 +219,11 @@ impl Shell {
         let command = words.next().expect("non-empty line has a first word");
         let args: Vec<&str> = words.collect();
         match command {
-            // Mutating commands snapshot the session first (on success only) so
-            // `undo` can revert exactly the last command.
+            // Mutating commands record their own reverse op (on success only) so
+            // `undo` can revert exactly the last command. A successful mutation also
+            // invalidates the cached transient — the stored waveform no longer
+            // reflects the changed circuit — so the live playback is cleared.
             "add" | "wire" | "probe" | "remove" | "set" => {
-                let before = self.capture();
                 let result = match command {
                     "add" => self.cmd_add(&args),
                     "wire" => self.cmd_wire(&args),
@@ -168,7 +232,7 @@ impl Shell {
                     _ => self.cmd_probe(&args),
                 };
                 if result.is_ok() {
-                    self.undo_stack.push(before);
+                    self.last_transient.clear();
                 }
                 result
             }
@@ -200,21 +264,38 @@ impl Shell {
         self.circuit = snap.circuit;
         self.nets = snap.nets;
         self.probes = snap.probes;
+        self.refresh_refs();
+    }
+
+    /// Push a reverse op onto the undo stack, dropping the oldest steps in batches
+    /// once the stack grows past twice [`UNDO_CAP`] so undo memory stays bounded.
+    fn push_undo(&mut self, op: UndoOp) {
+        self.undo_stack.push(op);
+        if self.undo_stack.len() > UNDO_CAP * 2 {
+            let drop = self.undo_stack.len() - UNDO_CAP;
+            self.undo_stack.drain(0..drop);
+        }
+    }
+
+    /// Push a full-snapshot reverse op (the boxed-variant path).
+    fn push_full(&mut self, snap: Snapshot) {
+        self.push_undo(UndoOp::Full(Box::new(snap)));
     }
 
     /// Push a manual snapshot of the session onto the undo stack. Mutating
     /// commands do this automatically; call it to mark an extra undo point.
     pub fn snapshot(&mut self) {
         let snap = self.capture();
-        self.undo_stack.push(snap);
+        self.push_full(snap);
     }
 
-    /// Revert the most recent snapshot (the last mutating command). Returns a
-    /// [`ShellError::NothingToUndo`] when the undo stack is empty.
+    /// Revert the most recent recorded command (the last mutating command). Returns
+    /// a [`ShellError::NothingToUndo`] when the undo stack is empty.
     pub fn undo(&mut self) -> Result<String, ShellError> {
         match self.undo_stack.pop() {
-            Some(snap) => {
-                self.restore_from(snap);
+            Some(op) => {
+                self.apply_undo(op);
+                self.last_transient.clear();
                 let n = self.circuit.parts().len();
                 Ok(format!(
                     "undone — {n} part{} remain",
@@ -222,6 +303,33 @@ impl Shell {
                 ))
             }
             None => Err(ShellError::NothingToUndo),
+        }
+    }
+
+    /// Apply one reverse op, restoring the session to just before the command that
+    /// recorded it.
+    fn apply_undo(&mut self, op: UndoOp) {
+        match op {
+            UndoOp::Full(snap) => self.restore_from(*snap),
+            UndoOp::Add {
+                reference,
+                added_names,
+            } => {
+                for name in &added_names {
+                    self.nets.remove(name);
+                }
+                self.placed_refs.remove(&reference);
+                self.circuit = self.rebuild_circuit_without(&reference);
+            }
+            UndoOp::SetValue {
+                reference,
+                old_value,
+            } => {
+                self.circuit.set_value(&reference, old_value);
+            }
+            UndoOp::Probe { node } => {
+                self.probes.retain(|n| n != &node);
+            }
         }
     }
 
@@ -315,6 +423,7 @@ impl Shell {
         self.circuit = parsed.main.circuit;
         self.nets = parsed.main.nets;
         self.probes = parsed.main.probes;
+        self.refresh_refs();
         self.undo_stack.clear();
         self.checkpoints = parsed
             .checkpoints
@@ -370,27 +479,221 @@ impl Shell {
 
     // ── commands ──────────────────────────────────────────────────────────
 
-    /// `add <ref> <nodeA> <nodeB> <value>` — place a part.
+    /// `add <ref> <nodes…> [value] [extras…]` — place a part.
+    ///
+    /// The reference's leading letter selects the device and, with it, the shape of
+    /// the rest of the line (`CP-UX-M8.2`):
+    ///
+    /// ```text
+    /// R/C/L/V/I  add R1 a b 1k              two-terminal, value required
+    /// D          add D1 a b [Is]            diode, value optional (model Is)
+    /// Q          add Q1 c b e [npn|pnp]     BJT, terminals [c,b,e]
+    /// M          add M1 d g s [nmos|pmos]   MOSFET, terminals [d,g,s]
+    /// E/G        add E1 o+ o- c+ c- <gain>  VCVS (V/V) / VCCS (A/V)
+    /// H/F        add H1 o+ o- <gain> <Vctrl> CCVS (V/A) / CCCS (A/A)
+    /// ```
     fn cmd_add(&mut self, args: &[&str]) -> Result<String, ShellError> {
-        let [reference, a, b, value] = args else {
+        let reference = *args.first().ok_or(ShellError::Usage {
+            command: "add",
+            usage: "add <ref> <nodeA> <nodeB> <value>",
+        })?;
+        let letter = reference
+            .chars()
+            .next()
+            .ok_or(ShellError::EmptyReference)?
+            .to_ascii_uppercase();
+        if self.placed_refs.contains(reference) {
+            return Err(ShellError::DuplicateRef(reference.to_string()));
+        }
+        let rest = &args[1..];
+        match letter {
+            'R' | 'C' | 'L' | 'V' | 'I' => self.add_two_terminal(reference, rest),
+            'D' => self.add_diode(reference, rest),
+            'Q' => self.add_bjt(reference, rest),
+            'M' => self.add_mosfet(reference, rest),
+            'E' | 'G' => self.add_vc_source(reference, letter, rest),
+            'H' | 'F' => self.add_cc_source(reference, letter, rest),
+            other => Err(ShellError::UnknownPartKind(other)),
+        }
+    }
+
+    /// Resolve `node_names` to nets, place `kind`/`value`, and record the undo.
+    /// The single placement path for every device shape, so the bookkeeping
+    /// (new-name tracking, duplicate ref set, undo op) is identical everywhere.
+    fn place(
+        &mut self,
+        reference: &str,
+        kind: PartKind,
+        value: Option<Value>,
+        node_names: &[&str],
+    ) -> Result<String, ShellError> {
+        let added_names = self.new_node_names(node_names);
+        let terminals: Vec<NetId> = node_names.iter().map(|n| self.net_for(n)).collect();
+        self.circuit
+            .add_part(reference.to_string(), kind, value, terminals);
+        self.placed_refs.insert(reference.to_string());
+        self.push_undo(UndoOp::Add {
+            reference: reference.to_string(),
+            added_names,
+        });
+        Ok(format!("added {reference}"))
+    }
+
+    /// Parse a value field into the given unit, quoting the token on failure.
+    fn parse_value(&self, value: &str, unit: Unit) -> Result<Value, ShellError> {
+        Value::parse(value, unit).map_err(|source| ShellError::BadValue {
+            field: format!("value {value:?}"),
+            source,
+        })
+    }
+
+    /// `add R/C/L/V/I <a> <b> <value>` — a two-terminal part with a required value.
+    fn add_two_terminal(&mut self, reference: &str, rest: &[&str]) -> Result<String, ShellError> {
+        let (kind, unit) = classify(reference)?;
+        let [a, b, value] = rest else {
             return Err(ShellError::Usage {
                 command: "add",
                 usage: "add <ref> <nodeA> <nodeB> <value>",
             });
         };
-        let (kind, unit) = classify(reference)?;
-        if self.circuit.part_by_ref(reference).is_some() {
-            return Err(ShellError::DuplicateRef((*reference).to_string()));
+        // A source shorted to itself (both terminals on one net) is degenerate.
+        if matches!(kind, PartKind::VoltageSource | PartKind::CurrentSource) && self.same_net(a, b)
+        {
+            return Err(ShellError::DegenerateSource(reference.to_string()));
         }
-        let value = Value::parse(value, unit).map_err(|source| ShellError::BadValue {
-            field: format!("value {value:?}"),
-            source,
-        })?;
-        let na = self.net_for(a);
-        let nb = self.net_for(b);
-        self.circuit
-            .add_part(*reference, kind, Some(value), vec![na, nb]);
-        Ok(format!("added {reference}"))
+        let value = self.parse_value(value, unit)?;
+        self.place(reference, kind, Some(value), &[a, b])
+    }
+
+    /// `add D <a> <b> [Is]` — a diode. The value is optional: the core allows a
+    /// value-less diode (the model carries `Is`), so a bare `add D1 a b` is valid
+    /// and a given value routes to the saturation current (`CP-UX-M8.2`).
+    fn add_diode(&mut self, reference: &str, rest: &[&str]) -> Result<String, ShellError> {
+        let (a, b, value) = match rest {
+            [a, b] => (*a, *b, None),
+            [a, b, v] => (*a, *b, Some(self.parse_value(v, Unit::Ampere)?)),
+            _ => {
+                return Err(ShellError::Usage {
+                    command: "add",
+                    usage: "add <Dref> <anode> <cathode> [Is]",
+                })
+            }
+        };
+        let mut model = DiodeModel::default();
+        if let Some(v) = value {
+            model.is = v.magnitude;
+        }
+        self.place(reference, PartKind::Diode(model), value, &[a, b])
+    }
+
+    /// `add Q <c> <b> <e> [npn|pnp]` — a BJT (terminals [collector, base, emitter]).
+    fn add_bjt(&mut self, reference: &str, rest: &[&str]) -> Result<String, ShellError> {
+        let (c, b, e, pol) = match rest {
+            [c, b, e] => (*c, *b, *e, Polarity::N),
+            [c, b, e, p] => (*c, *b, *e, parse_polarity(p, true)?),
+            _ => {
+                return Err(ShellError::Usage {
+                    command: "add",
+                    usage: "add <Qref> <collector> <base> <emitter> [npn|pnp]",
+                })
+            }
+        };
+        self.place(
+            reference,
+            PartKind::Bjt(pol, BjtModel::default()),
+            None,
+            &[c, b, e],
+        )
+    }
+
+    /// `add M <d> <g> <s> [nmos|pmos]` — a MOSFET (terminals [drain, gate, source]).
+    fn add_mosfet(&mut self, reference: &str, rest: &[&str]) -> Result<String, ShellError> {
+        let (d, g, s, pol) = match rest {
+            [d, g, s] => (*d, *g, *s, Polarity::N),
+            [d, g, s, p] => (*d, *g, *s, parse_polarity(p, false)?),
+            _ => {
+                return Err(ShellError::Usage {
+                    command: "add",
+                    usage: "add <Mref> <drain> <gate> <source> [nmos|pmos]",
+                })
+            }
+        };
+        self.place(
+            reference,
+            PartKind::Mosfet(pol, MosfetModel::default()),
+            None,
+            &[d, g, s],
+        )
+    }
+
+    /// `add E/G <o+> <o-> <c+> <c-> <gain>` — a voltage-controlled source: VCVS
+    /// (`E`, gain in V/V) or VCCS (`G`, transconductance in A/V).
+    fn add_vc_source(
+        &mut self,
+        reference: &str,
+        letter: char,
+        rest: &[&str],
+    ) -> Result<String, ShellError> {
+        let [op, om, cp, cm, gain] = rest else {
+            return Err(ShellError::Usage {
+                command: "add",
+                usage: "add <ref> <out+> <out-> <ctrl+> <ctrl-> <gain>",
+            });
+        };
+        let g = self.parse_value(gain, Unit::None)?.magnitude;
+        let kind = if letter == 'E' {
+            PartKind::Vcvs(g)
+        } else {
+            PartKind::Vccs(g)
+        };
+        self.place(reference, kind, None, &[op, om, cp, cm])
+    }
+
+    /// `add H/F <o+> <o-> <gain> <Vctrl>` — a current-controlled source: CCVS (`H`,
+    /// transresistance in V/A) or CCCS (`F`, current gain in A/A). The controlling
+    /// current is sensed through the named voltage source's branch.
+    fn add_cc_source(
+        &mut self,
+        reference: &str,
+        letter: char,
+        rest: &[&str],
+    ) -> Result<String, ShellError> {
+        let [op, om, gain, ctrl] = rest else {
+            return Err(ShellError::Usage {
+                command: "add",
+                usage: "add <ref> <out+> <out-> <gain> <Vctrl>",
+            });
+        };
+        let g = self.parse_value(gain, Unit::None)?.magnitude;
+        let kind = if letter == 'H' {
+            PartKind::Ccvs(g, (*ctrl).to_string())
+        } else {
+            PartKind::Cccs(g, (*ctrl).to_string())
+        };
+        self.place(reference, kind, None, &[op, om])
+    }
+
+    /// Whether two node names resolve to the same net (ground-aware).
+    fn same_net(&self, a: &str, b: &str) -> bool {
+        match (self.net_known(a), self.net_known(b)) {
+            (Ok(na), Ok(nb)) => self.circuit.resolve(na) == self.circuit.resolve(nb),
+            // One or both are new names — new names are distinct unless textually
+            // equal (e.g. `add V1 x x`).
+            _ => a == b,
+        }
+    }
+
+    /// The subset of `names` that are not ground and not yet in the net map, each
+    /// listed once in first-seen order — the node names a placement will newly
+    /// introduce (used to record a precise, clone-free `add` undo).
+    fn new_node_names(&self, names: &[&str]) -> Vec<String> {
+        let mut added: Vec<String> = Vec::new();
+        for &n in names {
+            if !is_ground(n) && !self.nets.contains_key(n) && !added.iter().any(|a| a == n) {
+                added.push(n.to_string());
+            }
+        }
+        added
     }
 
     /// `wire <nodeA> <nodeB>` — merge two already-named nodes into one net.
@@ -403,7 +706,11 @@ impl Shell {
         };
         let na = self.net_known(a)?;
         let nb = self.net_known(b)?;
+        // A union-find merge has no cheap inverse, so keep a full snapshot (wires
+        // are rare next to `add`/`set`, so this does not reintroduce the O(N²)).
+        let before = self.capture();
         self.circuit.wire(na, nb);
+        self.push_full(before);
         Ok(format!("wired {a} — {b}"))
     }
 
@@ -418,30 +725,62 @@ impl Shell {
         self.net_known(node)?; // reject a typo'd node up front
         let node = (*node).to_string();
         let msg = format!("probing {node}");
+        // Only record an undo step when the probe actually changes the list: a
+        // duplicate `probe` is a no-op and must not leave a dead undo entry behind
+        // (`CP-UX-M8.2`).
         if !self.probes.contains(&node) {
-            self.probes.push(node);
+            self.probes.push(node.clone());
+            self.push_undo(UndoOp::Probe { node });
         }
         Ok(msg)
     }
 
-    /// `set <ref>.value <value>` — retarget a placed component's primary value.
+    /// `set …` — retarget a value, attach a source waveform, or set a part/circuit
+    /// parameter. One verb, several shapes (`CP-UX-M8.2`):
     ///
-    /// This is the shared mutation path the live TUI's component tuning lowers to
-    /// (`CP-UX-M6.1`): a `+`/`-` nudge in the editor and a typed `set` both end up
-    /// here, so re-solving against the changed value is identical either way. A
-    /// bare `<ref>` target means its `.value`; any other dotted param is rejected
-    /// (only the primary value is settable today). The value's unit follows the
-    /// part's existing value, falling back to the kind implied by the reference.
+    /// ```text
+    /// set <ref>.value <v> | set <ref> <v>     retarget the primary value (live-tune)
+    /// set <ref> sine <amp> <freq> [off] [ph]  attach a sine drive (AC/Bode stimulus)
+    /// set <ref> pulse <v1> <v2> <d> <w> <per> attach a pulse drive
+    /// set <ref> dc <v>                         revert to a constant (DC) level
+    /// set tol <ref> <frac>                     fractional tolerance (Monte-Carlo)
+    /// set tempco <ref> <tc>                    temperature coefficient (1/°C)
+    /// set temp <celsius>                       circuit operating temperature
+    /// ```
     fn cmd_set(&mut self, args: &[&str]) -> Result<String, ShellError> {
+        // Global (non-per-part) verbs first — their keywords ("temp"/"tol"/"tempco")
+        // are not valid part references, so they never shadow a `set <ref> …`.
+        match args {
+            ["temp", c] => return self.set_temperature(c),
+            ["tol", r, frac] | ["tolerance", r, frac] => return self.set_tolerance(r, frac),
+            ["tempco", r, tc] => return self.set_tempco(r, tc),
+            _ => {}
+        }
+        // Per-part waveform verbs, keyed on the second token.
+        match args {
+            [r, "sine", a, fr] => return self.set_sine(r, a, fr, "0", "0"),
+            [r, "sine", a, fr, off] => return self.set_sine(r, a, fr, off, "0"),
+            [r, "sine", a, fr, off, ph] => return self.set_sine(r, a, fr, off, ph),
+            [r, "pulse", v1, v2, d, w, per] => return self.set_pulse(r, v1, v2, d, w, per),
+            [r, "dc", v] => return self.set_dc(r, v),
+            _ => {}
+        }
         let [target, value] = args else {
             return Err(ShellError::Usage {
                 command: "set",
-                usage: "set <ref>.value <value>",
+                usage:
+                    "set <ref>.value <value> (or: set <ref> sine|pulse|dc …, set temp|tol|tempco …)",
             });
         };
+        self.set_value(target, value)
+    }
+
+    /// The `set <ref>.value <value>` / `set <ref> <value>` value-retarget path — the
+    /// shared mutation the live TUI's `+`/`-` tuning lowers to (`CP-UX-M6.1`).
+    fn set_value(&mut self, target: &str, value: &str) -> Result<String, ShellError> {
         let (reference, param) = match target.split_once('.') {
             Some((r, p)) => (r, p),
-            None => (*target, "value"),
+            None => (target, "value"),
         };
         if !param.eq_ignore_ascii_case("value") {
             return Err(ShellError::Usage {
@@ -449,20 +788,166 @@ impl Shell {
                 usage: "set <ref>.value <value>",
             });
         }
-        let unit = match self.circuit.part_by_ref(reference) {
-            Some(p) => p
-                .value
-                .map(|v| v.unit)
-                .or_else(|| classify(reference).ok().map(|(_, u)| u))
-                .unwrap_or(Unit::None),
+        let old_value = match self.circuit.part_by_ref(reference) {
+            Some(p) => p.value,
             None => return Err(ShellError::UnknownPart(reference.to_string())),
         };
+        let unit = old_value
+            .map(|v| v.unit)
+            .or_else(|| classify(reference).ok().map(|(_, u)| u))
+            .unwrap_or(Unit::None);
         let parsed = Value::parse(value, unit).map_err(|source| ShellError::BadValue {
             field: format!("value {value:?}"),
             source,
         })?;
+        // Reverse of a value change is just the prior value — unless there was none
+        // (a value-less diode), which `set_value` cannot clear again, so snapshot.
+        let undo = match old_value {
+            Some(old) => UndoOp::SetValue {
+                reference: reference.to_string(),
+                old_value: old,
+            },
+            None => UndoOp::Full(Box::new(self.capture())),
+        };
         self.circuit.set_value(reference, parsed);
+        self.push_undo(undo);
         Ok(format!("set {reference}.value = {value}"))
+    }
+
+    /// Require that `reference` names a placed part, for the `set` sub-verbs.
+    fn require_part(&self, reference: &str) -> Result<(), ShellError> {
+        if self.placed_refs.contains(reference) {
+            Ok(())
+        } else {
+            Err(ShellError::UnknownPart(reference.to_string()))
+        }
+    }
+
+    /// Attach a [`Waveform`] to an existing source, snapshotting for undo. Only
+    /// independent sources act on it; other parts carry it inertly.
+    fn set_part_waveform(
+        &mut self,
+        reference: &str,
+        waveform: Waveform,
+        msg: String,
+    ) -> Result<String, ShellError> {
+        self.require_part(reference)?;
+        let before = self.capture();
+        self.circuit.set_waveform(reference, waveform);
+        self.push_full(before);
+        Ok(msg)
+    }
+
+    /// `set <ref> sine <amp> <freq> [off] [phase]` — a sinusoidal drive (also the
+    /// AC/Bode small-signal stimulus).
+    fn set_sine(
+        &mut self,
+        reference: &str,
+        amp: &str,
+        freq: &str,
+        off: &str,
+        phase: &str,
+    ) -> Result<String, ShellError> {
+        let amplitude = self.parse_value(amp, Unit::None)?.magnitude;
+        let freq = self.parse_value(freq, Unit::Hertz)?.magnitude;
+        let offset = self.parse_value(off, Unit::None)?.magnitude;
+        let phase_deg = self.parse_value(phase, Unit::None)?.magnitude;
+        self.set_part_waveform(
+            reference,
+            Waveform::Sine {
+                amplitude,
+                freq,
+                offset,
+                phase_deg,
+            },
+            format!("set {reference} sine {amplitude}@{freq}Hz"),
+        )
+    }
+
+    /// `set <ref> pulse <v1> <v2> <delay> <width> <period>` — a pulse drive.
+    fn set_pulse(
+        &mut self,
+        reference: &str,
+        v1: &str,
+        v2: &str,
+        delay: &str,
+        width: &str,
+        period: &str,
+    ) -> Result<String, ShellError> {
+        let v1 = self.parse_value(v1, Unit::None)?.magnitude;
+        let v2 = self.parse_value(v2, Unit::None)?.magnitude;
+        let delay = self.parse_value(delay, Unit::Second)?.magnitude;
+        let width = self.parse_value(width, Unit::Second)?.magnitude;
+        let period = self.parse_value(period, Unit::Second)?.magnitude;
+        self.set_part_waveform(
+            reference,
+            Waveform::Pulse {
+                v1,
+                v2,
+                delay,
+                width,
+                period,
+            },
+            format!("set {reference} pulse {v1}→{v2}"),
+        )
+    }
+
+    /// `set <ref> dc <value>` — revert a source to a constant level (clears any
+    /// waveform and retargets the primary value).
+    fn set_dc(&mut self, reference: &str, value: &str) -> Result<String, ShellError> {
+        self.require_part(reference)?;
+        let before = self.capture();
+        self.circuit.set_waveform(reference, Waveform::Dc);
+        self.push_full(before);
+        // Reuse the value path's parsing/formatting (it records its own undo op too,
+        // which is fine — two LIFO undo steps revert the one `set … dc` cleanly).
+        self.set_value(reference, value)
+    }
+
+    /// `set tol <ref> <frac>` — fractional component tolerance (±frac) for
+    /// Monte-Carlo. Rejected (as a clean error) for an unknown part or a negative /
+    /// non-finite fraction.
+    fn set_tolerance(&mut self, reference: &str, frac: &str) -> Result<String, ShellError> {
+        self.require_part(reference)?;
+        let tol = self.parse_value(frac, Unit::None)?.magnitude;
+        let before = self.capture();
+        if !self.circuit.set_tolerance(reference, tol) {
+            return Err(ShellError::BadValue {
+                field: format!("tolerance {frac:?}"),
+                source: ParseError::NotANumber,
+            });
+        }
+        self.push_full(before);
+        Ok(format!("set {reference} tolerance ±{tol}"))
+    }
+
+    /// `set tempco <ref> <tc>` — a part's temperature coefficient (1/°C).
+    fn set_tempco(&mut self, reference: &str, tc: &str) -> Result<String, ShellError> {
+        self.require_part(reference)?;
+        let tc = self.parse_value(tc, Unit::None)?.magnitude;
+        let before = self.capture();
+        if !self.circuit.set_tempco(reference, tc) {
+            return Err(ShellError::BadValue {
+                field: format!("tempco {tc:?}"),
+                source: ParseError::NotANumber,
+            });
+        }
+        self.push_full(before);
+        Ok(format!("set {reference} tempco {tc}/°C"))
+    }
+
+    /// `set temp <celsius>` — the circuit's operating temperature.
+    fn set_temperature(&mut self, celsius: &str) -> Result<String, ShellError> {
+        let t = self.parse_value(celsius, Unit::None)?.magnitude;
+        let before = self.capture();
+        if !self.circuit.set_temperature(t) {
+            return Err(ShellError::BadValue {
+                field: format!("temperature {celsius:?}"),
+                source: ParseError::NotANumber,
+            });
+        }
+        self.push_full(before);
+        Ok(format!("set temperature {t}°C"))
     }
 
     /// `remove <ref>` — delete a placed part by reference designator.
@@ -490,7 +975,13 @@ impl Shell {
         if self.circuit.part_by_ref(reference).is_none() {
             return Err(ShellError::UnknownPart(reference.to_string()));
         }
+        // Restoring a removed part (with its metadata and net topology) has no
+        // compact inverse, so snapshot. `remove` already rebuilds the circuit
+        // (O(N)), so the extra clone does not change its complexity.
+        let before = self.capture();
+        self.push_full(before);
         self.circuit = self.rebuild_circuit_without(reference);
+        self.placed_refs.remove(reference);
         let n = self.circuit.parts().len();
         Ok(format!(
             "removed {reference} — {n} part{} remain",
@@ -550,23 +1041,64 @@ impl Shell {
         c
     }
 
-    /// `run [tran [<dur>]]` / `run op` — simulate and render.
+    /// `run <analysis> …` — simulate and render. Reaches every engine analysis:
+    /// `tran`, `op`, `ac`, `dc`, `noise`, `mc`, and `tf` (`CP-UX-M8.2`).
     fn cmd_run(&mut self, args: &[&str]) -> Result<String, ShellError> {
         match args {
             [] | ["tran"] => self.run_transient(DEFAULT_DURATION),
             ["tran", dur] => {
-                let d = Value::parse(dur, Unit::Second).map_err(|source| ShellError::BadValue {
-                    field: format!("duration {dur:?}"),
-                    source,
-                })?;
-                self.run_transient(d.magnitude)
+                let d = self.parse_duration(dur)?;
+                self.run_transient(d)
             }
             ["op"] => self.run_op(),
+            ["ac", f0, f1] => self.run_ac(f0, f1, DEFAULT_PPD),
+            ["ac", f0, f1, ppd] => {
+                let ppd = self.parse_count(ppd, "points-per-decade")?;
+                self.run_ac(f0, f1, ppd)
+            }
+            ["dc", source, start, stop, step] => self.run_dc(source, start, stop, step),
+            ["noise", out, f0, f1] => self.run_noise(out, f0, f1, DEFAULT_PPD),
+            ["noise", out, f0, f1, ppd] => {
+                let ppd = self.parse_count(ppd, "points-per-decade")?;
+                self.run_noise(out, f0, f1, ppd)
+            }
+            ["mc", out, runs] => self.run_mc(out, runs, DEFAULT_MC_SEED),
+            ["mc", out, runs, seed] => {
+                let seed = seed.parse::<u64>().map_err(|_| ShellError::BadValue {
+                    field: format!("seed {seed:?}"),
+                    source: ParseError::NotANumber,
+                })?;
+                self.run_mc(out, runs, seed)
+            }
+            ["tf", out, source] => self.run_tf(out, source),
             _ => Err(ShellError::Usage {
                 command: "run",
-                usage: "run [tran [<dur>]] | run op",
+                usage: "run tran [<dur>] | op | ac <f0> <f1> [ppd] | dc <src> <start> <stop> <step> | noise <node> <f0> <f1> [ppd] | mc <node> <runs> [seed] | tf <node> <src>",
             }),
         }
+    }
+
+    /// Parse and validate a transient duration: reject ≤0 (a token-named error) and
+    /// leave an "absurd duration" note to be surfaced by the caller via a warning.
+    fn parse_duration(&self, dur: &str) -> Result<f64, ShellError> {
+        let d = self.parse_value(dur, Unit::Second)?.magnitude;
+        if !d.is_finite() || d <= 0.0 {
+            return Err(ShellError::BadDuration(dur.to_string()));
+        }
+        Ok(d)
+    }
+
+    /// Parse a non-negative integer count field (points-per-decade, runs).
+    fn parse_count(&self, token: &str, field: &str) -> Result<u32, ShellError> {
+        token.parse::<u32>().map_err(|_| ShellError::BadValue {
+            field: format!("{field} {token:?}"),
+            source: ParseError::NotANumber,
+        })
+    }
+
+    /// The NetId of a named output node for an analysis that takes one.
+    fn output_net(&self, name: &str) -> Result<NetId, ShellError> {
+        self.net_known(name)
     }
 
     // ── run: parse → sim → plot ───────────────────────────────────────────
@@ -614,6 +1146,184 @@ impl Shell {
             .filter_map(|name| signals.iter().find(|s| s.name == name).cloned())
             .collect();
         self.last_transient = cached;
+        // An absurdly long window is almost always a slipped unit — warn, don't fail.
+        if duration > ABSURD_DURATION {
+            out = format!(
+                "warning: transient window is {duration} s — did you mean a smaller unit?\n{out}"
+            );
+        }
+        Ok(out)
+    }
+
+    /// `run ac <f0> <f1> [ppd]` — small-signal AC sweep, rendered as a Bode plot per
+    /// probed node. The drive comes from any source carrying a `sine` waveform
+    /// (`set <ref> sine …`); with no AC drive the response is flat zero.
+    fn run_ac(&mut self, f0: &str, f1: &str, ppd: u32) -> Result<String, ShellError> {
+        let f_start = self.parse_value(f0, Unit::Hertz)?.magnitude;
+        let f_stop = self.parse_value(f1, Unit::Hertz)?.magnitude;
+        let signals = Engine::new()
+            .run(
+                &self.circuit,
+                &Analysis::Ac {
+                    f_start,
+                    f_stop,
+                    points_per_decade: ppd,
+                },
+            )
+            .map_err(ShellError::Sim)?;
+        if self.probes.is_empty() {
+            return Ok("nothing probed — add `probe <node>` to see a Bode plot.".to_string());
+        }
+        let mut out = String::new();
+        for (i, node) in self.probes.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            let name = self.signal_name(node);
+            match signals.iter().find(|s| s.name == name) {
+                Some(sig) => {
+                    let title = format!("AC: v({node})");
+                    out.push_str(&Bode::new(&title).size(72, 8).render(sig));
+                    out.push('\n');
+                }
+                None => out.push_str(&format!("  v({node}) is ground (0 V) — nothing to plot.\n")),
+            }
+        }
+        Ok(out)
+    }
+
+    /// `run dc <source> <start> <stop> <step>` — a DC sweep of one source's level,
+    /// rendered as each probed node's response versus the swept level.
+    fn run_dc(
+        &mut self,
+        source: &str,
+        start: &str,
+        stop: &str,
+        step: &str,
+    ) -> Result<String, ShellError> {
+        // Sweep bounds carry the source's natural unit (V or A) for nice x labels.
+        let unit = self
+            .circuit
+            .part_by_ref(source)
+            .and_then(|p| p.value.map(|v| v.unit))
+            .unwrap_or(Unit::Volt);
+        let start_v = self.parse_value(start, unit)?.magnitude;
+        let stop_v = self.parse_value(stop, unit)?.magnitude;
+        let step_v = self.parse_value(step, unit)?.magnitude;
+        let signals = Engine::new()
+            .run(
+                &self.circuit,
+                &Analysis::DcSweep {
+                    source: source.to_string(),
+                    start: start_v,
+                    stop: stop_v,
+                    step: step_v,
+                },
+            )
+            .map_err(ShellError::Sim)?;
+        if self.probes.is_empty() {
+            return Ok("nothing probed — add `probe <node>` to see a sweep.".to_string());
+        }
+        let x_unit = unit.symbol();
+        let mut out = String::new();
+        for (i, node) in self.probes.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            let name = self.signal_name(node);
+            match signals.iter().find(|s| s.name == name) {
+                Some(sig) => {
+                    let y = sig.real().unwrap_or(&[]);
+                    let title = format!("v({node}) vs {source}");
+                    out.push_str(&Plot::new(&title).units("V", x_unit).render(&sig.x, y));
+                }
+                None => out.push_str(&format!("  v({node}) is ground (0 V) — nothing to plot.\n")),
+            }
+        }
+        Ok(out)
+    }
+
+    /// `run noise <node> <f0> <f1> [ppd]` — output-referred noise PSD at `node`.
+    fn run_noise(
+        &mut self,
+        node: &str,
+        f0: &str,
+        f1: &str,
+        ppd: u32,
+    ) -> Result<String, ShellError> {
+        let output = self.output_net(node)?;
+        let f_start = self.parse_value(f0, Unit::Hertz)?.magnitude;
+        let f_stop = self.parse_value(f1, Unit::Hertz)?.magnitude;
+        let signals = Engine::new()
+            .run(
+                &self.circuit,
+                &Analysis::Noise {
+                    output,
+                    f_start,
+                    f_stop,
+                    points_per_decade: ppd,
+                },
+            )
+            .map_err(ShellError::Sim)?;
+        let sig = signals.first().ok_or(ShellError::Sim(SimError::Singular))?;
+        let y = sig.real().unwrap_or(&[]);
+        let peak = y.iter().copied().fold(0.0_f64, f64::max);
+        let title = format!("noise PSD at v({node})");
+        let mut out = format!("  {}  peak {:.3e} V²/Hz\n", sig.name, peak);
+        out.push_str(&Plot::new(&title).units("V²/Hz", "Hz").render(&sig.x, y));
+        Ok(out)
+    }
+
+    /// `run mc <node> <runs> [seed]` — Monte-Carlo tolerance spread of the DC
+    /// operating-point voltage at `node`, summarized as mean / σ / min / max.
+    fn run_mc(&mut self, node: &str, runs: &str, seed: u64) -> Result<String, ShellError> {
+        let output = self.output_net(node)?;
+        let runs = self.parse_count(runs, "runs")? as usize;
+        let signals = Engine::new()
+            .run(
+                &self.circuit,
+                &Analysis::MonteCarlo {
+                    seed,
+                    runs,
+                    output,
+                    sample: 0,
+                    inner: Box::new(Analysis::OperatingPoint),
+                },
+            )
+            .map_err(ShellError::Sim)?;
+        let samples = signals.first().and_then(|s| s.real()).unwrap_or(&[]);
+        let (mean, std, lo, hi) = stats(samples);
+        Ok(format!(
+            "monte-carlo v({node}) over {runs} runs (seed {seed:#x}):\n  \
+             mean {mean:.6} V  σ {std:.6} V  min {lo:.6} V  max {hi:.6} V\n"
+        ))
+    }
+
+    /// `run tf <node> <source>` — small-signal transfer-function / pole-zero report
+    /// from an independent `source` to `node`.
+    fn run_tf(&mut self, node: &str, source: &str) -> Result<String, ShellError> {
+        let output = self.output_net(node)?;
+        let tf = Engine::new()
+            .transfer_function(&self.circuit, output, source)
+            .map_err(ShellError::Sim)?;
+        let mut out = format!(
+            "transfer function v({node})/{source}:\n  \
+             DC gain {:.6}\n  Rin {:.4} Ω\n  Rout {:.4} Ω\n",
+            tf.dc_gain, tf.input_impedance, tf.output_impedance
+        );
+        out.push_str(&format!("  poles ({}):\n", tf.poles.len()));
+        for p in &tf.poles {
+            out.push_str(&format!("    {}\n", fmt_complex_rad(p)));
+        }
+        match &tf.zeros {
+            Some(zeros) => {
+                out.push_str(&format!("  zeros ({}):\n", zeros.len()));
+                for z in zeros {
+                    out.push_str(&format!("    {}\n", fmt_complex_rad(z)));
+                }
+            }
+            None => out.push_str("  zeros: (not tractable for this circuit)\n"),
+        }
         Ok(out)
     }
 
@@ -673,15 +1383,28 @@ impl Shell {
     fn help_text() -> String {
         [
             "commands:",
-            "  add <ref> <a> <b> <value>   place a part (R/C/L/V from the ref's first letter)",
+            "  add <ref> <a> <b> <value>   place R/C/L/V/I (2-terminal) or D (value optional)",
+            "  add Q<n> <c> <b> <e> [npn|pnp]    place a BJT (collector base emitter)",
+            "  add M<n> <d> <g> <s> [nmos|pmos]  place a MOSFET (drain gate source)",
+            "  add E/G <o+> <o-> <c+> <c-> <k>   VCVS (V/V) / VCCS (A/V)",
+            "  add H/F <o+> <o-> <k> <Vctrl>     CCVS (V/A) / CCCS (A/A)",
             "  wire <a> <b>                merge two named nodes into one net",
             "  probe <node>                mark a node to plot on the next run",
             "  remove <ref>                delete a placed part",
             "  set <ref>.value <value>     retarget a component's value (live-tunable)",
-            "  run [tran [<dur>]]          transient (default 1 ms), plotting each probe",
+            "  set <ref> sine <amp> <freq> [off] [phase]   attach a sine drive (AC/Bode)",
+            "  set <ref> pulse <v1> <v2> <d> <w> <per>      attach a pulse drive",
+            "  set tol|tempco <ref> <n>    tolerance (Monte-Carlo) / temperature coefficient",
+            "  set temp <celsius>          circuit operating temperature",
+            "  run tran [<dur>]            transient (default 1 ms), plotting each probe",
             "  run op                      DC operating-point node-voltage table",
+            "  run ac <f0> <f1> [ppd]      small-signal AC sweep (Bode per probe)",
+            "  run dc <src> <start> <stop> <step>   DC sweep of a source's level",
+            "  run noise <node> <f0> <f1> [ppd]     output-referred noise PSD",
+            "  run mc <node> <runs> [seed]  Monte-Carlo tolerance spread",
+            "  run tf <node> <src>         transfer function / pole-zero report",
             "  show                        list the placed parts",
-            "  undo                        revert the last add/wire/probe",
+            "  undo                        revert the last add/wire/probe/set",
             "  checkpoint <name>           save the session under a name",
             "  restore <name>              restore the session to a checkpoint",
             "  save <path>                 write the whole session to a file",
@@ -789,6 +1512,48 @@ fn classify(reference: &str) -> Result<(PartKind, Unit), ShellError> {
     })
 }
 
+/// Parse a transistor polarity token, defaulting to the n-type. `bjt` selects the
+/// accepted words: `npn`/`n`/`pnp`/`p` for a BJT, `nmos`/`n`/`pmos`/`p` for a
+/// MOSFET. An unrecognized token is a friendly [`ShellError::BadPolarity`].
+fn parse_polarity(token: &str, bjt: bool) -> Result<Polarity, ShellError> {
+    match token.to_ascii_lowercase().as_str() {
+        "n" | "npn" if bjt => Ok(Polarity::N),
+        "p" | "pnp" if bjt => Ok(Polarity::P),
+        "n" | "nmos" if !bjt => Ok(Polarity::N),
+        "p" | "pmos" if !bjt => Ok(Polarity::P),
+        _ => Err(ShellError::BadPolarity(token.to_string())),
+    }
+}
+
+/// Mean, population standard deviation, min, and max of a sample set (all `0.0`
+/// for an empty set) — the Monte-Carlo spread readout.
+fn stats(samples: &[f64]) -> (f64, f64, f64, f64) {
+    if samples.is_empty() {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+    let n = samples.len() as f64;
+    let mean = samples.iter().sum::<f64>() / n;
+    let var = samples.iter().map(|&v| (v - mean).powi(2)).sum::<f64>() / n;
+    let lo = samples.iter().copied().fold(f64::INFINITY, f64::min);
+    let hi = samples.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    (mean, var.sqrt(), lo, hi)
+}
+
+/// Format a Laplace-plane root (rad/s) compactly: a real root as a scalar, a
+/// complex pair as `re ± im·j`.
+fn fmt_complex_rad(z: &Complex) -> String {
+    if z.im.abs() < 1e-9 * z.re.abs().max(1.0) {
+        format!("{:.4} rad/s", z.re)
+    } else {
+        format!(
+            "{:.4} {} {:.4}j rad/s",
+            z.re,
+            if z.im < 0.0 { "-" } else { "+" },
+            z.im.abs()
+        )
+    }
+}
+
 /// `gnd`, `ground`, and `0` all name the ground reference.
 fn is_ground(name: &str) -> bool {
     matches!(name.to_ascii_lowercase().as_str(), "gnd" | "ground" | "0")
@@ -825,6 +1590,12 @@ pub enum ShellError {
     },
     /// A reference's first letter is not a known part type.
     UnknownPartKind(char),
+    /// A transistor polarity token was neither the n- nor the p-type.
+    BadPolarity(String),
+    /// An independent source was placed with both terminals on one net.
+    DegenerateSource(String),
+    /// A transient duration was zero, negative, or non-finite.
+    BadDuration(String),
     /// The reference designator was empty.
     EmptyReference,
     /// A value (or duration) field could not be parsed. `field` quotes the
@@ -866,7 +1637,19 @@ impl fmt::Display for ShellError {
                 write!(f, "bad arguments for `{command}` — usage: {usage}")
             }
             ShellError::UnknownPartKind(c) => {
-                write!(f, "unknown part type '{c}' (expected R, C, L, or V)")
+                write!(
+                    f,
+                    "unknown part type '{c}' — expected R, C, L, V, I, D, Q, M, E, G, H, or F"
+                )
+            }
+            ShellError::BadPolarity(p) => {
+                write!(f, "unknown polarity {p:?} — expected npn/pnp or nmos/pmos")
+            }
+            ShellError::DegenerateSource(r) => {
+                write!(f, "source {r:?} has both terminals on the same node")
+            }
+            ShellError::BadDuration(d) => {
+                write!(f, "duration {d:?} must be a positive time (e.g. 5m, 1u)")
             }
             ShellError::EmptyReference => write!(f, "empty part reference"),
             ShellError::BadValue { field, source } => {
@@ -1363,8 +2146,14 @@ mod tests {
         );
         assert_eq!(r1_after.from, in_net, "direction unchanged (in → out)");
 
-        // The overlay render reflects it too: toggle it on via the palette and the
-        // frame carries the animated flow arrows.
+        // The overlay render reflects it too. Leave edit mode first — edit-mode
+        // chrome now takes precedence over the overlay (`CP-UX-M8.1`) — then toggle
+        // the overlay on via the palette; the frame carries the animated flow arrows.
+        key(&mut app, KeyCode::Esc);
+        assert!(
+            !app.edit_mode(),
+            "left edit mode before viewing the overlay"
+        );
         app.handle_event(AppEvent::Key(KeyEvent::char('p').with_ctrl()));
         typ(&mut app, "toggle overlay");
         key(&mut app, KeyCode::Enter);
@@ -1409,6 +2198,64 @@ mod tests {
         // Undo again removes R1 too, back to the empty circuit.
         sh.undo().unwrap();
         assert_eq!(sh.circuit().parts().len(), 0);
+    }
+
+    /// Regression (`CP-UX-M8.2`): a large build must stay roughly linear, not the
+    /// old O(N²) (every `add` deep-cloned the whole circuit for undo and scanned
+    /// every part for a duplicate reference). 100k parts must place quickly; the
+    /// generous time bound only catches a return of the quadratic blow-up.
+    #[test]
+    fn large_build_script_is_not_quadratic() {
+        let src = "repeat 100000 as i {\n  add R$i a b 1k\n}";
+        let start = std::time::Instant::now();
+        let mut sh = Shell::new();
+        let run = sh.run_script(src).expect("the 100k build runs");
+        let elapsed = start.elapsed();
+        assert_eq!(sh.circuit().parts().len(), 100_000, "all parts placed");
+        assert_eq!(run.recording.commands().len(), 100_000);
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "100k-part build took {elapsed:?} — the O(N²) undo/dup-check is back"
+        );
+        // One undo reverts exactly the last part — cheap even at this size.
+        sh.undo().unwrap();
+        assert_eq!(sh.circuit().parts().len(), 99_999);
+    }
+
+    /// Regression (`CP-UX-M8.2`): an absurd `repeat` count is rejected up front with
+    /// a typed error rather than expanding forever.
+    #[test]
+    fn runaway_repeat_is_rejected_fast() {
+        let src = "repeat 100000000 as i {\n  add R$i a b 1k\n}";
+        let start = std::time::Instant::now();
+        let mut sh = Shell::new();
+        let err = sh.run_script(src).unwrap_err();
+        assert!(
+            matches!(err, ScriptError::TooLarge { .. }),
+            "expected TooLarge, got {err}"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(30),
+            "a runaway repeat must fail fast, not hang"
+        );
+    }
+
+    /// Regression (`CP-UX-M8.2`): a duplicate `probe` changes nothing, so it must
+    /// not push a dead undo step. After `probe out` twice, a single `undo` clears
+    /// the probe and the next `undo` reaches the `add` (not a probe no-op).
+    #[test]
+    fn duplicate_probe_records_no_undo_step() {
+        let mut sh = Shell::new();
+        sh.execute("add R1 in out 1k").unwrap();
+        sh.execute("probe out").unwrap();
+        sh.execute("probe out").unwrap(); // duplicate: a no-op
+        assert_eq!(sh.probes.len(), 1, "probed once");
+        sh.undo().unwrap(); // reverts the (single) probe
+        assert!(sh.probes.is_empty(), "the one probe is gone");
+        // The next undo is the add, not a second probe no-op.
+        let msg = sh.undo().unwrap();
+        assert!(msg.contains("undone"), "{msg}");
+        assert_eq!(sh.circuit().parts().len(), 0, "R1 removed by the next undo");
     }
 
     /// A probe can be undone, and a failed command leaves no undo entry behind.
@@ -1649,5 +2496,198 @@ mod tests {
             sh.execute("run tran wat").unwrap_err(),
             ShellError::BadValue { .. }
         ));
+    }
+
+    // ── CP-UX-M8.2: shell reach + correctness ──────────────────────────────
+
+    /// Regression: `run ac` reaches the AC engine and renders a Bode plot per
+    /// probe. The sine drive (`set V1 sine …`) is the small-signal stimulus.
+    #[test]
+    fn run_ac_renders_a_bode_plot() {
+        let mut sh = Shell::new();
+        sh.execute("add V1 in gnd 1").unwrap();
+        sh.execute("set V1 sine 1 1k").unwrap();
+        sh.execute("add R1 in out 1k").unwrap();
+        sh.execute("add C1 out gnd 159n").unwrap(); // fc ≈ 1 kHz
+        sh.execute("probe out").unwrap();
+        let out = sh.execute("run ac 10 100k").unwrap();
+        assert!(out.contains("AC: v(out)"), "names the probe:\n{out}");
+        assert!(out.contains("|H| (dB)"), "a Bode magnitude plot:\n{out}");
+        assert!(out.contains("f(-3dB)"), "a corner readout:\n{out}");
+    }
+
+    /// Regression: `run dc` sweeps a source and plots each probe versus the level.
+    #[test]
+    fn run_dc_sweeps_a_source() {
+        let mut sh = Shell::new();
+        sh.execute("add V1 in gnd 0").unwrap();
+        sh.execute("add R1 in out 1k").unwrap();
+        sh.execute("add R2 out gnd 1k").unwrap();
+        sh.execute("probe out").unwrap();
+        let out = sh.execute("run dc V1 0 10 1").unwrap();
+        assert!(out.contains("v(out) vs V1"), "titled sweep:\n{out}");
+        assert!(out.contains('\u{2524}'), "a braille frame:\n{out}");
+    }
+
+    /// Regression: `run tf` reports the DC gain and the pole set.
+    #[test]
+    fn run_tf_reports_gain_and_poles() {
+        let mut sh = Shell::new();
+        sh.execute("add V1 in gnd 1").unwrap();
+        sh.execute("add R1 in out 1k").unwrap();
+        sh.execute("add C1 out gnd 1u").unwrap();
+        let out = sh.execute("run tf out V1").unwrap();
+        assert!(out.contains("DC gain"), "{out}");
+        assert!(out.contains("poles"), "{out}");
+        // A first-order RC low-pass has exactly one real pole at −1/RC ≈ −1000 rad/s.
+        assert!(out.contains("poles (1)"), "one pole expected:\n{out}");
+    }
+
+    /// Regression: `run noise` reaches the noise engine and reports a PSD readout.
+    #[test]
+    fn run_noise_reports_psd() {
+        let mut sh = Shell::new();
+        sh.execute("add V1 in gnd 1").unwrap();
+        sh.execute("add R1 in out 1k").unwrap();
+        sh.execute("add R2 out gnd 1k").unwrap();
+        let out = sh.execute("run noise out 1 1k").unwrap();
+        assert!(out.contains("V²/Hz"), "a PSD readout:\n{out}");
+    }
+
+    /// Gate: a BJT common-emitter amplifier is placeable and solvable from eesh —
+    /// the 3-terminal `Q` part reaches the nonlinear engine and the bias solves.
+    #[test]
+    fn bjt_common_emitter_amp_places_and_solves() {
+        let mut sh = Shell::new();
+        sh.execute("add V1 vcc gnd 10").unwrap();
+        sh.execute("add RC vcc c 1k").unwrap();
+        sh.execute("add RB vcc b 470k").unwrap();
+        sh.execute("add Q1 c b e npn").unwrap();
+        sh.execute("add RE e gnd 100").unwrap();
+        // The BJT placed with three terminals and the right kind.
+        let q = sh.circuit().part_by_ref("Q1").expect("Q1 placed");
+        assert!(matches!(q.kind, PartKind::Bjt(Polarity::N, _)));
+        assert_eq!(q.terminals.len(), 3, "collector, base, emitter");
+        // The bias point solves and sits between the rails (the stage is active).
+        let table = sh.execute("run op").unwrap();
+        let vc = parse_op_voltage(&table, "c").expect("v(c) in the table");
+        assert!(
+            vc > 0.1 && vc < 9.9,
+            "collector should sit between the rails, got {vc} V:\n{table}"
+        );
+    }
+
+    /// A MOSFET and the controlled sources place with the right terminal counts.
+    #[test]
+    fn mosfet_and_controlled_sources_place() {
+        let mut sh = Shell::new();
+        sh.execute("add M1 d g s nmos").unwrap();
+        assert!(matches!(
+            sh.circuit().part_by_ref("M1").unwrap().kind,
+            PartKind::Mosfet(Polarity::N, _)
+        ));
+        sh.execute("add V1 cp gnd 1").unwrap();
+        sh.execute("add E1 op gnd cp gnd 100").unwrap(); // VCVS, 4 terminals
+        let e = sh.circuit().part_by_ref("E1").unwrap();
+        assert!(matches!(e.kind, PartKind::Vcvs(_)));
+        assert_eq!(e.terminals.len(), 4);
+        sh.execute("add H1 oh gnd 50 V1").unwrap(); // CCVS, 2 terminals + control
+        let h = sh.circuit().part_by_ref("H1").unwrap();
+        assert!(matches!(h.kind, PartKind::Ccvs(_, _)));
+        assert_eq!(h.terminals.len(), 2);
+    }
+
+    /// `set <ref> sine …`, tolerance, tempco, and temperature all reach the core.
+    #[test]
+    fn waveform_and_parameter_verbs_reach_the_core() {
+        let mut sh = Shell::new();
+        sh.execute("add V1 in gnd 1").unwrap();
+        sh.execute("add R1 in gnd 1k").unwrap();
+        sh.execute("set V1 sine 2 1k 0.5 90").unwrap();
+        assert!(matches!(
+            sh.circuit().part_by_ref("V1").unwrap().waveform,
+            Waveform::Sine { .. }
+        ));
+        sh.execute("set tol R1 0.05").unwrap();
+        assert_eq!(sh.circuit().tolerance("R1"), Some(0.05));
+        sh.execute("set tempco R1 0.001").unwrap();
+        assert_eq!(sh.circuit().tempco("R1"), Some(0.001));
+        sh.execute("set temp 85").unwrap();
+        assert_eq!(sh.circuit().temperature(), 85.0);
+        // Undo reverts the temperature change (one full-snapshot step).
+        sh.undo().unwrap();
+        assert_eq!(sh.circuit().temperature(), 27.0);
+    }
+
+    /// Edge cases: degenerate source, non-positive duration, and the absurd-window
+    /// warning each behave (clean typed errors / a non-fatal warning).
+    #[test]
+    fn run_and_add_edge_cases_are_clean() {
+        let mut sh = Shell::new();
+        // A source shorted to itself is degenerate.
+        assert!(matches!(
+            sh.execute("add V1 a a 5").unwrap_err(),
+            ShellError::DegenerateSource(_)
+        ));
+        sh.execute("add V1 in gnd 5").unwrap();
+        sh.execute("add R1 in out 1k").unwrap();
+        sh.execute("add C1 out gnd 1u").unwrap();
+        sh.execute("probe out").unwrap();
+        // Zero / negative durations are rejected with a typed error.
+        assert!(matches!(
+            sh.execute("run tran 0").unwrap_err(),
+            ShellError::BadDuration(_)
+        ));
+        assert!(matches!(
+            sh.execute("run tran -1").unwrap_err(),
+            ShellError::BadDuration(_)
+        ));
+        // An absurd window (1k = 1000 s) warns but still runs.
+        let out = sh.execute("run tran 1k").unwrap();
+        assert!(out.starts_with("warning"), "absurd-window warning:\n{out}");
+        assert!(out.contains('\u{2524}'), "still renders a frame:\n{out}");
+    }
+
+    /// The unknown-part-type message lists the real set and names the letter.
+    #[test]
+    fn unknown_part_type_message_lists_the_real_set() {
+        let mut sh = Shell::new();
+        let err = sh.execute("add Z1 a b 1k").unwrap_err();
+        assert!(matches!(err, ShellError::UnknownPartKind('Z')));
+        let msg = err.to_string();
+        assert!(msg.contains('Z'), "names the letter: {msg}");
+        assert!(
+            msg.contains('Q') && msg.contains('D'),
+            "lists Q and D: {msg}"
+        );
+    }
+
+    /// A value-less diode is valid (`add D1 a b`); a given value routes to `Is`.
+    #[test]
+    fn diode_value_is_optional() {
+        let mut sh = Shell::new();
+        sh.execute("add D1 a b")
+            .expect("a value-less diode is valid");
+        assert!(matches!(
+            sh.circuit().part_by_ref("D1").unwrap().kind,
+            PartKind::Diode(_)
+        ));
+        sh.execute("add D2 a b 2e-14")
+            .expect("a diode with an Is value is valid");
+        if let PartKind::Diode(m) = sh.circuit().part_by_ref("D2").unwrap().kind {
+            assert!((m.is - 2e-14).abs() < 1e-20, "Is routed to the model");
+        } else {
+            panic!("D2 is not a diode");
+        }
+    }
+
+    /// Pull a `v(<name>) = <volts> V` reading out of a `run op` table, for tests.
+    fn parse_op_voltage(table: &str, node: &str) -> Option<f64> {
+        let needle = format!("v({node}) = ");
+        table.lines().find_map(|l| {
+            let l = l.trim();
+            let rest = l.strip_prefix(&needle)?;
+            rest.trim_end_matches(" V").trim().parse::<f64>().ok()
+        })
     }
 }

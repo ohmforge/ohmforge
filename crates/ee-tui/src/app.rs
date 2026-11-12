@@ -6,7 +6,7 @@
 //! methods that take an abstract [`AppEvent`] and mutate [`App`], and
 //! [`App::render`] is a pure function from state to a single `String` of a given
 //! width and height. No `crossterm`, no raw mode, no `tty` — so the whole thing
-//! is unit-testable the way [`Screen`](crate::Screen) and [`Plot`](crate::Plot)
+//! is unit-testable the way [`Screen`](crate::Screen) and [`Plot`]
 //! already are.
 //!
 //! The crossterm raw-mode glue (reading real key/mouse events, drawing the frame)
@@ -39,6 +39,7 @@ use ee_core::value::Value;
 use crate::current::{branch_currents, BranchCurrents};
 use crate::overlay::{NodeVoltages, Overlay};
 use crate::playback::Playback;
+use crate::plot::Plot;
 use crate::schematic::{fmt_value, Schematic};
 use crate::screen::Pane;
 
@@ -385,6 +386,11 @@ pub struct App<B: Backend> {
     /// The cached transient result and its playhead — a scrubbable "play" over the
     /// last transient `run` (`CP-UX-M7.1`). Empty until a transient is run.
     playback: Playback,
+    /// Whether the user is actively scrubbing the scope transport. Only while this
+    /// is set does the overlay follow the playhead; otherwise it shows the live DC
+    /// op-point / tuned solution, so live-tune feedback keeps working after a
+    /// transient has been loaded (`CP-UX-M8.1`). Cleared on any command/edit.
+    scrubbing: bool,
     /// Animation frame counter — the run loop bumps it so the flow arrows march.
     tick: u64,
     /// Last known terminal size, for mouse hit-testing between renders.
@@ -410,6 +416,7 @@ impl<B: Backend> App<B> {
             voltages,
             currents,
             playback: Playback::new(),
+            scrubbing: false,
             tick: 0,
             size: (100, 30),
             should_quit: false,
@@ -495,7 +502,12 @@ impl<B: Backend> App<B> {
             KeyCode::Right => self.playback.step(1),
             KeyCode::Char(',') => self.playback.seek(0),
             KeyCode::Char('.') => self.playback.seek(usize::MAX),
-            _ => {}
+            _ => return,
+        }
+        // Any transport action means the user is scrubbing: hand the overlay to the
+        // playhead until the next command/edit (`CP-UX-M8.1`).
+        if !self.playback.is_empty() {
+            self.scrubbing = true;
         }
     }
 
@@ -533,6 +545,27 @@ impl<B: Backend> App<B> {
 
     fn on_mouse(&mut self, m: MouseEvent) {
         match m.kind {
+            // While the palette is open a click interacts with it instead of
+            // falling through to the pane behind: on a command row it selects and
+            // runs it; anywhere outside the box it dismisses the palette
+            // (`CP-UX-M8.1`).
+            MouseKind::Down if self.palette.open => {
+                let (w, h) = self.size;
+                let rect = self.palette_rect(w, h);
+                if !rect.contains(m.col, m.row) {
+                    self.palette.open = false;
+                    return;
+                }
+                // Inside the box: rows are border(y), query(y+1), then matches.
+                let first_match_row = rect.y + 2;
+                if m.row >= first_match_row {
+                    let idx = m.row - first_match_row;
+                    if idx < self.palette_matches().len() {
+                        self.palette.selected = idx;
+                        self.run_selected_command();
+                    }
+                }
+            }
             // A click focuses whichever panel it lands in.
             MouseKind::Down => {
                 let (w, h) = self.size;
@@ -665,11 +698,13 @@ impl<B: Backend> App<B> {
     /// typed shell line and the interactive editor.
     fn run_line(&mut self, line: &str) {
         self.push_log(format!("> {line}"));
+        // A new command returns the overlay to the live op-point until the user
+        // deliberately scrubs again (`CP-UX-M8.1`).
+        self.scrubbing = false;
         match self.backend.execute(line) {
             Ok(out) if is_scope(&out) => {
                 self.scope = out;
                 self.push_log("scope updated".to_string());
-                self.refresh_playback();
             }
             Ok(out) => {
                 for l in out.lines() {
@@ -678,6 +713,10 @@ impl<B: Backend> App<B> {
             }
             Err(e) => self.push_log(format!("error: {e}")),
         }
+        // Reload the playback from the backend's transient cache (now empty after a
+        // mutating command, since the stored waveform no longer matches the circuit)
+        // and re-solve the op-point so the overlay tracks the latest circuit.
+        self.refresh_playback();
         self.refresh_solution();
     }
 
@@ -707,6 +746,18 @@ impl<B: Backend> App<B> {
         self.playback.advance();
     }
 
+    /// Whether anything on screen is actually animating, so the run loop knows
+    /// whether to drive [`tick`](App::tick) at all (`CP-UX-M8.1`).
+    ///
+    /// Two things animate: a *playing* transient playback (the playhead marches),
+    /// and the current-flow arrows — but the arrows only move when the overlay is
+    /// shown **and** some branch carries current. An idle screen (overlay off, or
+    /// an empty/zero-current circuit, playback paused) animates nothing, so the
+    /// loop can block for input instead of repainting on a timer. Pure, no I/O.
+    pub fn is_animating(&self) -> bool {
+        self.playback.playing() || (self.overlay && self.currents.max_magnitude() > 0.0)
+    }
+
     // ── transient playback (CP-UX-M7.1) ────────────────────────────────────
 
     /// The cached transient playback (for tests and the scope/overlay panes).
@@ -717,6 +768,7 @@ impl<B: Backend> App<B> {
     /// Start the transient playback advancing on each tick.
     pub fn play(&mut self) {
         self.playback.play();
+        self.mark_scrubbing();
     }
 
     /// Pause the transient playback, leaving the playhead where it is.
@@ -727,27 +779,45 @@ impl<B: Backend> App<B> {
     /// Toggle the transient playback between playing and paused.
     pub fn toggle_play(&mut self) {
         self.playback.toggle();
+        self.mark_scrubbing();
     }
 
     /// Step the playhead by `delta` samples (negative rewinds), clamped at the ends.
     pub fn step_playhead(&mut self, delta: isize) {
         self.playback.step(delta);
+        self.mark_scrubbing();
     }
 
     /// Seek the playhead to an absolute sample index, clamped to the last frame.
     pub fn seek_playhead(&mut self, index: usize) {
         self.playback.seek(index);
+        self.mark_scrubbing();
+    }
+
+    /// Mark the overlay as following the playhead (a non-empty playback is scrubbed).
+    fn mark_scrubbing(&mut self) {
+        if !self.playback.is_empty() {
+            self.scrubbing = true;
+        }
     }
 
     /// The node voltages the overlay should paint: the transient sample at the
-    /// playhead while a scrubbable transient is loaded, else the DC op-point. This
-    /// is the seam that makes the live overlay "reflect the sampled instant".
+    /// playhead *only while the user is actively scrubbing* the scope transport,
+    /// else the live DC op-point / tuned solution. Gating on [`scrubbing`] (rather
+    /// than merely "a transient is loaded") is what lets live-tune feedback keep
+    /// working after a `run tran` — the overlay reflects each tune's re-solved
+    /// op-point until the user deliberately scrubs the playhead (`CP-UX-M8.1`).
     fn overlay_voltages(&self) -> NodeVoltages {
-        if self.playback.is_empty() {
-            self.voltages.clone()
-        } else {
+        if self.scrubbing && !self.playback.is_empty() {
             self.playback.voltages()
+        } else {
+            self.voltages.clone()
         }
+    }
+
+    /// Whether the overlay is currently following the scrubbed playhead.
+    pub fn is_scrubbing(&self) -> bool {
+        self.scrubbing && !self.playback.is_empty()
     }
 
     /// The last solved operating-point node voltages (for tests and the overlay).
@@ -1013,6 +1083,17 @@ impl<B: Backend> App<B> {
     fn render_panel(&self, id: PanelId, rect: Rect) -> Vec<String> {
         let focused = id == self.focus;
         match id {
+            // Edit mode takes precedence over the overlay: the selection marker,
+            // prompt, and hint must stay visible while editing even if the overlay
+            // is toggled on (`CP-UX-M8.1`).
+            PanelId::Schematic if self.edit.active => {
+                let rows = Schematic::new("schematic")
+                    .width(rect.w)
+                    .rows(self.backend.circuit());
+                let base = self.edit_schematic_body(&rows);
+                let title = focus_title("schematic [edit]", focused);
+                Pane::new(&title, &base).render(rect.w, rect.h)
+            }
             PanelId::Schematic if self.overlay => {
                 let title = focus_title("op-point", focused);
                 // The overlay reflects the sampled instant: the transient sample at
@@ -1030,9 +1111,7 @@ impl<B: Backend> App<B> {
                 let rows = Schematic::new("schematic")
                     .width(rect.w)
                     .rows(self.backend.circuit());
-                let (base, name) = if self.edit.active {
-                    (self.edit_schematic_body(&rows), "schematic [edit]")
-                } else if rows.is_empty() {
+                let (base, name) = if rows.is_empty() {
                     ("(no parts)".to_string(), "schematic")
                 } else {
                     (rows.join("\n"), "schematic")
@@ -1042,7 +1121,7 @@ impl<B: Backend> App<B> {
             }
             PanelId::Scope => {
                 let title = focus_title("scope", focused);
-                let body = self.scope_body();
+                let body = self.scope_body(rect);
                 Pane::new(&title, &body).render(rect.w, rect.h)
             }
             PanelId::Shell => {
@@ -1080,19 +1159,57 @@ impl<B: Backend> App<B> {
         lines.join("\n")
     }
 
-    /// The scope pane body: the last waveform frame, with a transient-playback
-    /// transport header prepended while a scrubbable transient is loaded so the
-    /// scope reflects the sampled instant at the playhead (`CP-UX-M7.1`).
-    fn scope_body(&self) -> String {
-        let base = if self.scope.is_empty() {
+    /// The scope pane body, sized to its pane. When a transient is loaded it is
+    /// **re-plotted from the cached series at the live pane rect** so the waveform
+    /// (and its x-axis label) never clip, regardless of the fixed size the shell
+    /// first rendered at; a transport header rides on top (`CP-UX-M7.1`/`M8.1`).
+    /// Non-transient scope frames (AC/DC/noise) fall back to the shell's string.
+    fn scope_body(&self, rect: Rect) -> String {
+        // Pane interior: two border columns/rows are consumed by the frame.
+        let inner_w = rect.w.saturating_sub(4);
+        let inner_h = rect.h.saturating_sub(2);
+        if !self.playback.is_empty() {
+            // One interior row goes to the transport header; the plots fill the rest.
+            let plot_h = inner_h.saturating_sub(1);
+            let body = self.replot_transient(inner_w, plot_h);
+            return format!("{}\n{body}", self.transport_line());
+        }
+        if self.scope.is_empty() {
             "(run a transient to plot)".to_string()
         } else {
             self.scope.clone()
-        };
-        if self.playback.is_empty() {
-            return base;
         }
-        format!("{}\n{base}", self.transport_line())
+    }
+
+    /// Re-plot every cached transient series into `inner_w × inner_h` interior
+    /// cells, splitting the height across the probed signals. Each [`Plot`] needs a
+    /// title row, an x-axis rule, and a labels row on top of its braille rows, and
+    /// a y-axis gutter on the left — budgeted here so nothing overruns the pane.
+    fn replot_transient(&self, inner_w: usize, inner_h: usize) -> String {
+        let sigs = self.playback.signals();
+        if sigs.is_empty() {
+            return String::new();
+        }
+        // Chrome per plot: title + x rule + x labels = 3 rows; gutter ≈ 7 cols.
+        const PLOT_CHROME_ROWS: usize = 3;
+        const GUTTER_BUDGET: usize = 7;
+        let per = (inner_h / sigs.len()).max(PLOT_CHROME_ROWS + 1);
+        let plot_h = per.saturating_sub(PLOT_CHROME_ROWS).max(1);
+        let plot_w = inner_w.saturating_sub(GUTTER_BUDGET).max(1);
+        let mut out = String::new();
+        for (i, s) in sigs.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            let y = s.real().unwrap_or(&[]);
+            out.push_str(
+                &Plot::new(&s.name)
+                    .units("V", "s")
+                    .size(plot_w, plot_h)
+                    .render(&s.x, y),
+            );
+        }
+        out
     }
 
     /// The playback transport status line: play/pause state, the playhead time,
@@ -1119,9 +1236,18 @@ impl<B: Backend> App<B> {
     }
 
     /// The shell pane body: the most recent log lines, then the input prompt.
+    ///
+    /// The run loop hides the terminal's own cursor, so the prompt draws its own
+    /// caret (`▏`) at the input position while the shell holds focus, so the user
+    /// can see where typing lands (`CP-UX-M8.1`).
     fn shell_body(&self, pane_h: usize) -> String {
         let rows = pane_h.saturating_sub(2); // interior rows inside the frame
-        let prompt = format!("> {}", self.input);
+        let caret = if self.focus == PanelId::Shell {
+            "\u{258f}"
+        } else {
+            ""
+        };
+        let prompt = format!("> {}{caret}", self.input);
         if rows == 0 {
             return prompt;
         }
@@ -1132,13 +1258,27 @@ impl<B: Backend> App<B> {
         body.join("\n")
     }
 
-    /// Draw the command palette as a centred, framed overlay.
-    fn render_palette(&self, grid: &mut [Vec<char>], w: usize, h: usize) {
+    /// The centred, framed command-palette box at the given screen size — shared by
+    /// the renderer and the mouse hit-test so a click lands where the box is drawn.
+    fn palette_rect(&self, w: usize, h: usize) -> Rect {
         let matches = self.palette_matches();
         let box_w = 40.min(w.saturating_sub(4)).max(12);
         // One row for the query, up to eight match rows, plus two border rows.
         let shown = matches.len().min(8);
         let box_h = (shown + 3).min(h.saturating_sub(2)).max(3);
+        Rect {
+            x: (w - box_w) / 2,
+            y: (h - box_h) / 2,
+            w: box_w,
+            h: box_h,
+        }
+    }
+
+    /// Draw the command palette as a centred, framed overlay.
+    fn render_palette(&self, grid: &mut [Vec<char>], w: usize, h: usize) {
+        let matches = self.palette_matches();
+        let rect = self.palette_rect(w, h);
+        let (box_w, box_h) = (rect.w, rect.h);
 
         let mut body = String::new();
         body.push_str(&format!("/ {}", self.palette.query));
@@ -1157,9 +1297,7 @@ impl<B: Backend> App<B> {
         }
 
         let lines = Pane::new("palette", &body).render(box_w, box_h);
-        let x = (w - box_w) / 2;
-        let y = (h - box_h) / 2;
-        blit(grid, &lines, x, y);
+        blit(grid, &lines, rect.x, rect.y);
     }
 
     /// Borrow the backend (e.g. to read the circuit after the loop exits).
@@ -2089,6 +2227,279 @@ mod tests {
         assert!(
             frame.contains("t="),
             "scope transport shows the playhead time:\n{frame}"
+        );
+    }
+
+    // ── CP-UX-M8.1: TUI hardening ──────────────────────────────────────────
+
+    /// A tune-aware backend: `op_point` reports `v(n1)` equal to a stored level,
+    /// and `set …` updates that level — so the overlay can be checked for tracking
+    /// the *live op-point* versus the loaded transient's `t = 0` sample.
+    struct TuneBackend {
+        circuit: Circuit,
+        level: f64,
+    }
+
+    impl TuneBackend {
+        fn new() -> Self {
+            let mut circuit = Circuit::new("tune");
+            let n1 = circuit.new_net();
+            circuit.add_part(
+                "R1",
+                PartKind::Resistor,
+                Some(Value::new(1000.0, Unit::Ohm)),
+                vec![n1, NetId::GROUND],
+            );
+            Self {
+                circuit,
+                level: 5.0,
+            }
+        }
+    }
+
+    impl Backend for TuneBackend {
+        fn execute(&mut self, line: &str) -> Result<String, String> {
+            if line.starts_with("run") {
+                return Ok("  tran\n  \u{2524}\u{2801}\n".to_string());
+            }
+            if let Some(v) = line.strip_prefix("set R1.value ") {
+                self.level = v.parse().unwrap_or(self.level);
+            }
+            Ok(format!("ok: {line}"))
+        }
+        fn circuit(&self) -> &Circuit {
+            &self.circuit
+        }
+        fn op_point(&self) -> NodeVoltages {
+            let mut v = NodeVoltages::new();
+            v.set(NetId(1), self.level);
+            v
+        }
+        fn transient(&self) -> Vec<Signal> {
+            // A ramp whose t=0 sample is 0 V — distinct from the op-point level.
+            vec![Signal::time(
+                "v(n1)",
+                Unit::Volt,
+                vec![0.0, 1e-3, 2e-3],
+                vec![0.0, 1.0, 2.0],
+            )]
+        }
+    }
+
+    /// Gate: the overlay reflects a live tune while a transient is loaded. After a
+    /// `run`, the playback is loaded but the overlay must still show the DC
+    /// op-point (`v(n1)=5V`), not the playback's `t=0` sample (0 V); a tune then
+    /// moves the op-point and the overlay follows — the regression the scrubbing
+    /// flag fixes (`CP-UX-M8.1`).
+    #[test]
+    fn overlay_reflects_a_tune_with_a_transient_loaded() {
+        let mut a = App::new(TuneBackend::new());
+        a.focus = PanelId::Shell;
+        typ(&mut a, "run tran 2m");
+        key(&mut a, KeyCode::Enter);
+        a.overlay = true;
+        assert!(
+            !a.playback().is_empty(),
+            "the transient loaded into playback"
+        );
+        assert!(!a.is_scrubbing(), "a fresh run is not scrubbing");
+
+        // Not scrubbing → the overlay shows the live op-point, not the t=0 sample.
+        let frame = a.render(80, 24);
+        assert!(
+            frame.contains("n1=5V"),
+            "overlay shows the DC op-point, not the t=0 playback sample:\n{frame}"
+        );
+
+        // A live tune moves the op-point and the overlay follows immediately.
+        a.apply_edit(EditAction::Tune {
+            reference: "R1".to_string(),
+            value: "8".to_string(),
+        });
+        let frame = a.render(80, 24);
+        assert!(
+            frame.contains("n1=8V"),
+            "overlay reflects the tuned op-point:\n{frame}"
+        );
+        assert!(
+            !a.is_scrubbing(),
+            "a command/edit returns the overlay to the op-point"
+        );
+    }
+
+    /// Scrubbing the scope transport hands the overlay to the playhead; the next
+    /// command returns it to the live op-point.
+    #[test]
+    fn scrubbing_flag_gates_the_overlay_source() {
+        let mut a = App::new(TuneBackend::new());
+        a.focus = PanelId::Shell;
+        typ(&mut a, "run");
+        key(&mut a, KeyCode::Enter);
+        assert!(!a.is_scrubbing());
+        // Focus the scope and step the transport → scrubbing.
+        a.focus = PanelId::Scope;
+        key(&mut a, KeyCode::Right);
+        assert!(a.is_scrubbing(), "a transport key starts scrubbing");
+        // Running another command clears scrubbing again.
+        a.focus = PanelId::Shell;
+        typ(&mut a, "run op");
+        key(&mut a, KeyCode::Enter);
+        assert!(
+            !a.is_scrubbing(),
+            "a command returns the overlay to the op-point"
+        );
+    }
+
+    /// An idle screen animates nothing and does not churn: ticking it leaves the
+    /// rendered frame byte-identical, so the diffing run loop never repaints
+    /// (`CP-UX-M8.1`).
+    #[test]
+    fn idle_screen_does_not_animate_or_churn() {
+        let mut a = app();
+        assert!(
+            !a.is_animating(),
+            "an idle (overlay-off) screen animates nothing"
+        );
+        let before = a.render(80, 24);
+        a.tick();
+        a.tick();
+        let after = a.render(80, 24);
+        assert_eq!(
+            before, after,
+            "ticking an idle screen must not change the frame"
+        );
+    }
+
+    /// A playing transient playback animates (so the loop drives ticks); a paused
+    /// one does not.
+    #[test]
+    fn playing_playback_is_the_only_reason_an_empty_circuit_animates() {
+        let mut a = App::new(PlayBackend::new());
+        a.focus = PanelId::Shell;
+        typ(&mut a, "run");
+        key(&mut a, KeyCode::Enter);
+        assert!(
+            !a.is_animating(),
+            "a freshly loaded, paused playback is idle"
+        );
+        a.play();
+        assert!(a.is_animating(), "a playing playback animates");
+        a.pause();
+        assert!(!a.is_animating(), "pausing stops the animation");
+    }
+
+    /// Gate: the scope renders within an 80×24 pane without clipping its x-axis.
+    /// The transient is re-plotted at the live pane size, so the axis rule and the
+    /// time-range labels are present even though the shell first rendered at a
+    /// fixed size (`CP-UX-M8.1`).
+    #[test]
+    fn scope_renders_within_an_80x24_pane_without_clipping_the_axis() {
+        let mut a = App::new(PlayBackend::new());
+        a.focus = PanelId::Shell;
+        typ(&mut a, "run tran 3m");
+        key(&mut a, KeyCode::Enter);
+        // Find the scope pane rect and pull just its rows out of the frame.
+        let (w, h) = (80, 24);
+        let scope_rect = a
+            .geometry(w, h)
+            .into_iter()
+            .find(|(id, _)| *id == PanelId::Scope)
+            .unwrap()
+            .1;
+        let frame = a.render(w, h);
+        let rows: Vec<&str> = frame.lines().collect();
+        let scope_text: String = rows[scope_rect.y..scope_rect.y + scope_rect.h].join("\n");
+        // The x-axis rule and a time-range label both survive inside the pane.
+        assert!(
+            scope_text.contains('\u{2514}'),
+            "the scope keeps its x-axis rule in an 80x24 pane:\n{scope_text}"
+        );
+        assert!(
+            scope_text.contains('\u{2524}'),
+            "the scope keeps its y-axis:\n{scope_text}"
+        );
+        // A braille trace was drawn (the plot has real height, not clipped away).
+        assert!(
+            scope_text
+                .chars()
+                .any(|c| ('\u{2801}'..='\u{28FF}').contains(&c)),
+            "the waveform drew braille dots inside the pane:\n{scope_text}"
+        );
+    }
+
+    /// Edit-mode chrome takes precedence over the overlay: with the overlay toggled
+    /// on, entering edit mode still shows the selection marker and the edit hint
+    /// (`CP-UX-M8.1`).
+    #[test]
+    fn edit_chrome_shows_even_when_overlay_is_on() {
+        let mut a = app();
+        a.overlay = true;
+        a.focus = PanelId::Schematic;
+        key(&mut a, KeyCode::Char('e')); // enter edit mode
+        assert!(a.edit_mode(), "edit mode is active");
+        let frame = a.render(80, 24);
+        assert!(
+            frame.contains("[edit]"),
+            "the schematic pane shows the edit title over the overlay:\n{frame}"
+        );
+        assert!(
+            frame.contains("[a]dd") || frame.contains('\u{25b8}'),
+            "the edit hint / selection marker is visible:\n{frame}"
+        );
+    }
+
+    /// A click on an open palette interacts with it (runs the clicked command)
+    /// rather than falling through to the pane behind; a click outside dismisses it
+    /// (`CP-UX-M8.1`).
+    #[test]
+    fn palette_click_selects_and_dismisses() {
+        let (w, h) = (80, 24);
+        let mut a = app();
+        a.set_size(w, h);
+        a.open_palette(); // query empty → every command matches, in list order
+        let rect = a.palette_rect(w, h);
+        // The first match row sits two rows below the box top (border + query line).
+        // COMMANDS[0] is "focus schematic".
+        let click_row = rect.y + 2;
+        let click_col = rect.x + 3;
+        a.handle_event(AppEvent::Mouse(MouseEvent {
+            kind: MouseKind::Down,
+            col: click_col,
+            row: click_row,
+        }));
+        assert!(
+            !a.palette_open(),
+            "clicking a command row runs it and closes the palette"
+        );
+        assert_eq!(
+            a.focus(),
+            PanelId::Schematic,
+            "the clicked command took effect"
+        );
+
+        // A click well outside the box just dismisses the palette.
+        a.open_palette();
+        a.handle_event(AppEvent::Mouse(MouseEvent {
+            kind: MouseKind::Down,
+            col: 0,
+            row: h - 1,
+        }));
+        assert!(
+            !a.palette_open(),
+            "a click outside the box dismisses the palette"
+        );
+    }
+
+    /// The shell prompt draws an input caret while the shell holds focus.
+    #[test]
+    fn shell_prompt_has_an_input_caret_when_focused() {
+        let mut a = app();
+        a.focus = PanelId::Shell;
+        typ(&mut a, "add R2");
+        let frame = a.render(80, 24);
+        assert!(
+            frame.contains("> add R2\u{258f}"),
+            "the caret follows the typed input:\n{frame}"
         );
     }
 }

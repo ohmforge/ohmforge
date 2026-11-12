@@ -103,27 +103,24 @@ pub fn magnitude_spectrum(sig: &Signal, window: Window) -> Signal {
         (Domain::Time, SignalData::Real(y)) if y.len() >= 2 => y,
         _ => return empty(),
     };
-    let n0 = y.len();
 
-    // Sample period from the average spacing of the time axis (uniform grid
-    // assumed); fall back to 1 s so a malformed axis still yields a usable grid.
-    let dt = if sig.x.len() >= 2 {
-        let span = sig.x[sig.x.len() - 1] - sig.x[0];
-        let d = span / (sig.x.len() - 1) as f64;
-        if d.is_finite() && d > 0.0 {
-            d
-        } else {
-            1.0
-        }
-    } else {
-        1.0
+    // The adaptive transient emits a *non-uniform* time axis, but the radix-2 FFT
+    // (and its single `dt`) assume uniform spacing — a mean-`dt` shortcut smears
+    // the frequency axis. If the grid is non-uniform, resample the series onto a
+    // uniform grid of the same length by linear interpolation first; a uniform
+    // grid passes through unchanged. A degenerate/zero-span axis falls back to a
+    // 1 s period so a malformed input still yields a usable (if nominal) grid.
+    let (samples, dt) = match uniform_resample(&sig.x, y) {
+        Some((ys, dt)) => (ys, dt),
+        None => (y.clone(), 1.0),
     };
+    let n0 = samples.len();
     let fs = 1.0 / dt;
 
     let n = n0.next_power_of_two();
     let mut buf = vec![Complex::ZERO; n];
     for (i, slot) in buf.iter_mut().enumerate().take(n0) {
-        *slot = Complex::new(y[i] * window.weight(i, n0), 0.0);
+        *slot = Complex::new(samples[i] * window.weight(i, n0), 0.0);
     }
     fft(&mut buf);
 
@@ -132,6 +129,58 @@ pub fn magnitude_spectrum(sig: &Signal, window: Window) -> Signal {
     let freqs: Vec<f64> = (0..=half).map(|k| k as f64 * fs / n as f64).collect();
     let spec: Vec<Complex> = buf[0..=half].to_vec();
     Signal::freq(name, sig.unit, freqs, spec)
+}
+
+/// Resample a real series sampled at times `x` onto a **uniform** grid of the
+/// same length spanning `[x[0], x[last]]`, returning the resampled samples and
+/// the uniform sample period `dt`. Linear interpolation; `x` is assumed
+/// non-decreasing (a time axis). Returns `None` for a mismatched-length,
+/// too-short, or zero/non-finite-span axis so the caller can fall back.
+///
+/// An already-uniform grid is detected (every interval within a relative
+/// tolerance of the mean) and passed through unchanged, so a fixed-step
+/// transient keeps bit-for-bit the samples it had before (`CP-UX-M8.3`).
+fn uniform_resample(x: &[f64], y: &[f64]) -> Option<(Vec<f64>, f64)> {
+    let n = y.len();
+    if n < 2 || x.len() != n {
+        return None;
+    }
+    let span = x[n - 1] - x[0];
+    if !span.is_finite() || span <= 0.0 {
+        return None;
+    }
+    let dt = span / (n - 1) as f64;
+
+    // Uniform already? Then return the samples untouched (no interpolation error).
+    let tol = dt.abs() * 1e-9;
+    let uniform = (1..n).all(|i| {
+        let d = x[i] - x[i - 1];
+        d.is_finite() && (d - dt).abs() <= tol
+    });
+    if uniform {
+        return Some((y.to_vec(), dt));
+    }
+
+    // Linear-interpolate onto t_j = x[0] + j·dt. `seg` walks forward so the whole
+    // resample is O(n).
+    let mut out = Vec::with_capacity(n);
+    let mut seg = 0usize;
+    for j in 0..n {
+        let t = x[0] + j as f64 * dt;
+        while seg + 1 < n - 1 && x[seg + 1] < t {
+            seg += 1;
+        }
+        let (x0, x1) = (x[seg], x[seg + 1]);
+        let (y0, y1) = (y[seg], y[seg + 1]);
+        let dx = x1 - x0;
+        let v = if dx.abs() > f64::EPSILON {
+            y0 + (y1 - y0) * ((t - x0) / dx)
+        } else {
+            y0
+        };
+        out.push(v);
+    }
+    Some((out, dt))
 }
 
 /// The frequency (Hz) and magnitude (dB) of the strongest spectral bin.
@@ -310,6 +359,39 @@ mod tests {
             bad.x.contains(&f),
             "peak frequency must come from the x axis, got {f}"
         );
+    }
+
+    /// Regression (`CP-UX-M8.3`): a tone sampled on a **non-uniform** time axis
+    /// (as the adaptive transient emits) must still peak at its true frequency.
+    /// Treating the samples as uniform (the old mean-`dt` shortcut) turns a pure
+    /// tone into a chirp and smears/moves the peak; resampling onto a uniform grid
+    /// first recovers it.
+    #[test]
+    fn non_uniform_grid_is_resampled_and_peaks_at_the_true_tone() {
+        let (f0, n) = (5.0, 64usize);
+        // Quadratically-clustered time axis over [0, 1] s — strongly non-uniform.
+        let x: Vec<f64> = (0..n)
+            .map(|j| {
+                let u = j as f64 / (n - 1) as f64;
+                u * u
+            })
+            .collect();
+        let y: Vec<f64> = x.iter().map(|&t| (TAU * f0 * t).sin()).collect();
+        let sig = Signal::time("v(in)", Unit::Volt, x.clone(), y.clone());
+
+        let spec = magnitude_spectrum(&sig, Window::Hann);
+        let (pf, _) = peak_bin(&spec).expect("a peak");
+        // Bin spacing here is fs/N ≈ 0.98 Hz; the resampled peak lands within a bin.
+        assert!(
+            (pf - f0).abs() < 1.5,
+            "resampled peak {pf} Hz should be near {f0} Hz"
+        );
+
+        // Guard that this input really is non-uniform (else the test is vacuous):
+        // the first and last intervals differ by well over the detection tolerance.
+        let first = x[1] - x[0];
+        let last = x[n - 1] - x[n - 2];
+        assert!(last > 3.0 * first, "the grid must be non-uniform");
     }
 
     #[test]

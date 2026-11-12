@@ -51,36 +51,63 @@ pub fn run<B: Backend>(backend: B) -> io::Result<()> {
     result
 }
 
-/// How long a frame waits for input before redrawing to advance the animation.
+/// How long a frame waits for input while something is animating, before ticking.
 const FRAME: Duration = Duration::from_millis(120);
 
-/// The draw/read loop: draw the frame, then either handle an input event or, when
-/// the frame times out with none, advance the current-flow animation one tick.
+/// How long to block for input when nothing is animating. Long enough that an idle
+/// screen never repaints on a timer (no flicker/churn), short enough that a resize
+/// or a stray event is still picked up promptly.
+const IDLE: Duration = Duration::from_millis(1000);
+
+/// The draw/read loop.
+///
+/// The frame is **diffed against the last one and only repainted when it changes**,
+/// so an idle screen never flickers; and the animation [`tick`](App::tick) only
+/// fires while [`App::is_animating`] is true, so an idle, zero-current circuit does
+/// not churn (`CP-UX-M8.1`). A size change forces a full clear + repaint so a
+/// resize stays correct.
 fn event_loop<B: Backend>(app: &mut App<B>, out: &mut impl Write) -> io::Result<()> {
+    let mut last_frame: Option<String> = None;
+    let mut last_size: Option<(usize, usize)> = None;
     loop {
         let (cols, rows) = crossterm::terminal::size()?;
         let (w, h) = (cols as usize, rows as usize);
         app.set_size(w, h);
-        draw(out, &app.render(w, h))?;
+
+        let resized = last_size != Some((w, h));
+        let frame = app.render(w, h);
+        if resized || last_frame.as_deref() != Some(frame.as_str()) {
+            draw(out, &frame, resized)?;
+            last_frame = Some(frame);
+            last_size = Some((w, h));
+        }
 
         if app.should_quit() {
             return Ok(());
         }
 
-        if event::poll(FRAME)? {
+        // Only wait on the animation cadence while something actually animates;
+        // otherwise block (for up to `IDLE`) purely for input, and do not tick.
+        let animating = app.is_animating();
+        let timeout = if animating { FRAME } else { IDLE };
+        if event::poll(timeout)? {
             if let Some(event) = map_event(event::read()?, w, h) {
                 app.handle_event(event);
             }
-        } else {
-            // No input this frame — march the flow arrows.
+        } else if animating {
+            // No input this frame — march the flow arrows / playhead.
             app.tick();
         }
     }
 }
 
-/// Paint a rendered frame to the alternate screen.
-fn draw(out: &mut impl Write, frame: &str) -> io::Result<()> {
-    queue!(out, cursor::MoveTo(0, 0), Clear(ClearType::All))?;
+/// Paint a rendered frame to the alternate screen. Clears the whole screen only on
+/// a resize (`full`); otherwise it overwrites every cell in place — each frame line
+/// is a full-width row — so no per-frame `Clear(All)` flicker is introduced.
+fn draw(out: &mut impl Write, frame: &str, full: bool) -> io::Result<()> {
+    if full {
+        queue!(out, Clear(ClearType::All))?;
+    }
     for (row, line) in frame.lines().enumerate() {
         queue!(out, cursor::MoveTo(0, row as u16))?;
         out.write_all(line.as_bytes())?;
