@@ -8,7 +8,8 @@
 //! Planned cores (docs/ROADMAP.md):
 //! - `avr`     — ATmega328P (Arduino Uno/Nano), ATmega2560, ATtiny  (M1/M2)
 //! - `cortexm` — RP2040 (Raspberry Pi Pico), STM32-class            (M2/M3)
-//! - `riscv`   — RV32I(MC) for ESP32-class                          (M3)
+//! - `xtensa`  — ESP32 (Xtensa LX6)                                 (M7)
+//! - `riscv`   — RV32I(MC) for ESP32-C-class                        (later)
 //!
 //! The cores are **pure computation** — no wall-clock, no randomness, no I/O —
 //! so a run is deterministic and the crate builds for `wasm32-unknown-unknown`.
@@ -19,6 +20,7 @@ pub mod avr;
 pub mod boundary;
 pub mod cortexm;
 pub mod pin;
+pub mod xtensa;
 
 /// External-toolchain compile orchestration (`.ino`/`.c` → HEX → emulator).
 ///
