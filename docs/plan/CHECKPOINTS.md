@@ -160,7 +160,6 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 
 | Track | Done | In progress | Total |
 |---|---|---|---|
-<<<<<<< HEAD
 | sim-core | 23 | 0 | 23 |
 | boards | 16 | 0 | 16 |
 | ui-shell | 17 | 0 | 17 |
@@ -168,15 +167,6 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 | platform | 6 | 0 | 7 |
 | web | 5 | 0 | 5 |
 | **Total** | **83** | **0** | **84** |
-=======
-| sim-core | 23 | 0 | 23 |
-| boards | 15 | 1 | 16 |
-| ui-shell | 16 | 1 | 17 |
-| ai-fmt | 14 | 2 | 16 |
-| platform | 6 | 1 | 7 |
-| web | 4 | 1 | 5 |
-| **Total** | **78** | **6** | **84** |
->>>>>>> track/sim-core
 
 _**67/67 — M0 through M4 all complete** (M0–M3 tagged v0.1.0; M4 adds the rest). M4 delivered the **plugin device-model API** + an **instrument/block plugin trait**, a **KLU-class ordered/reusable sparse solver** and **multithreaded analyses**, a **Cortex-M3/M4 (Thumb-2)** core with an STM32 board, **SPICE `.model` import** + a vendor model library, and **shareable circuit links** in the browser. Deferred by design: real-time collaboration, the QEMU full-SBC bridge, and full vendor-SPICE `.model` fidelity — the standing M-next horizon._
 
