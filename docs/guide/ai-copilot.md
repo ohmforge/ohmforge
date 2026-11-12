@@ -28,11 +28,13 @@ pub trait Transport {
 * **`MockTransport`** is handed a queue of canned `ModelResponse`s; each `send`
   pops the next and records the request, so a test both drives a multi-turn tool
   loop and asserts on exactly what the client sent. Every example below uses it.
-* **`HttpTransport`** (behind the `http` feature) is the real Anthropic path. It
-  is a std-only **stub today** — it compiles and reads the key from the
-  environment but returns a clear error if asked to send; the TLS/async stack
-  lands with the UI. The default build pulls in no third-party crates and
-  compiles for `wasm32`.
+* **`HttpTransport`** (behind the `http` feature) is the real Anthropic path. On
+  **native** it is **live**: a `reqwest` blocking client (rustls, so no
+  OpenSSL/system-TLS dependency) that reads the key from the environment, POSTs
+  the Messages request with a bounded request + connect timeout, and parses the
+  JSON response back — proven by `tests/http_transport.rs`. Only the **`wasm32`
+  `fetch`** path is still a documented TODO stub. With the feature **off** (the
+  default) the crate pulls in no third-party crates and compiles for `wasm32`.
 
 `Client::run` drives the Messages-API tool loop to completion: send → if the
 model asks for tools, run each through the caller's `ToolHandler` and feed the

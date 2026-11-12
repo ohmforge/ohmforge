@@ -176,8 +176,16 @@ pub mod drc {
         out
     }
 
-    /// Build net adjacency (each part bridges all its terminal nets) and BFS from
-    /// ground; any net present in the circuit but unreached has no path to ground.
+    /// Build net adjacency and BFS from ground; any net present in the circuit
+    /// but unreached has no *DC-conductive* path to ground.
+    ///
+    /// A part bridges all its terminal nets **only if it conducts DC**: a
+    /// [`Capacitor`](PartKind::Capacitor) is a DC open, so it carries no steady
+    /// current and must not bridge its nodes — a node reachable only through a
+    /// capacitor (an AC-coupled / capacitive-divider subnode) is correctly left
+    /// unreached. An [`Inductor`](PartKind::Inductor) is a DC short and every
+    /// other part conducts, so they bridge as before. The capacitor's nets are
+    /// still recorded in `all`, so such a node is reported, not silently dropped.
     fn no_path_to_ground(circuit: &Circuit) -> Vec<Finding> {
         let mut adj: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
         let mut all: BTreeSet<u32> = BTreeSet::new();
@@ -186,6 +194,11 @@ pub mod drc {
             let nets: Vec<u32> = part.terminals.iter().map(|&t| res(circuit, t)).collect();
             for &n in &nets {
                 all.insert(n);
+            }
+            // A capacitor is a DC open: its nodes exist but it conducts no steady
+            // current, so it must not bridge them in the path-to-ground graph.
+            if matches!(part.kind, PartKind::Capacitor) {
+                continue;
             }
             for (i, &a) in nets.iter().enumerate() {
                 for &b in &nets[i + 1..] {
@@ -221,28 +234,48 @@ pub mod drc {
             .collect()
     }
 
-    /// A diode with no current-limiting resistor sharing either of its nodes is
-    /// an LED about to let out its magic smoke — flag it.
+    /// A diode with no current-limiting resistor on its **conduction path** is an
+    /// LED about to let out its magic smoke — flag it.
+    ///
+    /// The resistor must be *in series* with the diode, which means two things a
+    /// naive "shares any net with a resistor" proxy gets wrong:
+    ///
+    /// * **Ground is not a series connection.** Nearly every resistor and LED
+    ///   touch [`GROUND`](NetId::GROUND), so a shared-ground proxy clears almost
+    ///   every LED. We require the resistor to meet the LED on one of its
+    ///   **non-ground** nodes.
+    /// * **A parallel resistor limits nothing.** A resistor across *both* of the
+    ///   LED's nodes shares its non-ground node but does not sit in the
+    ///   conduction path, so it must not clear the rule.
     fn led_without_series_resistor(circuit: &Circuit) -> Vec<Finding> {
-        // Nets that have a resistor attached.
-        let mut resistor_nets: BTreeSet<u32> = BTreeSet::new();
-        for part in circuit.parts() {
-            if matches!(part.kind, PartKind::Resistor) {
-                for &t in &part.terminals {
-                    resistor_nets.insert(res(circuit, t));
-                }
-            }
-        }
+        // Each resistor's resolved net set, so we can tell a series resistor
+        // (shares one non-ground node) from a parallel one (shares both nodes).
+        let resistor_net_sets: Vec<BTreeSet<u32>> = circuit
+            .parts()
+            .iter()
+            .filter(|p| matches!(p.kind, PartKind::Resistor))
+            .map(|p| p.terminals.iter().map(|&t| res(circuit, t)).collect())
+            .collect();
 
         let mut out = Vec::new();
         for part in circuit.parts() {
             if !matches!(part.kind, PartKind::Diode(_)) {
                 continue;
             }
-            let has_series_r = part
-                .terminals
+            let diode_nets: BTreeSet<u32> =
+                part.terminals.iter().map(|&t| res(circuit, t)).collect();
+            // A current-limiting resistor must reach a *non-ground* diode node …
+            let non_ground: Vec<u32> = diode_nets
                 .iter()
-                .any(|&t| resistor_nets.contains(&res(circuit, t)));
+                .copied()
+                .filter(|&n| n != NetId::GROUND.0)
+                .collect();
+            let has_series_r = resistor_net_sets.iter().any(|r_nets| {
+                // … and must not merely bridge BOTH diode nodes (that is a
+                // parallel resistor, which limits no current).
+                let is_parallel = diode_nets.iter().all(|n| r_nets.contains(n));
+                !is_parallel && non_ground.iter().any(|n| r_nets.contains(n))
+            });
             if !has_series_r {
                 out.push(Finding {
                     rule: Rule::LedNoSeriesResistor,
@@ -700,6 +733,108 @@ mod tests {
                 .any(|f| f.rule == Rule::LedNoSeriesResistor),
             "{:?}",
             check(&good)
+        );
+    }
+
+    /// An unprotected LED is still flagged when some *other* resistor merely
+    /// shares the ground net with it. Before the fix, `GROUND` was in the
+    /// resistor-net proxy and almost every LED touches ground, so the rule nearly
+    /// never fired; now the resistor must meet the LED on a non-ground node.
+    #[test]
+    fn led_without_series_resistor_is_flagged_over_a_shared_ground() {
+        let mut c = Circuit::new("shared ground");
+        let n = c.new_net();
+        let n2 = c.new_net();
+        // Branch A: a bare LED straight across the 5 V rail — no series resistor.
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            Some(Value::new(5.0, Unit::Volt)),
+            vec![n, NetId::GROUND],
+        );
+        c.add_part(
+            "D1",
+            PartKind::Diode(DiodeModel::default()),
+            None,
+            vec![n, NetId::GROUND],
+        );
+        // Branch B: a resistor on a galvanically separate node — it shares ONLY
+        // ground with the LED, so it does not limit the LED's current.
+        c.add_part(
+            "V2",
+            PartKind::VoltageSource,
+            Some(Value::new(5.0, Unit::Volt)),
+            vec![n2, NetId::GROUND],
+        );
+        c.add_part("R1", PartKind::Resistor, r(1000.0), vec![n2, NetId::GROUND]);
+
+        let fs = check(&c);
+        assert!(
+            fs.iter()
+                .any(|f| f.rule == Rule::LedNoSeriesResistor && f.refs == vec!["D1"]),
+            "the LED sharing only ground with R1 must still be flagged: {fs:?}"
+        );
+    }
+
+    /// A resistor merely *parallel* to the LED (across both its nodes) does not
+    /// limit series current, so it must NOT clear the rule.
+    #[test]
+    fn parallel_resistor_does_not_clear_the_led_rule() {
+        let mut c = Circuit::new("parallel R");
+        let n = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            Some(Value::new(5.0, Unit::Volt)),
+            vec![n, NetId::GROUND],
+        );
+        c.add_part(
+            "D1",
+            PartKind::Diode(DiodeModel::default()),
+            None,
+            vec![n, NetId::GROUND],
+        );
+        // R1 sits directly across the LED's two nodes — parallel, not in series.
+        c.add_part("R1", PartKind::Resistor, r(1000.0), vec![n, NetId::GROUND]);
+
+        let fs = check(&c);
+        assert!(
+            fs.iter()
+                .any(|f| f.rule == Rule::LedNoSeriesResistor && f.refs == vec!["D1"]),
+            "a parallel-only resistor must not clear the LED rule: {fs:?}"
+        );
+    }
+
+    /// A node reachable from ground only through a capacitor has no DC-conductive
+    /// path to ground (a capacitor is a DC open), so it is flagged — and it is not
+    /// a floating node, since it carries two pins.
+    #[test]
+    fn node_grounded_only_through_a_capacitor_is_floating() {
+        let mut c = Circuit::new("ac-coupled");
+        let n_in = c.new_net();
+        let mid = c.new_net();
+        // V1 grounds `in`; `mid` reaches the rest of the circuit only through
+        // capacitors (C1 to `in`, C2 to ground) — both DC-open.
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            Some(Value::new(5.0, Unit::Volt)),
+            vec![n_in, NetId::GROUND],
+        );
+        c.add_part("C1", PartKind::Capacitor, None, vec![n_in, mid]);
+        c.add_part("C2", PartKind::Capacitor, None, vec![mid, NetId::GROUND]);
+
+        let fs = check(&c);
+        // `mid` has no DC path to ground.
+        assert_eq!(
+            fs.iter().filter(|f| f.rule == Rule::NoPathToGround).count(),
+            1,
+            "only the capacitively-isolated node lacks a DC path to ground: {fs:?}"
+        );
+        // …and it is not mistaken for a dangling single-pin stub.
+        assert!(
+            !fs.iter().any(|f| f.rule == Rule::FloatingNode),
+            "the two-pin capacitive subnode is not a floating node: {fs:?}"
         );
     }
 
