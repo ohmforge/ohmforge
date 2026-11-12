@@ -3,11 +3,11 @@
 M0–M2 (+ the M3 interop items KiCad/BOM and offline mode) are complete — 52 ledger checkpoints, 427 tests. M3 is the **"make-anything" breadth phase** plus the deferred **browser front end**. Two concurrent streams:
 
 - **Workstream — M3 breadth:** the LabVIEW-style dataflow patcher, HDL-lite, custom boards + drop-in modules, behavioral sources + richer device models, and a tutor/lessons system. Fanned out across the four tracks (same low-conflict worktree rhythm as M1/M2).
-- **Webstream — WASM front end:** the already-wasm-clean compute core, driven from a browser page. A single focused effort in a new `ee-web` crate on a new `track/web` worktree.
+- **Webstream — WASM front end:** the already-wasm-clean compute core, driven from a browser page. A single focused effort in a new `ohmforge-web` crate on a new `track/web` worktree.
 
 Then **polish & ship**: close the documented follow-ups, round out examples + README, keep everything green, tag a release.
 
-This is breadth, not risky-core, so there's no single keystone to retire first — the streams are largely independent. The one hard constraint is the webstream must **not break the host workspace build** (wasm-only deps gated to `wasm32` or `ee-web` excluded from the default members), so `cargo build/clippy/test --workspace` stays green on the host.
+This is breadth, not risky-core, so there's no single keystone to retire first — the streams are largely independent. The one hard constraint is the webstream must **not break the host workspace build** (wasm-only deps gated to `wasm32` or `ohmforge-web` excluded from the default members), so `cargo build/clippy/test --workspace` stays green on the host.
 
 ---
 
@@ -22,7 +22,7 @@ This is breadth, not risky-core, so there's no single keystone to retire first �
 - **CP-AF-M3.4** (ai-fmt) — Fritzing-style export (and round out BOM/interop). *Gate:* export produces a well-formed artifact for a known circuit.
 
 ### Webstream — WASM
-- **CP-WEB.1** (web) — a new `ee-web` crate: `wasm-bindgen` bindings exposing the engine (build a circuit / parse a netlist → run op/transient → get a `Signal`), plus a minimal `index.html` + JS shell that runs a sim in the browser and renders the result (canvas or DOM). *Gate:* `wasm-pack`/`cargo build --target wasm32-unknown-unknown -p ee-web` produces a module; a headless-or-documented check runs a sim through the bindings; **host `cargo build/clippy/test --workspace` stays green** (wasm-only deps gated).
+- **CP-WEB.1** (web) — a new `ohmforge-web` crate: `wasm-bindgen` bindings exposing the engine (build a circuit / parse a netlist → run op/transient → get a `Signal`), plus a minimal `index.html` + JS shell that runs a sim in the browser and renders the result (canvas or DOM). *Gate:* `wasm-pack`/`cargo build --target wasm32-unknown-unknown -p ohmforge-web` produces a module; a headless-or-documented check runs a sim through the bindings; **host `cargo build/clippy/test --workspace` stays green** (wasm-only deps gated).
 
 ### Polish & ship
 - **CP-SHIP.1** (platform) — close documented follow-ups where cheap (SPICE diode/transistor export, waveform-source round-trip), expand `examples/` + README/demo, run the full CI-parity sweep, and tag a release (MIT OR Apache-2.0). *Gate:* a clean release checklist; everything green.

@@ -1,18 +1,18 @@
 # How the simulation engine works
 
-This is a tour of `ee-sim`, the analog / mixed-signal core of `ee-assist` — what
+This is a tour of `ohmforge-sim`, the analog / mixed-signal core of `ohmforge` — what
 happens between handing it a circuit and getting back a set of waveforms. It is
 written for a curious user who wants to understand the machinery, not just drive
 it. Worked, runnable circuits live in [`examples/analog/`](../../examples/analog/).
 
-The engine takes an [`ee_core::Circuit`], an [`Analysis`] describing what to
-measure, and returns one [`ee_core::Signal`] per node (a named, unit-carrying
+The engine takes an [`ohmforge_core::Circuit`], an [`Analysis`] describing what to
+measure, and returns one [`ohmforge_core::Signal`] per node (a named, unit-carrying
 waveform). It is pure compute: no clock, no filesystem, no unseeded randomness,
 and `wasm32`-clean — the same solver runs in the TUI, headless, and in the
 browser, and the same inputs always give the same outputs.
 
 ```rust
-use ee_sim::{Analysis, Engine};
+use ohmforge_sim::{Analysis, Engine};
 let signals = Engine::new().run(&circuit, &Analysis::OperatingPoint)?;
 ```
 
@@ -27,9 +27,9 @@ representative, with ground kept as the representative of whatever it touches.
 Raw ids stay stable for the UI; the solver only ever sees resolved nets.
 
 Each part carries a kind (`R`, `C`, `L`, voltage/current source, diode, BJT,
-MOSFET, the four controlled sources), an optional [`ee_core::Value`] (an
-engineering-notation magnitude plus a [`ee_core::Unit`] — `4k7` → 4700 Ω), its
-terminal nets, and, for sources, a time [`ee_core::Waveform`] (DC, sine, or
+MOSFET, the four controlled sources), an optional [`ohmforge_core::Value`] (an
+engineering-notation magnitude plus a [`ohmforge_core::Unit`] — `4k7` → 4700 Ω), its
+terminal nets, and, for sources, a time [`ohmforge_core::Waveform`] (DC, sine, or
 pulse).
 
 Results come back as `Signal`s — a real-valued buffer for time-domain and DC
@@ -93,7 +93,7 @@ pivot is below `1e-15` the matrix is singular (a floating node or no path to
 ground) and the solve returns `SimError::Singular` rather than NaNs.
 
 AC analysis uses a complex twin, `mna_complex::ComplexSystem` — the same
-elimination over `ee_core::Complex`, pivoting on complex magnitude. `Complex` is
+elimination over `ohmforge_core::Complex`, pivoting on complex magnitude. `Complex` is
 hand-rolled (no `num-complex` dependency) so the compute core stays dependency-free.
 
 A dense solve is `O(n³)`; it is correct and clear for the circuit sizes here. A
@@ -233,7 +233,7 @@ conductance at the bias. The stimulus is a `1∠0` phasor on every source marked
 an AC drive (a source carrying a sine waveform); all other sources are quiet (a
 voltage source is a short, a current source an open). Returns one complex signal
 per node — the node-voltage phasor versus frequency, from which magnitude (dB) and
-phase follow. (Try `cargo run -p ee bode`.)
+phase follow. (Try `cargo run -p ohmforge bode`.)
 
 ### Noise — [`Analysis::Noise { output, f_start, f_stop, points_per_decade }`]
 

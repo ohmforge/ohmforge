@@ -1,4 +1,4 @@
-# ee-assist task runner. `just` -> lists tasks. Install: cargo install just
+# ohmforge task runner. `just` -> lists tasks. Install: cargo install just
 # These mirror CI so "green locally" == "green in CI".
 
 set shell := ["bash", "-uc"]
@@ -27,7 +27,7 @@ clippy:
 test:
     cargo test --workspace --all-features
 
-# Test a single crate, e.g. `just test-one ee-core`.
+# Test a single crate, e.g. `just test-one ohmforge-core`.
 test-one crate:
     cargo test -p {{crate}}
 
@@ -37,7 +37,7 @@ doc:
 
 # Confirm the compute core still compiles to WASM (no I/O leak).
 wasm:
-    cargo check -p ee-core -p ee-sim --target wasm32-unknown-unknown
+    cargo check -p ohmforge-core -p ohmforge-sim --target wasm32-unknown-unknown
 
 # Run benchmarks (criterion).
 bench:
@@ -45,7 +45,7 @@ bench:
 
 # Run the app.
 run *ARGS:
-    cargo run -p ee -- {{ARGS}}
+    cargo run -p ohmforge -- {{ARGS}}
 
 # Verify against the MSRV toolchain (needs `rustup toolchain add 1.79.0`).
 msrv:
@@ -53,12 +53,12 @@ msrv:
 
 # --- Worktree helpers (see DEVELOPMENT.md) ---------------------------------
 
-# Create the per-track worktrees under ../ee-assist-worktrees/.
+# Create the per-track worktrees under ../ohmforge-worktrees/.
 worktrees-init:
     #!/usr/bin/env bash
     set -euo pipefail
     for track in sim-core boards ui-shell ai-fmt; do
-        dir="../ee-assist-worktrees/$track"
+        dir="../ohmforge-worktrees/$track"
         if git show-ref --verify --quiet "refs/heads/track/$track"; then
             git worktree add "$dir" "track/$track" 2>/dev/null || echo "exists: $dir"
         else

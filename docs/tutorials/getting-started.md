@@ -7,17 +7,17 @@ checkpoints let you explore without fear.
 
 Everything here is real, verified output from the current build. The runnable
 scripts live in [`examples/tutorial/`](../../examples/tutorial); each command
-block was produced by piping the matching file through the `ee` binary.
+block was produced by piping the matching file through the `of` binary.
 
 ## Starting the shell
 
 Run the binary with no arguments for an interactive prompt:
 
 ```console
-$ cargo run -p ee
-ee> add R1 in out 1k
+$ cargo run -p ohmforge
+eesh> add R1 in out 1k
 added R1
-ee> help
+eesh> help
 ...
 ```
 
@@ -25,7 +25,7 @@ ee> help
 line in order, printing output to stdout:
 
 ```console
-$ cat examples/tutorial/divider.eesh | cargo run -p ee
+$ cat examples/tutorial/divider.eesh | cargo run -p ohmforge
 ```
 
 That is exactly how every transcript below was captured.
@@ -62,7 +62,7 @@ show
 ```
 
 ```console
-$ cat examples/tutorial/divider.eesh | cargo run -p ee
+$ cat examples/tutorial/divider.eesh | cargo run -p ohmforge
 added V1
 added R1
 added R2
@@ -106,7 +106,7 @@ show
 high-resolution **braille scope**:
 
 ```console
-$ cat examples/tutorial/rc_lowpass.eesh | cargo run -p ee
+$ cat examples/tutorial/rc_lowpass.eesh | cargo run -p ohmforge
 added V1
 added R1
 added C1
@@ -152,7 +152,7 @@ form it looks like this for the same kind of divider:
 ```
 
 Each part's nets are annotated with their node voltage; ground is always 0 V. In
-the live TUI (and in `ee amp`) the voltages are colour-coded by level — ground
+the live TUI (and in `of amp`) the voltages are colour-coded by level — ground
 dim, higher rails toward red — so a probe point that is not where you expect it
 jumps out. See [the view guide](../guide/view.md) for the interactive version.
 
@@ -178,7 +178,7 @@ show
 ```
 
 ```console
-$ cat examples/tutorial/checkpoints.eesh | cargo run -p ee
+$ cat examples/tutorial/checkpoints.eesh | cargo run -p ohmforge
 added V1
 added R1
 added C1
@@ -256,13 +256,13 @@ transcript — ideal for tutorials, regression tests, and bug reports.
 > **Note.** Loop/parameter scripts run through the scripting engine
 > (`Shell::run_script`). The plain command-only scripts above (`divider.eesh`,
 > `rc_lowpass.eesh`, `checkpoints.eesh`) also run line-by-line straight through
-> the `ee` binary's stdin; a `.eesh` file that uses `#` comments, `set`,
+> the `of` binary's stdin; a `.eesh` file that uses `#` comments, `set`,
 > `repeat`, or `$vars` needs the scripting engine. (A `source <file>` verb that
 > routes a piped file through the engine is on the roadmap.)
 
 ## Where to next
 
-- [`docs/guide/view.md`](../guide/view.md) — the interactive `ee tui` and the
+- [`docs/guide/view.md`](../guide/view.md) — the interactive `of tui` and the
   virtual instruments (scope trigger/cursors, DMM, funcgen, PSU, Bode/spectrum,
   logic analyzer + protocol decode) for *debugging* a circuit.
 - [`docs/SHELL.md`](../SHELL.md) — the full command-language reference.

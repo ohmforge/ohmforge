@@ -1,0 +1,27 @@
+[package]
+name = "ohmforge-shell"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+description = "eesh: the command language, parser, completion, history, and embedded scripting for automation."
+
+[lints]
+workspace = true
+
+[dependencies]
+ohmforge-core = { workspace = true }
+ohmforge-sim = { workspace = true }
+ohmforge-tui = { workspace = true }
+# ohmforge-instruments supplies the Bode widget for rendering `run ac`/`run tf` results
+# (CP-UX-M8.2). The arrow is acyclic: ohmforge-instruments depends only on ohmforge-core/ohmforge-sim.
+ohmforge-instruments = { workspace = true }
+# ohmforge-fmt supplies the native project text for the circuit half of a saved
+# session (CP-UX-M4.1). The arrow is acyclic: ohmforge-fmt depends only on ohmforge-core.
+ohmforge-fmt = { workspace = true }
+# rhai = { workspace = true }   # embedded scripting, added at M1

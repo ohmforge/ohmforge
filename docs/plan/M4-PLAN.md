@@ -4,14 +4,14 @@ M0–M3 are complete (60/60, v0.1.0). M4 is the roadmap's **vision** tier: scale
 
 Three roadmap M4 items are intentionally **deferred** (heaviest + fuzziest, poor cost/value right now): real-time **collaborative** sessions, the **QEMU full-SBC** Raspberry Pi bridge, and full vendor-SPICE `.model` fidelity. M4 here takes the tractable, high-value slice of each theme.
 
-No single keystone — the streams are independent. The one standing rule still holds: `ee-core`/`ee-sim` stay dependency-free + `wasm32`-clean + deterministic, so anything native-only (threads) is **feature-gated and off on wasm**, and parallel results must match single-threaded bit-for-bit.
+No single keystone — the streams are independent. The one standing rule still holds: `ohmforge-core`/`ohmforge-sim` stay dependency-free + `wasm32`-clean + deterministic, so anything native-only (threads) is **feature-gated and off on wasm**, and parallel results must match single-threaded bit-for-bit.
 
 ---
 
 ## Checkpoints (new)
 
 ### sim-core — scale + extensibility
-- **CP-SIM-M4.1** Plugin **device-model API**: make the nonlinear-device contract public and add a registry so an external crate can implement a device (its `evaluate`/Jacobian stamp) and have the engine run it. *Gate:* a custom device defined **outside** `ee-sim` (in the test) participates in a real solve and matches hand analysis. (The extensibility headline — boards/instruments/lessons plugin surfaces build on this pattern.)
+- **CP-SIM-M4.1** Plugin **device-model API**: make the nonlinear-device contract public and add a registry so an external crate can implement a device (its `evaluate`/Jacobian stamp) and have the engine run it. *Gate:* a custom device defined **outside** `ohmforge-sim` (in the test) participates in a real solve and matches hand analysis. (The extensibility headline — boards/instruments/lessons plugin surfaces build on this pattern.)
 - **CP-SIM-M4.2** KLU-class sparse: a fill-reducing ordering (approximate-minimum-degree-style) + reuse of the symbolic factorization across repeated solves (transient steps / sweep points). *Gate:* correctness vs the current solver (bit-for-bit or ~1e-12) + a bench showing improved scaling on a large (≈10k-node) net vs the M2 sparse path.
 - **CP-SIM-M4.3** Multithreaded analyses: parallelize **independent** runs (Monte-Carlo samples, DC/parametric sweep points) across threads, behind a native-only feature (no threads on wasm), **deterministic** (identical results to single-threaded). *Gate:* same results single- vs multi-threaded; a measured speedup.
 
@@ -25,12 +25,12 @@ No single keystone — the streams are independent. The one standing rule still 
 - **CP-UX-M4.1** Instrument/processing-block **plugin surface** + session export: a trait so external processing blocks/instruments slot into the patcher, and a session export (circuit + patches + probes) to a portable file that reloads identically. *Gate:* a custom block registered via the trait runs in a patch; a session round-trips (export→import identical).
 
 ### web — reach
-- **CP-WEB.2** Shareable / publishable circuit: encode a circuit (netlist) into a URL fragment the `ee-web` page loads on open, so a circuit is a link you can share — "open in a browser, poke it." *Gate:* encode→decode round-trip; the page loads a circuit from a URL fragment and simulates it.
+- **CP-WEB.2** Shareable / publishable circuit: encode a circuit (netlist) into a URL fragment the `ohmforge-web` page loads on open, so a circuit is a link you can share — "open in a browser, poke it." *Gate:* encode→decode round-trip; the page loads a circuit from a URL fragment and simulates it.
 
 ---
 
 ## Fan-out
-One agent per track + the web agent, concurrently (the proven worktree rhythm). Merge each as it lands (reconcile any public-API/trait changes), full gate sweep each time. M4's plugin APIs (CP-SIM-M4.1, CP-UX-M4.1) are the throughline — they turn ee-assist from "complete" into "extensible."
+One agent per track + the web agent, concurrently (the proven worktree rhythm). Merge each as it lands (reconcile any public-API/trait changes), full gate sweep each time. M4's plugin APIs (CP-SIM-M4.1, CP-UX-M4.1) are the throughline — they turn ohmforge from "complete" into "extensible."
 
 ## Deferred (documented, not this milestone)
 Real-time collaborative editing; the QEMU-hosted full-SBC Raspberry Pi bridge; full vendor-SPICE `.model` fidelity (beyond the parameter subset above). Each is a sizable standalone effort for a later milestone.

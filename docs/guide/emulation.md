@@ -1,9 +1,9 @@
 # Microcontroller emulation & co-simulation
 
-This guide explains how ee-assist runs **real microcontroller firmware against a
+This guide explains how ohmforge runs **real microcontroller firmware against a
 simulated circuit**: the two emulated cores (AVR and RP2040), their peripherals,
 how firmware is loaded, how an MCU pin is bridged to a circuit net, the
-mixed-signal boundary, and the lockstep co-simulation loop (`ee cosim`).
+mixed-signal boundary, and the lockstep co-simulation loop (`of cosim`).
 
 It is the user-facing companion to the architecture notes in
 [`../ARCHITECTURE.md`](../ARCHITECTURE.md) § "Board & MCU emulation" and the
@@ -12,11 +12,11 @@ here is demonstrated by the runnable examples under
 [`examples/mcu/`](../../examples/mcu/) — each command's output in this guide was
 produced by actually running it.
 
-The emulators live in the `ee-mcu` crate. They are **pure computation** — no
+The emulators live in the `ohmforge-mcu` crate. They are **pure computation** — no
 wall-clock, no randomness, no I/O — so a run is fully deterministic and the crate
-builds for `wasm32-unknown-unknown`. `ee-mcu` depends on `ee-core` and
-`ee-digital` but **not** on `ee-sim`: the analog solver and the MCU core are
-siblings, and the lockstep co-sim loop that joins them lives in the `ee` binary.
+builds for `wasm32-unknown-unknown`. `ohmforge-mcu` depends on `ohmforge-core` and
+`ohmforge-digital` but **not** on `ohmforge-sim`: the analog solver and the MCU core are
+siblings, and the lockstep co-sim loop that joins them lives in the `of` binary.
 
 ---
 
@@ -25,12 +25,12 @@ siblings, and the lockstep co-sim loop that joins them lives in the `ee` binary.
 Both cores are **instruction-accurate**: they execute whole instructions and
 track a cycle counter, so simulated time maps onto the instruction stream, but
 sub-instruction timing is not modelled. Both implement the shared
-[`McuCore`](../../crates/ee-mcu/src/lib.rs) trait (`step`, `step_to`,
+[`McuCore`](../../crates/ohmforge-mcu/src/lib.rs) trait (`step`, `step_to`,
 `load_firmware`, `pin_count`, `next_event`, `step_to_cycle`).
 
 ### AVR — ATmega328P (Arduino Uno / Nano)
 
-An 8-bit Harvard-architecture RISC core (`ee_mcu::avr`):
+An 8-bit Harvard-architecture RISC core (`ohmforge_mcu::avr`):
 
 - **Flash**: 16 K 16-bit words (32 KiB). The program counter is a **word** index.
 - **Data space** (byte-addressed, one flat space):
@@ -44,7 +44,7 @@ An 8-bit Harvard-architecture RISC core (`ee_mcu::avr`):
   `IN`/`OUT` address the I/O window via `addr + 0x20`. `SREG` (`0x5F`), `SPL`
   (`0x5D`) and `SPH` (`0x5E`) are kept as dedicated fields but are reachable at
   those data addresses.
-- **Status register** ([`Sreg`](../../crates/ee-mcu/src/avr/sreg.rs)): the eight
+- **Status register** ([`Sreg`](../../crates/ohmforge-mcu/src/avr/sreg.rs)): the eight
   flags `C Z N V S H T I`, packed LSB-first so `IN`/`OUT`/`PUSH`/`POP` of `SREG`
   round-trip exactly. The datasheet three-term carry/half-carry/overflow forms
   are implemented verbatim.
@@ -61,20 +61,20 @@ An 8-bit Harvard-architecture RISC core (`ee_mcu::avr`):
   `BRBS/BRBC` branch family, `CPSE`). The multiply family, `LPM`/`SPM`,
   `SLEEP`/`WDR`/`BREAK` and `EIJMP`/`EICALL` are not yet modelled and decode to
   `Instr::Unknown` (a no-op, with a debug assertion). See
-  [`avr/decode.rs`](../../crates/ee-mcu/src/avr/decode.rs) for the exact list.
+  [`avr/decode.rs`](../../crates/ohmforge-mcu/src/avr/decode.rs) for the exact list.
 
-The [`Uno`](../../crates/ee-mcu/src/avr/board.rs) board wraps the core at 16 MHz
+The [`Uno`](../../crates/ohmforge-mcu/src/avr/board.rs) board wraps the core at 16 MHz
 with the Arduino pin map.
 
 ### Cortex-M0+ — RP2040 (Raspberry Pi Pico)
 
-An ARMv6-M (Thumb) core (`ee_mcu::cortexm`):
+An ARMv6-M (Thumb) core (`ohmforge_mcu::cortexm`):
 
 - **Registers**: sixteen 32-bit registers, with `r13 = SP`, `r14 = LR`,
   `r15 = PC`. A read of `PC` yields the Thumb **PC value** (the current
   instruction's address + 4), so PC-relative loads and branches compute the
   right target; a write to `PC` branches (clearing the Thumb bit).
-- **Condition flags** ([`Apsr`](../../crates/ee-mcu/src/cortexm/core.rs)):
+- **Condition flags** ([`Apsr`](../../crates/ohmforge-mcu/src/cortexm/core.rs)):
   `N`/`Z`/`C`/`V`, packed into the top nibble of `xPSR` with the `T` bit set.
 - **Memory**: a flat, little-endian 256 KiB RAM mapped from address 0, plus the
   RP2040 **SIO** GPIO block decoded at `0xD000_0000`. Firmware and the reset
@@ -91,9 +91,9 @@ An ARMv6-M (Thumb) core (`ee_mcu::cortexm`):
   `STMIA`/`LDMIA`, `SXT*`/`UXT*`, `REV*`, `B`/`B<cond>`/`BL`/`BX`/`BLX`, `SVC`,
   and the hint space as `NOP`. `MRS`/`MSR`, the barriers, `CPS`, `BKPT`, `UDF`
   and `WFI`/`WFE` are not modelled (decode to `Instr::Unknown`). See
-  [`cortexm/decode.rs`](../../crates/ee-mcu/src/cortexm/decode.rs).
+  [`cortexm/decode.rs`](../../crates/ohmforge-mcu/src/cortexm/decode.rs).
 
-The [`Pico`](../../crates/ee-mcu/src/cortexm/board.rs) board wraps the core at
+The [`Pico`](../../crates/ohmforge-mcu/src/cortexm/board.rs) board wraps the core at
 the RP2040's 125 MHz default with the Pico pin map.
 
 ---
@@ -118,7 +118,7 @@ For tests and hand-assembled snippets the cores also expose `load_program`
 (`&[u16]` of raw instruction words / halfwords), which skips the firmware
 framing.
 
-The `blink.hex` fixture ([`crates/ee-mcu/tests/blink.hex`](../../crates/ee-mcu/tests/blink.hex))
+The `blink.hex` fixture ([`crates/ohmforge-mcu/tests/blink.hex`](../../crates/ohmforge-mcu/tests/blink.hex))
 is a hand-assembled Intel-HEX blink program for the Uno. Its assembly, by flash
 word address:
 
@@ -151,7 +151,7 @@ calls `tick(cycles)`, so timers count, PWM edges move, the ADC converts and the
 USART shifts bytes out in step with execution — deterministic and wall-clock
 free.
 
-### AVR ([`avr/periph.rs`](../../crates/ee-mcu/src/avr/periph.rs))
+### AVR ([`avr/periph.rs`](../../crates/ohmforge-mcu/src/avr/periph.rs))
 
 - **GPIO** — `PORTB`/`PORTC`/`PORTD` with `DDRx` (direction), `PORTx` (output
   latch / input pull-up enable) and `PINx` (resolved pin levels), including the
@@ -175,7 +175,7 @@ free.
   holding buffer. Every shifted byte is captured (`peripherals().usart_tx()`).
   RX is a minimal stub.
 
-### RP2040 SIO ([`cortexm/periph.rs`](../../crates/ee-mcu/src/cortexm/periph.rs))
+### RP2040 SIO ([`cortexm/periph.rs`](../../crates/ohmforge-mcu/src/cortexm/periph.rs))
 
 The single-cycle I/O GPIO block at `0xD000_0000`: `GPIO_OUT` (output latch),
 `GPIO_OE` (output enable) and `GPIO_IN` (sampled input), plus the atomic
@@ -198,7 +198,7 @@ ids from the board, which maps friendly pin names to the core's port/bit.
 | A0..A5      | PORTC 0..5   | ADC channels 0..5               |
 
 ```rust
-use ee_mcu::avr::Uno;
+use ohmforge_mcu::avr::Uno;
 let led = Uno::digital_pin_id(13).unwrap(); // D13 → PB5
 let a0  = Uno::analog_pin_id(0).unwrap();   // A0  → PC0 / ADC0
 ```
@@ -208,7 +208,7 @@ let a0  = Uno::analog_pin_id(0).unwrap();   // A0  → PC0 / ADC0
 The GP number **is** the GPIO (and `PinId`) number; the on-board LED is on GP25.
 
 ```rust
-use ee_mcu::cortexm::Pico;
+use ohmforge_mcu::cortexm::Pico;
 let led = Pico::gpio_pin_id(25).unwrap(); // GP25 (on-board LED)
 ```
 
@@ -216,7 +216,7 @@ let led = Pico::gpio_pin_id(25).unwrap(); // GP25 (on-board LED)
 
 ## 5. The `PinIo` pin ↔ net bridge
 
-[`PinIo`](../../crates/ee-mcu/src/pin.rs) is the only state a core and the
+[`PinIo`](../../crates/ohmforge-mcu/src/pin.rs) is the only state a core and the
 outside world swap each step — a fixed bank of pins, each carrying two halves:
 
 - **out** — a [`PinDrive`] the core asserts: `HighZ` (input / not driving),
@@ -242,7 +242,7 @@ let drive = io.drive(led);             // what the core now drives
 ## 6. The mixed-signal boundary
 
 The bridge above exchanges *ideal* levels. The
-[`boundary`](../../crates/ee-mcu/src/boundary.rs) module refines both halves so a
+[`boundary`](../../crates/ohmforge-mcu/src/boundary.rs) module refines both halves so a
 pin behaves like real silicon once it meets a non-trivial load:
 
 - **Input side — [`InputThresholds`]**: a node voltage resolves to a four-valued
@@ -260,7 +260,7 @@ pin behaves like real silicon once it meets a non-trivial load:
   / `current_into` solve a resistive load.
 
 ```rust
-use ee_mcu::boundary::{InputThresholds, OutputDrive};
+use ohmforge_mcu::boundary::{InputThresholds, OutputDrive};
 let p = uno.mcu_mut().peripherals_mut();
 p.set_input_thresholds(InputThresholds::cmos(5.0));      // Schmitt inputs
 p.set_output_drive(OutputDrive::push_pull(5.0, 40.0));   // 5 V, 40 Ω source R
@@ -268,9 +268,9 @@ p.set_output_drive(OutputDrive::push_pull(5.0, 40.0));   // 5 V, 40 Ω source R
 
 ---
 
-## 7. The lockstep co-simulation loop (`ee cosim`)
+## 7. The lockstep co-simulation loop (`of cosim`)
 
-The real loop lives in the `ee` binary (`ee cosim`) — the one place that
+The real loop lives in the `of` binary (`of cosim`) — the one place that
 legitimately links both the MCU and the analog engine. One lockstep interval is:
 
 1. **sample** the circuit's solved node voltages into the core (`sample_inputs`,
@@ -288,25 +288,25 @@ The loop advances both engines to
 `t_next = min(core.next_event(), sim.next_event(), …)`, so an early — but never
 late — wake only costs a little efficiency, never correctness.
 
-`ee cosim` wires a tiny AVR program (make D13 an output, drive it high) to a
+`of cosim` wires a tiny AVR program (make D13 an output, drive it high) to a
 220 Ω resistor + LED in the analog graph and reports the LED current. The
-`cosim_led` example below reproduces that structure entirely inside `ee-mcu`
-(solving a simple load by hand through the boundary, since `ee-mcu` cannot depend
-on `ee-sim`).
+`cosim_led` example below reproduces that structure entirely inside `ohmforge-mcu`
+(solving a simple load by hand through the boundary, since `ohmforge-mcu` cannot depend
+on `ohmforge-sim`).
 
 ---
 
 ## 8. Worked examples
 
 All examples are runnable and live under
-[`crates/ee-mcu/examples/`](../../crates/ee-mcu/examples/) (indexed from
+[`crates/ohmforge-mcu/examples/`](../../crates/ohmforge-mcu/examples/) (indexed from
 [`examples/mcu/`](../../examples/mcu/)). Run any of them with
-`cargo run -p ee-mcu --example <name>`. The outputs below are verified.
+`cargo run -p ohmforge-mcu --example <name>`. The outputs below are verified.
 
 ### `uno_blink` — the ~1 Hz blink
 
 ```text
-$ cargo run -p ee-mcu --example uno_blink
+$ cargo run -p ohmforge-mcu --example uno_blink
 Arduino Uno blink — D13 (PB5) toggling at ~1 Hz (clock = 1 MHz)
 
   edge: D13 -> HIGH  at cycle         4  (t = 0.000 s)
@@ -319,7 +319,7 @@ Measured toggle interval: 1000103 cycles = 1.000 s (≈ 1 Hz, half-period).
 ### `cosim_led` — firmware drives a pin into a simulated LED
 
 ```text
-$ cargo run -p ee-mcu --example cosim_led
+$ cargo run -p ohmforge-mcu --example cosim_led
 Co-simulation: AVR firmware drives D13 → a simulated LED.
   driver: 5 V push-pull, 40 Ω source R;  load: 220 Ω + LED (2.0 V)
 
@@ -332,7 +332,7 @@ Co-simulation: AVR firmware drives D13 → a simulated LED.
 ### `pwm_duty` — a measured 25 % Fast-PWM duty
 
 ```text
-$ cargo run -p ee-mcu --example pwm_duty
+$ cargo run -p ohmforge-mcu --example pwm_duty
 Timer0 Fast-PWM on OC0A (PD6): OCR0A = 64, TOP = 255 → expect 25 % duty
 
   sampled 512 points over 4 PWM periods
@@ -343,7 +343,7 @@ Timer0 Fast-PWM on OC0A (PD6): OCR0A = 64, TOP = 255 → expect 25 % duty
 ### `uart_tx` — a USART byte stream
 
 ```text
-$ cargo run -p ee-mcu --example uart_tx
+$ cargo run -p ohmforge-mcu --example uart_tx
 USART0 TX @ 9600 baud (16 MHz): sending "Hi!"
 
   wrote UDR0 = 0x48 ('H')
@@ -356,7 +356,7 @@ USART0 TX @ 9600 baud (16 MHz): sending "Hi!"
 ### `pico_blink` — RP2040 firmware toggling GP25
 
 ```text
-$ cargo run -p ee-mcu --example pico_blink
+$ cargo run -p ohmforge-mcu --example pico_blink
 Raspberry Pi Pico blink — GP25 (on-board LED) via the RP2040 SIO
 
   after setup: GP25 = low
@@ -367,9 +367,9 @@ Raspberry Pi Pico blink — GP25 (on-board LED) via the RP2040 SIO
 ```
 
 The bridge surface itself is also covered end-to-end by the integration tests
-[`crates/ee-mcu/tests/blink.rs`](../../crates/ee-mcu/tests/blink.rs) and
-[`crates/ee-mcu/tests/cosim.rs`](../../crates/ee-mcu/tests/cosim.rs).
+[`crates/ohmforge-mcu/tests/blink.rs`](../../crates/ohmforge-mcu/tests/blink.rs) and
+[`crates/ohmforge-mcu/tests/cosim.rs`](../../crates/ohmforge-mcu/tests/cosim.rs).
 
-[`PinDrive`]: ../../crates/ee-mcu/src/pin.rs
-[`InputThresholds`]: ../../crates/ee-mcu/src/boundary.rs
-[`OutputDrive`]: ../../crates/ee-mcu/src/boundary.rs
+[`PinDrive`]: ../../crates/ohmforge-mcu/src/pin.rs
+[`InputThresholds`]: ../../crates/ohmforge-mcu/src/boundary.rs
+[`OutputDrive`]: ../../crates/ohmforge-mcu/src/boundary.rs

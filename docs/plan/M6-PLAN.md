@@ -11,8 +11,8 @@ merge-and-gate rhythm.
 The hardest items are the two sim-core pieces: mutual inductance has to stamp
 correctly in both transient and AC, and the convergence aids must help hard
 circuits **without** perturbing the golden bit-for-bit suite on the easy ones.
-Standing rules hold: `ee-core`/`ee-sim` stay dependency-free + `wasm32`-clean +
-deterministic; `ee-mcu` keeps no `ee-sim` dependency (the ADC sample crosses the
+Standing rules hold: `ohmforge-core`/`ohmforge-sim` stay dependency-free + `wasm32`-clean +
+deterministic; `ohmforge-mcu` keeps no `ohmforge-sim` dependency (the ADC sample crosses the
 existing co-sim bridge); browser-only deps gated to `wasm32`; the host workspace
 stays green.
 
@@ -34,10 +34,10 @@ stays green.
   iterations, and the golden determinism suite stays bit-for-bit.
 
 ### boards — closed-loop MCU ↔ analog
-- **CP-BRD-M6.1** **Closed-loop co-sim**: the AVR ADC samples a real `ee-sim`
+- **CP-BRD-M6.1** **Closed-loop co-sim**: the AVR ADC samples a real `ohmforge-sim`
   analog node and firmware reacts (threshold → drives a GPIO), plus external
   pin-change interrupts. The ADC sample is injected through the existing
-  `PinIo`/co-sim bridge — `ee-mcu` gains no `ee-sim` dependency. *Gate:* firmware
+  `PinIo`/co-sim bridge — `ohmforge-mcu` gains no `ohmforge-sim` dependency. *Gate:* firmware
   reads an ADC value tracking an analog divider and sets a GPIO when it crosses a
   threshold; a pin-change ISR fires on an input edge.
 

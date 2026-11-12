@@ -15,10 +15,10 @@
 ```
 
 > **Shell limitation.** An op-amp is modeled here as a **VCVS** (voltage-controlled
-> voltage source), a 4-terminal controlled source ([`ee_core::graph::PartKind::Vcvs`]).
+> voltage source), a 4-terminal controlled source ([`ohmforge_core::graph::PartKind::Vcvs`]).
 > The stdin shell's `add` only places 2-terminal parts, so this example is driven
 > through the **engine API**. The VCVS stamp is exercised by the
-> `ideal_opamp_noninverting_gain` regression test in `ee-sim`.
+> `ideal_opamp_noninverting_gain` regression test in `ohmforge-sim`.
 
 ## The circuit
 
@@ -44,9 +44,9 @@ turns into an ideal gain block with no transistor-level detail.
 ## Build it (engine API)
 
 ```rust
-use ee_core::graph::{Circuit, NetId, PartKind};
-use ee_core::{Unit, Value};
-use ee_sim::{Analysis, Engine};
+use ohmforge_core::graph::{Circuit, NetId, PartKind};
+use ohmforge_core::{Unit, Value};
+use ohmforge_sim::{Analysis, Engine};
 
 let mut c = Circuit::new("opamp");
 let vin = c.new_net();   // V+

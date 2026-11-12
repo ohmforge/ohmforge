@@ -1,0 +1,50 @@
+[package]
+name = "ohmforge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ohmforge: the AI-assisted EE workbench binary — orchestrates the eesh shell, TUI, engines, and copilot."
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+
+# The primary CLI: `of`.
+[[bin]]
+name = "of"
+path = "src/main.rs"
+
+# A second binary that launches straight into the eesh shell REPL.
+[[bin]]
+name = "eesh"
+path = "src/bin/eesh.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+ohmforge-core = { workspace = true }
+ohmforge-sim = { workspace = true }
+ohmforge-digital = { workspace = true }
+ohmforge-mcu = { workspace = true }
+ohmforge-devices = { workspace = true }
+ohmforge-instruments = { workspace = true }
+ohmforge-fmt = { workspace = true }
+ohmforge-tui = { workspace = true }
+ohmforge-shell = { workspace = true }
+ohmforge-ai = { workspace = true }
+
+# Line editing for the interactive REPL (binary only — never the compute core):
+# history, emacs keybindings, Ctrl-R search, and tab completion.
+rustyline = "14"
+
+[features]
+# Opt-in live copilot: forwards to ohmforge-ai's network transport so `of ask` can
+# reach the Claude API. Off by default — the binary and the offline copilot
+# (`of review`/`of drc`) build with no network/TLS stack.
+http = ["ohmforge-ai/http"]

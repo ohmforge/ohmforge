@@ -69,7 +69,7 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       # The compute core must stay I/O-free and WASM-clean (CP-PLAT.3).
-      - run: cargo check -p ee-core -p ee-sim --target wasm32-unknown-unknown
+      - run: cargo check -p ohmforge-core -p ohmforge-sim --target wasm32-unknown-unknown
 
   aarch64:
     name: aarch64 cross-build (CP-PLAT.2)

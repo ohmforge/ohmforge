@@ -1,4 +1,4 @@
-# `eesh` — the ee-assist shell
+# `eesh` — the ohmforge shell
 
 `eesh` is a dedicated REPL for building, wiring, probing, running, and reasoning about circuits. It's keyboard-first, scriptable, and speaks the same API the TUI and AI use — so anything you can click or ask for, you can type, and vice-versa.
 
@@ -18,7 +18,7 @@ help
 
 - **Part kind is inferred from the reference's first letter** (`R1`→resistor, `C1`→capacitor, `V1`→source, …); there is no `<type>` token yet. 3-/4-terminal and controlled devices (BJT/MOSFET/VCVS/…) are modeled by the engine but not yet placeable from this grammar — build those via the netlist/project formats or the engine API.
 - **Scripting** (`set`, `repeat … { }`, `$vars`, deterministic replay) and **comments** (`#`) run through the script engine: pipe a file in — `ee < script.eesh` or `cat script.eesh | ee`. The interactive REPL runs one command per line.
-- The binary also has non-REPL showcases: `ee demo` (RC scope), `ee bode`, `ee amp`, `ee cosim`, and `ee tui` (interactive panels).
+- The binary also has non-REPL showcases: `of demo` (RC scope), `of bode`, `of amp`, `of cosim`, and `of tui` (interactive panels).
 
 Everything from here down is the broader design the shell is growing toward; not all of it is wired yet.
 

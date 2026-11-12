@@ -1,6 +1,6 @@
 # Feature catalog
 
-A menu of what `ee-assist` does (and will do). Items are tagged with the milestone that lands them. **[`ROADMAP.md`](ROADMAP.md) is the authoritative schedule and [`plan/CHECKPOINTS.md`](plan/CHECKPOINTS.md) tracks execution** — where a tag here and the roadmap ever disagree, the roadmap wins. Legend: **[M0]** MVP · **[M1]** · **[M2]** · **[M3]** · **[M4]** stretch/vision.
+A menu of what `ohmforge` does (and will do). Items are tagged with the milestone that lands them. **[`ROADMAP.md`](ROADMAP.md) is the authoritative schedule and [`plan/CHECKPOINTS.md`](plan/CHECKPOINTS.md) tracks execution** — where a tag here and the roadmap ever disagree, the roadmap wins. Legend: **[M0]** MVP · **[M1]** · **[M2]** · **[M3]** · **[M4]** stretch/vision.
 
 ---
 

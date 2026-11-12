@@ -1,15 +1,15 @@
-# File formats & interop (`ee-fmt`)
+# File formats & interop (`ohmforge-fmt`)
 
-`ee-fmt` is how a circuit leaves and re-enters ee-assist: a human-readable
+`ohmforge-fmt` is how a circuit leaves and re-enters ohmforge: a human-readable
 **native project** file for git, a terse **netlist** you type, **SPICE** import/
 export for the wider ecosystem, and **CSV**/**VCD** waveform export for
 spreadsheets and GTKWave. Every parser is hand-written with **no dependency
-beyond `ee-core`**, every error is tagged with its 1-based source line, and all
+beyond `ohmforge-core`**, every error is tagged with its 1-based source line, and all
 output is deterministic (numbers print via `f64`'s shortest round-trippable
 form, so files are byte-stable and diff cleanly).
 
 Runnable examples live in [`examples/formats/`](../../examples/formats/) and are
-checked by `cargo test -p ee-fmt --test examples`.
+checked by `cargo test -p ohmforge-fmt --test examples`.
 
 | Format | Module | Read | Write | Lossless? |
 |---|---|---|---|---|
@@ -62,7 +62,7 @@ must not contain `)`, a newline, or a comment marker. Source time-waveforms
 
 The terse "type a circuit" front door — input only, feeds the engine directly.
 Fields are `REF A B VALUE`; the part type comes from the reference's first
-letter (`R`/`C`/`L`/`V`). Values use `ee-core`'s engineering notation, where —
+letter (`R`/`C`/`L`/`V`). Values use `ohmforge-core`'s engineering notation, where —
 note — **`M` means mega** (`1M` = 1 000 000), the opposite of SPICE.
 
 ```text
@@ -79,7 +79,7 @@ Import/export of the industry-standard deck (the R/C/L/V/I subset at M1). A real
 deck that imports and solves ([`examples/formats/divider.cir`](../../examples/formats/divider.cir)):
 
 ```text
-* ee-assist example: a 10 V resistive divider (DC operating point)
+* ohmforge example: a 10 V resistive divider (DC operating point)
 V1 in 0 DC 10
 R1 in out 1k
 R2 out 0 1k
@@ -113,7 +113,7 @@ bite: **`M` (or `m`) means *milli*, not mega — mega is spelled `MEG`.**
 So `R1 … 1m` is a **1 milliohm** resistor and `R1 … 1meg` is a **1 megohm** one
 — a factor of a billion apart. `meg` and `mil` are matched before the single
 letter `m` so neither is misread, and trailing unit text is ignored
-(`10kohm` == `10k`). Because `ee-core`'s own netlist uses the opposite
+(`10kohm` == `10k`). Because `ohmforge-core`'s own netlist uses the opposite
 convention (`M` = mega), the SPICE module parses magnitudes itself rather than
 deferring to the shared parser.
 
@@ -125,7 +125,7 @@ milliohm or megohm survives the round trip exactly.
 
 ## Waveform export — CSV & VCD
 
-Both turn a slice of `ee-sim` `Signal`s (one analysis run) into a file. All
+Both turn a slice of `ohmforge-sim` `Signal`s (one analysis run) into a file. All
 signals must share one x-axis (same length and sample points) — the normal case
 for a single run. Numbers print in `f64`'s shortest round-trippable form.
 
@@ -157,8 +157,8 @@ each tick (plus every var's initial value at the first), the standard compact
 dump. Complex (AC) signals are rejected — use CSV for those.
 
 ```text
-$date ee-assist $end
-$version ee-fmt waveform export $end
+$date ohmforge $end
+$version ohmforge-fmt waveform export $end
 $timescale 1 ms $end
 $scope module ee $end
 $var real 1 ! v(out) $end

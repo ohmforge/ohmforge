@@ -5,7 +5,7 @@
 # Handy shortcuts (see `just` for the fuller task set).
 lint = "clippy --workspace --all-targets --all-features -- -D warnings"
 t = "test --workspace"
-wasm = "check -p ee-core -p ee-sim --target wasm32-unknown-unknown"
+wasm = "check -p ohmforge-core -p ohmforge-sim --target wasm32-unknown-unknown"
 
 [build]
 # Uncomment for faster incremental linking once contributors have the linker

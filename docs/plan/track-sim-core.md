@@ -1,6 +1,6 @@
-# Track design: **sim-core** (`ee-core`, `ee-sim`)
+# Track design: **sim-core** (`ohmforge-core`, `ohmforge-sim`)
 
-> The foundation. Everything else runs against the types in `ee-core` and the signals produced by `ee-sim`. Get this right and the other tracks have real data to build on.
+> The foundation. Everything else runs against the types in `ohmforge-core` and the signals produced by `ohmforge-sim`. Get this right and the other tracks have real data to build on.
 >
 > Checkpoints: `CP-SIM-M0.1 … CP-SIM-M2.4` in [`CHECKPOINTS.md`](CHECKPOINTS.md). Contracts: [`README.md`](README.md#inter-track-contracts). Rationale for the cross-cutting rules: [`../ARCHITECTURE.md`](../ARCHITECTURE.md#cross-cutting-design-decisions).
 
@@ -8,14 +8,14 @@
 
 | Crate | Owns |
 |---|---|
-| `ee-core` | The shared data model — **no solver, no I/O**: circuit graph, `Unit`/`Value`, simulation time, event queue, and the `Signal` result type. This is the crate every other track depends on. |
-| `ee-sim` | The analog/mixed-signal engine: MNA assembly, linear solve, Newton–Raphson, numerical integration, and the `Analysis` requests (op/transient/DC-sweep/AC/noise/Monte-Carlo/parametric). |
+| `ohmforge-core` | The shared data model — **no solver, no I/O**: circuit graph, `Unit`/`Value`, simulation time, event queue, and the `Signal` result type. This is the crate every other track depends on. |
+| `ohmforge-sim` | The analog/mixed-signal engine: MNA assembly, linear solve, Newton–Raphson, numerical integration, and the `Analysis` requests (op/transient/DC-sweep/AC/noise/Monte-Carlo/parametric). |
 
-**Hard rule:** `ee-core` and `ee-sim` take no clock, no filesystem, no network, and no unseeded randomness. They must stay `wasm32-unknown-unknown`-clean (`just wasm`). This is what makes golden-file determinism and the browser build possible.
+**Hard rule:** `ohmforge-core` and `ohmforge-sim` take no clock, no filesystem, no network, and no unseeded randomness. They must stay `wasm32-unknown-unknown`-clean (`just wasm`). This is what makes golden-file determinism and the browser build possible.
 
 ---
 
-## `ee-core` data model
+## `ohmforge-core` data model
 
 ### The circuit graph (`graph.rs`) — the single source of truth
 
@@ -33,7 +33,7 @@ pub struct Circuit { name, parts, next_net, next_part }
 - `wire(a, b)` — merge two nets into one electrically-common node. Use a **union-find** over net ids so `wire` is near-O(1) and merges are order-independent; expose a `resolve(NetId) -> NetId` the solver calls when stamping. Keep the raw ids stable for the UI; resolve only at stamp time.
 - `part_by_ref(&str)`, `remove_part(PartId)`, `set_param(PartId, Value)`.
 - An **iteration API for stamping**: `parts()` (exists) plus a `node_count()` / dense-index mapping so the solver can turn resolved nets into matrix rows without knowing graph internals.
-- *Gate:* `cargo test -p ee-core graph::` covers a net-merge and a name lookup.
+- *Gate:* `cargo test -p ohmforge-core graph::` covers a net-merge and a name lookup.
 
 ### Units & values (`units.rs`, `value.rs`) — **done** (`CP-SIM-M0.2`)
 
@@ -41,11 +41,11 @@ pub struct Circuit { name, parts, next_net, next_part }
 
 ### Time & events (`time.rs`) — for the digital/co-sim tracks
 
-`Seconds(f64)` newtype for sim time, and an `Event`/event-queue primitive (a binary heap keyed by time) that `ee-digital` and the co-sim loop reuse. Lives in core so both the analog and digital sides share one clock type.
+`Seconds(f64)` newtype for sim time, and an `Event`/event-queue primitive (a binary heap keyed by time) that `ohmforge-digital` and the co-sim loop reuse. Lives in core so both the analog and digital sides share one clock type.
 
-### `Signal` — **the universal result type** (contract; promote to `ee-core` at `CP-SIM-M0.5`)
+### `Signal` — **the universal result type** (contract; promote to `ohmforge-core` at `CP-SIM-M0.5`)
 
-Every analysis emits `Signal`s; every consumer (instruments, TUI, AI, fmt) reads them **without depending on `ee-sim`**. That's why it lives in `ee-core`.
+Every analysis emits `Signal`s; every consumer (instruments, TUI, AI, fmt) reads them **without depending on `ohmforge-sim`**. That's why it lives in `ohmforge-core`.
 
 ```rust
 pub struct Signal {
@@ -57,11 +57,11 @@ pub struct Signal {
 }
 ```
 
-Design notes: keep it a plain owned buffer (no borrows into the solver) so it can cross the snapshot channel to the TUI and be serialized by `ee-fmt`. Streaming variants (an iterator/callback for long transients) come later; the M0 shape is a finished buffer.
+Design notes: keep it a plain owned buffer (no borrows into the solver) so it can cross the snapshot channel to the TUI and be serialized by `ohmforge-fmt`. Streaming variants (an iterator/callback for long transients) come later; the M0 shape is a finished buffer.
 
 ---
 
-## `ee-sim` engine
+## `ohmforge-sim` engine
 
 ### MNA assembly (`CP-SIM-M0.3`)
 
@@ -103,7 +103,7 @@ Dependable dense/`faer`-backed LU with partial pivoting first; move hot/large ci
 
 ## The `Analysis` request contract
 
-The shell and AI never call the solver directly — they submit an `Analysis` and get `Signal`s back (dispatched by the `ee` binary). Defining this enum is part of `CP-SIM-M0.5`.
+The shell and AI never call the solver directly — they submit an `Analysis` and get `Signal`s back (dispatched by the `of` binary). Defining this enum is part of `CP-SIM-M0.5`.
 
 ```rust
 pub enum Analysis {

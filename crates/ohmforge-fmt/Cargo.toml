@@ -1,0 +1,23 @@
+[package]
+name = "ohmforge-fmt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+description = "File formats & interop: native project I/O, SPICE/KiCad import/export, CSV/VCD waveform export."
+
+[lints]
+workspace = true
+
+[dependencies]
+ohmforge-core = { workspace = true }
+
+[dev-dependencies]
+# Tests prove a parsed circuit actually simulates; the format layer itself
+# never depends on the solver.
+ohmforge-sim = { workspace = true }

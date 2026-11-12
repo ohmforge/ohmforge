@@ -8,7 +8,7 @@ round-trips are correct — so M8 fixes a specific set of confirmed defects and
 closes the big **reachability gaps** that make most of the engine and the whole
 AI copilot unreachable from what a user actually types.
 
-Standing rules hold: `ee-core`/`ee-sim` stay dependency-free + `wasm32`-clean +
+Standing rules hold: `ohmforge-core`/`ohmforge-sim` stay dependency-free + `wasm32`-clean +
 deterministic; the golden/determinism suite stays **bit-for-bit**; new deps stay
 behind opt-in features. No new `PartKind` cascades. Every fix ships with a
 regression test that fails before and passes after.
@@ -76,12 +76,12 @@ regression test that fails before and passes after.
   bounded `AiError::Transport`, no hang); docs updated.
 
 ### platform — make it reachable, then ship
-- **CP-PLAT.6** **Wire the copilot + analyses into the `ee` binary** (done on
-  `main` after the track fixes merge): `ee ask`, `ee review`/`ee drc` (offline, no
+- **CP-PLAT.6** **Wire the copilot + analyses into the `of` binary** (done on
+  `main` after the track fixes merge): `of ask`, `of review`/`of drc` (offline, no
   key), `ee design`/`ee debug`/`ee tune`, defaulting to offline mode when
   `ANTHROPIC_API_KEY` is absent; ensure the new `run` analyses are reachable
-  end-to-end. Refresh the guides. *Gate:* `ee ask …` (offline) runs with no key
-  and returns a grounded answer; `ee` help lists the AI subcommands.
+  end-to-end. Refresh the guides. *Gate:* `of ask …` (offline) runs with no key
+  and returns a grounded answer; `of` help lists the AI subcommands.
 - **CP-SHIP.4** Polish & tag **v0.6.0**: full CI-parity gate sweep (incl. `http`
   and `relay` feature jobs), refresh README to M0–M8, tag.
 
@@ -89,7 +89,7 @@ regression test that fails before and passes after.
 
 ## Fan-out
 One agent per track (sim-core, ui-shell, ai-fmt), concurrently in their
-worktrees. The integrator wires `CP-PLAT.6` (the `ee` binary CLI) on `main`
+worktrees. The integrator wires `CP-PLAT.6` (the `of` binary CLI) on `main`
 during reconcile, then gates and tags **v0.6.0** (`CP-SHIP.4`). Boards and web
 had no audit findings — no agents there.
 

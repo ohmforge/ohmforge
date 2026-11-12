@@ -1,6 +1,6 @@
 # Debugging things for the view
 
-This guide is about *looking* at a circuit: the interactive `ee tui` and the
+This guide is about *looking* at a circuit: the interactive `of tui` and the
 virtual instruments you drive from it. Where [getting started](../tutorials/getting-started.md)
 built and simulated a circuit, this is how you *inspect* one — trigger a scope
 on an edge, drop cursors on it, read a meter, sweep a Bode plot, and decode a
@@ -9,10 +9,10 @@ protocol bus — to find out why it does what it does.
 All command lists, key bindings, and numbers below are taken from the current
 implementation and its tests.
 
-## The interactive TUI (`ee tui`)
+## The interactive TUI (`of tui`)
 
 ```console
-$ cargo run -p ee tui
+$ cargo run -p ohmforge tui
 ```
 
 takes over the terminal (raw mode, alternate screen, mouse capture) and runs the
@@ -82,8 +82,8 @@ engine from the tutorial, `undo`/`checkpoint`/`restore` work here too.
 
 ### The op-point overlay
 
-`toggle overlay` (or `ee amp`) replaces the component list with the DC state
-painted onto it. For a common-emitter amplifier, `ee amp` renders:
+`toggle overlay` (or `of amp`) replaces the component list with the DC state
+painted onto it. For a common-emitter amplifier, `of amp` renders:
 
 ```text
 ┌─ ce-amp op-point ────────────────────────────────────────────────────┐
@@ -106,10 +106,10 @@ width.
 
 ## The virtual instruments
 
-The instruments live in the `ee-instruments` crate: each *consumes* a `Signal`
+The instruments live in the `ohmforge-instruments` crate: each *consumes* a `Signal`
 (or controls a source) and renders a deterministic, dependency-light front panel
 to a string, so they are testable with no live terminal and look identical in the
-TUI, a demo, and a test. The `ee bode` and `ee amp` sub-commands are runnable
+TUI, a demo, and a test. The `of bode` and `of amp` sub-commands are runnable
 front ends today; the rest are driven programmatically and from the TUI.
 
 ### Oscilloscope — trigger and cursors
@@ -181,7 +181,7 @@ load tripped the current limit rather than the supply failing.
 
 ### Bode, spectrum, and FFT
 
-**`ee bode`** renders an AC sweep as magnitude (dB) and phase (°) against a
+**`of bode`** renders an AC sweep as magnitude (dB) and phase (°) against a
 **log** frequency axis with decade ticks, and reports the −3 dB corner. For an
 RC low-pass (R = 1 k, C = 159 n):
 
@@ -238,6 +238,6 @@ bus actually broke.
 
 - [`docs/tutorials/getting-started.md`](../tutorials/getting-started.md) — build,
   probe, simulate, script.
-- `cargo run -p ee-tui --example scope` — the standalone braille-plot demo.
+- `cargo run -p ohmforge-tui --example scope` — the standalone braille-plot demo.
 - [`docs/SHELL.md`](../SHELL.md) — the command-language reference.
 </content>

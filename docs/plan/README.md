@@ -16,10 +16,10 @@ Each track owns a set of crates so day-to-day edits rarely touch another track's
 
 | Track | Slug | Owns crates | Worktree branch | Design doc | Depends on |
 |---|---|---|---|---|---|
-| **Simulation core** | `sim-core` | `ee-core`, `ee-sim` | `track/sim-core` | [`track-sim-core.md`](track-sim-core.md) | — (foundation) |
-| **Boards & digital** | `boards` | `ee-digital`, `ee-mcu`, `ee-devices` | `track/boards` | [`track-boards.md`](track-boards.md) | `sim-core` |
-| **UI & shell** | `ui-shell` | `ee-tui`, `ee-shell`, `ee-instruments` | `track/ui-shell` | [`track-ui-shell.md`](track-ui-shell.md) | `sim-core` |
-| **AI & formats** | `ai-fmt` | `ee-ai`, `ee-fmt` | `track/ai-fmt` | [`track-ai-fmt.md`](track-ai-fmt.md) | `sim-core`, `ui-shell` (eesh AST) |
+| **Simulation core** | `sim-core` | `ohmforge-core`, `ohmforge-sim` | `track/sim-core` | [`track-sim-core.md`](track-sim-core.md) | — (foundation) |
+| **Boards & digital** | `boards` | `ohmforge-digital`, `ohmforge-mcu`, `ohmforge-devices` | `track/boards` | [`track-boards.md`](track-boards.md) | `sim-core` |
+| **UI & shell** | `ui-shell` | `ohmforge-tui`, `ohmforge-shell`, `ohmforge-instruments` | `track/ui-shell` | [`track-ui-shell.md`](track-ui-shell.md) | `sim-core` |
+| **AI & formats** | `ai-fmt` | `ohmforge-ai`, `ohmforge-fmt` | `track/ai-fmt` | [`track-ai-fmt.md`](track-ai-fmt.md) | `sim-core`, `ui-shell` (eesh AST) |
 | **Platform** | `platform` | *(cross-cutting)* | `main` | this doc | all |
 
 `platform` (CI, WASM, benches, release) lives on `main` because it touches every crate; it isn't a worktree.
@@ -28,7 +28,7 @@ Each track owns a set of crates so day-to-day edits rarely touch another track's
 
 ```
                     ┌───────────────┐
-                    │   sim-core    │   ee-core (shared types) + ee-sim
+                    │   sim-core    │   ohmforge-core (shared types) + ohmforge-sim
                     └───┬───────┬───┘
              ┌──────────┘       └──────────┐
              ▼                             ▼
@@ -45,7 +45,7 @@ Each track owns a set of crates so day-to-day edits rarely touch another track's
                     └────────────┘
 ```
 
-**Critical path:** `ee-core` → `ee-sim` (linear MNA + transient) → everything else can proceed against real signals. Until then, `ui-shell` develops against a stub `Signal` producer and `boards` against `ee-core` alone.
+**Critical path:** `ohmforge-core` → `ohmforge-sim` (linear MNA + transient) → everything else can proceed against real signals. Until then, `ui-shell` develops against a stub `Signal` producer and `boards` against `ohmforge-core` alone.
 
 ---
 
@@ -65,14 +65,14 @@ These are the **only** surfaces tracks share. Changing one is a cross-track even
 
 | Contract | Defined in | Produced by | Consumed by | Notes |
 |---|---|---|---|---|
-| `Circuit` mutation API (`add_part`, `wire`, `set_param`, iteration for stamping) | `ee-core::graph` | shell, tui, ai | sim, digital, mcu | The single source of truth; everyone mutates the same graph. |
-| `Signal` (typed time/freq series) | `ee-core` *(promote here so consumers needn't depend on `ee-sim`)* | sim, mcu | instruments, tui, ai, fmt | Carries `Unit`; the universal analysis result. |
-| `Analysis` request enum | `ee-sim` | shell, ai | sim | What to run (op/transient/AC/sweep). |
-| `McuCore` trait + pin↔net mapping | `ee-mcu` | boards | co-sim loop in `ee` | Bridges MCU clock to sim time. |
-| `Command` AST (eesh) | `ee-shell` | shell parser, ai | `ee` dispatcher | The AI emits these so "type it" == "ask for it". |
-| Native project schema | `ee-fmt` | fmt | all (load/save) | Human-readable, diff-friendly, versioned. |
+| `Circuit` mutation API (`add_part`, `wire`, `set_param`, iteration for stamping) | `ohmforge-core::graph` | shell, tui, ai | sim, digital, mcu | The single source of truth; everyone mutates the same graph. |
+| `Signal` (typed time/freq series) | `ohmforge-core` *(promote here so consumers needn't depend on `ohmforge-sim`)* | sim, mcu | instruments, tui, ai, fmt | Carries `Unit`; the universal analysis result. |
+| `Analysis` request enum | `ohmforge-sim` | shell, ai | sim | What to run (op/transient/AC/sweep). |
+| `McuCore` trait + pin↔net mapping | `ohmforge-mcu` | boards | co-sim loop in `of` | Bridges MCU clock to sim time. |
+| `Command` AST (eesh) | `ohmforge-shell` | shell parser, ai | `of` dispatcher | The AI emits these so "type it" == "ask for it". |
+| Native project schema | `ohmforge-fmt` | fmt | all (load/save) | Human-readable, diff-friendly, versioned. |
 
-**Design rule that falls out of this (finalized in the architecture review):** `Signal` and `Unit` live in `ee-core` (not `ee-sim`) so instruments/tui/ai depend only on the tiny core, keeping the dependency DAG acyclic and the WASM surface small. This and the other project-wide conventions (error handling, panic strategy, determinism, WASM-safe AI transport, engine access) are pinned in [`../ARCHITECTURE.md`](../ARCHITECTURE.md#cross-cutting-design-decisions) — changing any of them is a cross-track event.
+**Design rule that falls out of this (finalized in the architecture review):** `Signal` and `Unit` live in `ohmforge-core` (not `ohmforge-sim`) so instruments/tui/ai depend only on the tiny core, keeping the dependency DAG acyclic and the WASM surface small. This and the other project-wide conventions (error handling, panic strategy, determinism, WASM-safe AI transport, engine access) are pinned in [`../ARCHITECTURE.md`](../ARCHITECTURE.md#cross-cutting-design-decisions) — changing any of them is a cross-track event.
 
 ---
 

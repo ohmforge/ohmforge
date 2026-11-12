@@ -1,0 +1,19 @@
+[package]
+name = "ohmforge-instruments"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+description = "Virtual instruments (scope, DMM, function generator, logic analyzer, PSU) — the LabVIEW-style front panels."
+
+[lints]
+workspace = true
+
+[dependencies]
+ohmforge-core = { workspace = true }
+ohmforge-sim = { workspace = true }

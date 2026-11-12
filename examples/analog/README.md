@@ -1,7 +1,7 @@
 # Worked analog examples
 
 Each example is a circuit with a short writeup of how it works (the physics) and
-the result the engine produces. The engine is `ee-sim`; the full walk-through of
+the result the engine produces. The engine is `ohmforge-sim`; the full walk-through of
 how it solves these is in [`docs/guide/simulation.md`](../../docs/guide/simulation.md).
 
 ## Runnable from the shell
@@ -9,7 +9,7 @@ how it solves these is in [`docs/guide/simulation.md`](../../docs/guide/simulati
 These are `.eesh` scripts the interactive shell accepts on **stdin**. Run one with:
 
 ```sh
-cat examples/analog/<name>.eesh | cargo run -p ee
+cat examples/analog/<name>.eesh | cargo run -p ohmforge
 ```
 
 | Example | Analysis | What it shows |
@@ -26,16 +26,16 @@ The stdin shell's `add <ref> <a> <b> <value>` places only **2-terminal, DC** par
 (R, C, L, V, I, D). These three circuits need capabilities the engine has but that
 grammar cannot yet express — a time-varying source, a 4-terminal controlled source,
 or a 3-terminal transistor — so each writeup drives the circuit through the engine
-API (or a built-in `cargo run -p ee <demo>`) and is backed by an `ee-sim`
+API (or a built-in `cargo run -p ohmforge <demo>`) and is backed by an `ohmforge-sim`
 regression test:
 
 | Example | Needs | Verified by |
 |---------|-------|-------------|
 | [`half_wave_rectifier`](half_wave_rectifier.md) | sine source ([`Waveform::Sine`]) | engine-API snippet |
 | [`opamp_noninverting`](opamp_noninverting.md) | VCVS (4-terminal) | `ideal_opamp_noninverting_gain` test |
-| [`common_emitter_bjt`](common_emitter_bjt.md) | BJT (3-terminal) | `cargo run -p ee amp`, `bjt_common_emitter_bias` test |
+| [`common_emitter_bjt`](common_emitter_bjt.md) | BJT (3-terminal) | `cargo run -p ohmforge amp`, `bjt_common_emitter_bias` test |
 
 > Extending the shell grammar to place sines and multi-terminal devices (so these
-> three become `.eesh` scripts too) lives in `ee-shell`, outside this engine crate.
+> three become `.eesh` scripts too) lives in `ohmforge-shell`, outside this engine crate.
 > The shell also has no comment syntax today, so `.eesh` files here are kept as pure
 > command lines with the prose in the paired `.md`.

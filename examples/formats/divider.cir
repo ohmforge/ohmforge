@@ -1,6 +1,6 @@
-* ee-assist example: a 10 V resistive divider (DC operating point)
+* ohmforge example: a 10 V resistive divider (DC operating point)
 * SPICE suffix gotcha: `m` is milli and `MEG` is mega (a factor of 1e9 apart);
-* ee-core's own netlist spells mega `M`, so this importer parses SPICE itself.
+* ohmforge-core's own netlist spells mega `M`, so this importer parses SPICE itself.
 * The first line is always the title (SPICE tradition); node 0 is ground.
 V1 in 0 DC 10
 R1 in out 1k

@@ -1,43 +1,47 @@
-# ee-assist — Cargo workspace
+# ohmforge — Cargo workspace
 # See docs/ARCHITECTURE.md for what each crate does.
 [workspace]
 resolver = "2"
 members = [
-    "crates/ee-core",
-    "crates/ee-sim",
-    "crates/ee-digital",
-    "crates/ee-mcu",
-    "crates/ee-devices",
-    "crates/ee-instruments",
-    "crates/ee-fmt",
-    "crates/ee-tui",
-    "crates/ee-shell",
-    "crates/ee-ai",
-    "crates/ee",
-    "crates/ee-web",
+    "crates/ohmforge-core",
+    "crates/ohmforge-sim",
+    "crates/ohmforge-digital",
+    "crates/ohmforge-mcu",
+    "crates/ohmforge-devices",
+    "crates/ohmforge-instruments",
+    "crates/ohmforge-fmt",
+    "crates/ohmforge-tui",
+    "crates/ohmforge-shell",
+    "crates/ohmforge-ai",
+    "crates/ohmforge",
+    "crates/ohmforge-web",
 ]
 
 [workspace.package]
-version = "0.0.0"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.79"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/your/ee-assist"
-authors = ["ee-assist contributors"]
+repository = "https://github.com/ohmforge/ohmforge"
+homepage = "https://github.com/ohmforge/ohmforge"
+authors = ["The ohmforge Authors"]
+# Shared crates.io discovery metadata; crates inherit with `keywords.workspace = true`.
+keywords = ["electronics", "simulation", "spice", "circuit", "eda"]
+categories = ["simulation", "science", "command-line-utilities"]
 
 # Shared dependency versions live here; crates opt in with `dep = { workspace = true }`.
 # Kept commented until first use so the scaffold builds with zero network deps.
 [workspace.dependencies]
-ee-core        = { path = "crates/ee-core" }
-ee-sim         = { path = "crates/ee-sim" }
-ee-digital     = { path = "crates/ee-digital" }
-ee-mcu         = { path = "crates/ee-mcu" }
-ee-devices     = { path = "crates/ee-devices" }
-ee-instruments = { path = "crates/ee-instruments" }
-ee-fmt         = { path = "crates/ee-fmt" }
-ee-tui         = { path = "crates/ee-tui" }
-ee-shell       = { path = "crates/ee-shell" }
-ee-ai          = { path = "crates/ee-ai" }
+ohmforge-core        = { path = "crates/ohmforge-core" }
+ohmforge-sim         = { path = "crates/ohmforge-sim" }
+ohmforge-digital     = { path = "crates/ohmforge-digital" }
+ohmforge-mcu         = { path = "crates/ohmforge-mcu" }
+ohmforge-devices     = { path = "crates/ohmforge-devices" }
+ohmforge-instruments = { path = "crates/ohmforge-instruments" }
+ohmforge-fmt         = { path = "crates/ohmforge-fmt" }
+ohmforge-tui         = { path = "crates/ohmforge-tui" }
+ohmforge-shell       = { path = "crates/ohmforge-shell" }
+ohmforge-ai          = { path = "crates/ohmforge-ai" }
 # Third-party (uncomment as milestones need them):
 # ratatui   = "0.28"
 # crossterm = "0.28"

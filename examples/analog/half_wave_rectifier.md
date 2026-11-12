@@ -9,7 +9,7 @@
 ```
 
 > **Shell limitation.** This circuit needs a *time-varying (sine) source*. The
-> engine models it ([`ee_core::Waveform::Sine`], driven in transient by
+> engine models it ([`ohmforge_core::Waveform::Sine`], driven in transient by
 > [`Analysis::Transient`]), but the current stdin shell grammar can only `add` DC
 > sources, so this example is driven through the **engine API** rather than an
 > `.eesh` script. See the note at the bottom of [`diode.md`](diode.md).
@@ -36,9 +36,9 @@ inside its Newton loop, so the conduction edge is resolved sample by sample.
 ## Build it (engine API)
 
 ```rust
-use ee_core::graph::{Circuit, NetId, PartKind, Waveform};
-use ee_core::{Unit, Value};
-use ee_sim::{Analysis, Engine};
+use ohmforge_core::graph::{Circuit, NetId, PartKind, Waveform};
+use ohmforge_core::{Unit, Value};
+use ohmforge_sim::{Analysis, Engine};
 
 let mut c = Circuit::new("rectifier");
 let vin = c.new_net();

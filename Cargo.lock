@@ -246,115 +246,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ee"
-version = "0.0.0"
-dependencies = [
- "ee-ai",
- "ee-core",
- "ee-devices",
- "ee-digital",
- "ee-fmt",
- "ee-instruments",
- "ee-mcu",
- "ee-shell",
- "ee-sim",
- "ee-tui",
- "rustyline",
-]
-
-[[package]]
-name = "ee-ai"
-version = "0.0.0"
-dependencies = [
- "ee-core",
- "ee-shell",
- "ee-sim",
- "reqwest",
- "serde_json",
-]
-
-[[package]]
-name = "ee-core"
-version = "0.0.0"
-dependencies = [
- "criterion",
-]
-
-[[package]]
-name = "ee-devices"
-version = "0.0.0"
-dependencies = [
- "ee-core",
- "ee-sim",
-]
-
-[[package]]
-name = "ee-digital"
-version = "0.0.0"
-
-[[package]]
-name = "ee-fmt"
-version = "0.0.0"
-dependencies = [
- "ee-core",
- "ee-sim",
-]
-
-[[package]]
-name = "ee-instruments"
-version = "0.0.0"
-dependencies = [
- "ee-core",
- "ee-sim",
-]
-
-[[package]]
-name = "ee-mcu"
-version = "0.0.0"
-dependencies = [
- "ee-core",
- "ee-digital",
-]
-
-[[package]]
-name = "ee-shell"
-version = "0.0.0"
-dependencies = [
- "ee-core",
- "ee-fmt",
- "ee-instruments",
- "ee-sim",
- "ee-tui",
-]
-
-[[package]]
-name = "ee-sim"
-version = "0.0.0"
-dependencies = [
- "criterion",
- "ee-core",
-]
-
-[[package]]
-name = "ee-tui"
-version = "0.0.0"
-dependencies = [
- "crossterm",
- "ee-core",
- "ee-instruments",
-]
-
-[[package]]
-name = "ee-web"
-version = "0.0.0"
-dependencies = [
- "ee-core",
- "ee-fmt",
- "ee-sim",
- "wasm-bindgen",
-]
-
-[[package]]
 name = "either"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -846,6 +737,115 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "ohmforge"
+version = "0.6.0"
+dependencies = [
+ "ohmforge-ai",
+ "ohmforge-core",
+ "ohmforge-devices",
+ "ohmforge-digital",
+ "ohmforge-fmt",
+ "ohmforge-instruments",
+ "ohmforge-mcu",
+ "ohmforge-shell",
+ "ohmforge-sim",
+ "ohmforge-tui",
+ "rustyline",
+]
+
+[[package]]
+name = "ohmforge-ai"
+version = "0.6.0"
+dependencies = [
+ "ohmforge-core",
+ "ohmforge-shell",
+ "ohmforge-sim",
+ "reqwest",
+ "serde_json",
+]
+
+[[package]]
+name = "ohmforge-core"
+version = "0.6.0"
+dependencies = [
+ "criterion",
+]
+
+[[package]]
+name = "ohmforge-devices"
+version = "0.6.0"
+dependencies = [
+ "ohmforge-core",
+ "ohmforge-sim",
+]
+
+[[package]]
+name = "ohmforge-digital"
+version = "0.6.0"
+
+[[package]]
+name = "ohmforge-fmt"
+version = "0.6.0"
+dependencies = [
+ "ohmforge-core",
+ "ohmforge-sim",
+]
+
+[[package]]
+name = "ohmforge-instruments"
+version = "0.6.0"
+dependencies = [
+ "ohmforge-core",
+ "ohmforge-sim",
+]
+
+[[package]]
+name = "ohmforge-mcu"
+version = "0.6.0"
+dependencies = [
+ "ohmforge-core",
+ "ohmforge-digital",
+]
+
+[[package]]
+name = "ohmforge-shell"
+version = "0.6.0"
+dependencies = [
+ "ohmforge-core",
+ "ohmforge-fmt",
+ "ohmforge-instruments",
+ "ohmforge-sim",
+ "ohmforge-tui",
+]
+
+[[package]]
+name = "ohmforge-sim"
+version = "0.6.0"
+dependencies = [
+ "criterion",
+ "ohmforge-core",
+]
+
+[[package]]
+name = "ohmforge-tui"
+version = "0.6.0"
+dependencies = [
+ "crossterm",
+ "ohmforge-core",
+ "ohmforge-instruments",
+]
+
+[[package]]
+name = "ohmforge-web"
+version = "0.6.0"
+dependencies = [
+ "ohmforge-core",
+ "ohmforge-fmt",
+ "ohmforge-sim",
+ "wasm-bindgen",
 ]
 
 [[package]]

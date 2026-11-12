@@ -1,9 +1,9 @@
-# The AI copilot (`ee-ai`)
+# The AI copilot (`ohmforge-ai`)
 
 The copilot's one rule (see [`docs/AI.md`](../AI.md)): **the AI works through the
 same API you do, and verifies its own claims by running the simulator.** It does
 not emit prose a human must trust and transcribe — it *acts* through tools that
-drive the same `eesh` shell and `ee-sim` engine you drive, reads the real
+drive the same `eesh` shell and `ohmforge-sim` engine you drive, reads the real
 results back, and iterates. Nothing it proposes touches your circuit until you
 approve it.
 
@@ -12,21 +12,21 @@ network-free and testable, and how secrets are handled. The worked examples use
 the real public API with a **stub model** (`MockTransport`) so they run with no
 network and no key — exactly how the crate's own tests exercise the loop.
 
-## From the command line (`ee`)
+## From the command line (`of`)
 
 The copilot is reachable from the binary:
 
 | Command | Needs a key? | What it does |
 |---|---|---|
-| `ee review [file.eesh]` / `ee drc …` | **No** | Builds the circuit from an `.eesh` script (a path, else stdin) and prints the grounded, offline design-rule review (DRC + sanity checks). |
-| `ee ask <question>` | Yes | The live copilot — drives a real shell+engine through the tool loop and answers. Build with `--features http` and set `ANTHROPIC_API_KEY`. |
+| `of review [file.eesh]` / `of drc …` | **No** | Builds the circuit from an `.eesh` script (a path, else stdin) and prints the grounded, offline design-rule review (DRC + sanity checks). |
+| `of ask <question>` | Yes | The live copilot — drives a real shell+engine through the tool loop and answers. Build with `--features http` and set `ANTHROPIC_API_KEY`. |
 
 ```sh
 # Offline, no key — the AI surface you can always reach:
-printf 'add V1 in gnd 5\nadd R1 in out 1k\nadd D1 out gnd\n' | ee review
+printf 'add V1 in gnd 5\nadd R1 in out 1k\nadd D1 out gnd\n' | of review
 
 # Live copilot (opt-in network transport):
-cargo run -p ee --features http -- ask "design a 5 V to 3.3 V divider and check it"
+cargo run -p ohmforge --features http -- ask "design a 5 V to 3.3 V divider and check it"
 ```
 
 The live path reads the endpoint from `EE_BASE_URL`/`ANTHROPIC_BASE_URL` (below),
@@ -90,7 +90,7 @@ node's voltage **as a number**) — then answers. The number the model quotes
 comes from a real solve, not a guess.
 
 ```rust
-use ee_ai::{ask, Client, MockTransport, ContentBlock, ModelResponse, StopReason,
+use ohmforge_ai::{ask, Client, MockTransport, ContentBlock, ModelResponse, StopReason,
             Usage, EESH_TOOL, READ_OP_TOOL};
 
 fn resp(blocks: Vec<ContentBlock>, stop: StopReason) -> ModelResponse {
@@ -120,7 +120,7 @@ let text = ask(&client, "What does the divider output settle at?")?;
 
 Design is the **verification loop**, the crate's trust mechanism. The model
 proposes a patch (a list of `eesh` commands) through the `propose_patch` tool;
-`ee-ai` **scratch-applies it to a clone of your circuit**, re-simulates, and
+`ohmforge-ai` **scratch-applies it to a clone of your circuit**, re-simulates, and
 measures the spec quantities, feeding the model a structured verdict with the
 real numbers. The live circuit is borrowed immutably throughout — `design`
 *cannot* change it. Committing is a separate, explicit `apply` you make after
@@ -129,9 +129,9 @@ the user approves.
 Worked example — "give me 3.3 V at 500 mA from a 5 V rail":
 
 ```rust
-use ee_ai::{design, apply, Client, MockTransport, Criterion, Spec,
+use ohmforge_ai::{design, apply, Client, MockTransport, Criterion, Spec,
             ContentBlock, ModelResponse, StopReason, Usage, PROPOSE_PATCH_TOOL};
-use ee_shell::Shell;
+use ohmforge_shell::Shell;
 
 // The user's starting circuit: a bare 5 V rail on node `in`.
 let mut live = Shell::new();
@@ -180,9 +180,9 @@ Worked example — a 10 V divider whose top resistor is wrong (3 kΩ where 1 kΩ
 intended), so `v(out)` sags to 2.5 V where 5 V is expected:
 
 ```rust
-use ee_ai::{debug_circuit, Client, MockTransport,
+use ohmforge_ai::{debug_circuit, Client, MockTransport,
             ContentBlock, ModelResponse, StopReason, Usage};
-use ee_shell::Shell;
+use ohmforge_shell::Shell;
 
 let mut faulty = Shell::new();
 faulty.execute("add V1 in gnd 10").unwrap();
@@ -218,11 +218,11 @@ and emits its compiled image as an **Intel HEX** string via `emit_firmware`. The
 HEX is validated (start code, hex digits, per-record byte count, two's-
 complement checksum, EOF record — each error tagged with its record line) and
 staged. The validated string is exactly what the co-sim bridge
-(`ee-mcu`'s `load_firmware`) consumes, so flashing it into a live emulator is a
+(`ohmforge-mcu`'s `load_firmware`) consumes, so flashing it into a live emulator is a
 thin follow-up; the mode is fully testable with a stub model today.
 
 ```rust
-use ee_ai::{firmware, Client, MockTransport,
+use ohmforge_ai::{firmware, Client, MockTransport,
             ContentBlock, ModelResponse, StopReason, Usage};
 
 let emit = ModelResponse {

@@ -1,0 +1,23 @@
+[package]
+name = "ohmforge-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+description = "Terminal UI: schematic renderer, braille waveform plots, dockable panels. Built on ratatui."
+
+[lints]
+workspace = true
+
+[dependencies]
+ohmforge-core = { workspace = true }
+ohmforge-instruments = { workspace = true }
+# ratatui   = { workspace = true }   # uncomment at M0 render work
+# Terminal input + raw-mode I/O for the live app (CP-UX-M1.4). Kept to the thin
+# `run` wrapper; the event logic is a pure, tty-free state machine in `app`.
+crossterm = { version = "0.28", default-features = false, features = ["events"] }

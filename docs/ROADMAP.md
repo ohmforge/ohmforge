@@ -9,11 +9,11 @@ Phased so that **something real works at the end of every milestone**. Each phas
 **Goal:** type a circuit in `eesh`, simulate it, see a waveform. The end-to-end pipeline works, even if narrow.
 
 - [x] Cargo workspace + crate stubs.
-- [x] `ee-core`: circuit graph (union-find nets), typed units/values, engineering-notation parser (`4k7`, `1u`), `Signal` result type.
-- [x] `ee-sim`: MNA for **linear** circuits (R, C, L, DC voltage + current sources) + **DC op-point** + **transient** (Backward Euler), validated against analytic RC/RL/RLC. _(time-varying pulse/sine sources: follow-up.)_
-- [x] `ee-shell`: minimal REPL — `add`, `wire`, `probe`, `run`, `show`, `help`; interactive (TTY) or scripted (pipe). _(line history + completion: follow-up.)_
-- [ ] `ee-tui`: **braille waveform** plot done ✅; schematic list view + dockable shell pane still to do.
-- [x] `ee-fmt`: native project save/load (human-readable, lossless round-trip) + friendly netlist import.
+- [x] `ohmforge-core`: circuit graph (union-find nets), typed units/values, engineering-notation parser (`4k7`, `1u`), `Signal` result type.
+- [x] `ohmforge-sim`: MNA for **linear** circuits (R, C, L, DC voltage + current sources) + **DC op-point** + **transient** (Backward Euler), validated against analytic RC/RL/RLC. _(time-varying pulse/sine sources: follow-up.)_
+- [x] `ohmforge-shell`: minimal REPL — `add`, `wire`, `probe`, `run`, `show`, `help`; interactive (TTY) or scripted (pipe). _(line history + completion: follow-up.)_
+- [ ] `ohmforge-tui`: **braille waveform** plot done ✅; schematic list view + dockable shell pane still to do.
+- [x] `ohmforge-fmt`: native project save/load (human-readable, lossless round-trip) + friendly netlist import.
 - [ ] `criterion` benches on stamp/solve (CI build/test/clippy/fmt/wasm/MSRV/docs on Linux/macOS/Windows is done ✅).
 
 **Demo:** an RC low-pass built by command, transient run, waveform on screen. ✅ pipeline proven.
@@ -26,13 +26,13 @@ Phased so that **something real works at the end of every milestone**. Each phas
 
 - [ ] Nonlinear devices: diode/LED, BJT, MOSFET, op-amp; **Newton–Raphson** + convergence aids.
 - [ ] Analyses: **DC sweep**, **AC/Bode**, parametric sweep; adaptive timestep.
-- [ ] `ee-digital`: gates/flip-flops/counters, event-driven, X/Z logic.
-- [ ] `ee-instruments`: oscilloscope (trigger/cursors), multimeter, function generator.
-- [ ] `ee-tui`: live overlay (voltage color / current flow), multi-channel scope, dockable panels, mouse placement.
-- [ ] `ee-mcu` (`avr`): **Arduino Uno** core + GPIO/timers/PWM/ADC/UART; load `.hex`/`.elf`.
-- [ ] `ee-ai`: **Ask** mode (tool-using, grounded in sim results); Claude client + streaming.
-- [ ] `ee-fmt`: **SPICE netlist** import/export.
-- [ ] `ee-shell`: **scripting** engine (`.eesh`, loops/params) + deterministic **session replay**.
+- [ ] `ohmforge-digital`: gates/flip-flops/counters, event-driven, X/Z logic.
+- [ ] `ohmforge-instruments`: oscilloscope (trigger/cursors), multimeter, function generator.
+- [ ] `ohmforge-tui`: live overlay (voltage color / current flow), multi-channel scope, dockable panels, mouse placement.
+- [ ] `ohmforge-mcu` (`avr`): **Arduino Uno** core + GPIO/timers/PWM/ADC/UART; load `.hex`/`.elf`.
+- [ ] `ohmforge-ai`: **Ask** mode (tool-using, grounded in sim results); Claude client + streaming.
+- [ ] `ohmforge-fmt`: **SPICE netlist** import/export.
+- [ ] `ohmforge-shell`: **scripting** engine (`.eesh`, loops/params) + deterministic **session replay**.
 - [ ] Static + `aarch64` builds; example project library.
 
 **Demo:** design an amplifier, sweep its Bode plot, load a blink `.hex` on a Uno, ask "what's the gain at 1 kHz?" and get a grounded answer.
@@ -46,13 +46,13 @@ Phased so that **something real works at the end of every milestone**. Each phas
 - [ ] **Co-simulation bridge**: MCU pins ↔ sim nodes, synchronized clocks; ADC reads real node voltages.
 - [ ] Compile sketches via detected external toolchains (`arduino-cli`, `avr-gcc`, `arm-none-eabi-gcc`).
 - [ ] MCU **debug view**: regs/mem/disasm, step, breakpoints, pin/peripheral state.
-- [ ] `ee-mcu` (`cortexm`): **Raspberry Pi Pico (RP2040, Cortex-M0+)**; ATmega2560/ATtiny.
+- [ ] `ohmforge-mcu` (`cortexm`): **Raspberry Pi Pico (RP2040, Cortex-M0+)**; ATmega2560/ATtiny.
 - [ ] Mixed-signal boundary elements; logic analyzer + **UART/SPI/I²C decode**.
 - [ ] Analyses: **noise**, **Monte-Carlo/tolerances**, behavioral/controlled sources, **thermal-aware models** (temperature/self-heating).
 - [ ] Instruments: bench PSU, Bode/spectrum, scope **math/FFT**.
-- [ ] `ee-ai`: **Design / Debug / Firmware** modes with the **staged-patch + re-simulate verification loop**; `apply`/`reject`.
+- [ ] `ohmforge-ai`: **Design / Debug / Firmware** modes with the **staged-patch + re-simulate verification loop**; `apply`/`reject`.
 - [ ] Visualization: **breadboard view**; export CSV/VCD/SVG/PNG.
-- [ ] `ee-shell`: session **snapshots/undo**, named checkpoints.
+- [ ] `ohmforge-shell`: session **snapshots/undo**, named checkpoints.
 - [ ] **WASM** build of core + a browser front end.
 
 **Demo:** wire a Pico + sensor + LED, have the AI write the firmware, co-simulate, watch the logic analyzer decode the I²C traffic, and export a VCD.
@@ -68,7 +68,7 @@ Phased so that **something real works at the end of every milestone**. Each phas
 - [ ] **HDL-lite** custom logic blocks; memories/buses/tri-state.
 - [ ] Common modules: 7-seg/LCD/servo/sensors/motor-driver/WS2812 as drop-in blocks.
 - [ ] Learning: **guided lessons** + **graded challenges** run against the simulator; contextual glossary/datasheet snippets.
-- [ ] `ee-ai`: **offline mode** (heuristics + local index); tutor mode.
+- [ ] `ohmforge-ai`: **offline mode** (heuristics + local index); tutor mode.
 - [ ] KiCad netlist import; BOM export; Fritzing-style export.
 
 **Demo:** build a custom board manifest for your own PCB, drop in an LCD + rotary encoder, run a graded "make a thermostat" challenge, all in the terminal.

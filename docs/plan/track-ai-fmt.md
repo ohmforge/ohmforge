@@ -1,6 +1,6 @@
-# Track design: **ai-fmt** (`ee-ai`, `ee-fmt`)
+# Track design: **ai-fmt** (`ohmforge-ai`, `ohmforge-fmt`)
 
-> The copilot and the file/interop layer. The AI acts through the **same `Command` AST a user types** and must **re-simulate to verify its own suggestions** before presenting them — nothing auto-applies. `ee-fmt` gives every other track durable, diff-friendly persistence and ecosystem interop.
+> The copilot and the file/interop layer. The AI acts through the **same `Command` AST a user types** and must **re-simulate to verify its own suggestions** before presenting them — nothing auto-applies. `ohmforge-fmt` gives every other track durable, diff-friendly persistence and ecosystem interop.
 >
 > Checkpoints: `CP-AF-M0.1 … CP-AF-M3.2`. Full copilot design: [`../AI.md`](../AI.md). Contracts: [`README.md`](README.md#inter-track-contracts). Cross-cutting rules: [`../ARCHITECTURE.md`](../ARCHITECTURE.md#cross-cutting-design-decisions).
 
@@ -8,14 +8,14 @@
 
 | Crate | Owns |
 |---|---|
-| `ee-fmt` | File formats & interop: the **native project format**, SPICE netlist import/export, KiCad import + BOM export, waveform export (CSV/VCD). |
-| `ee-ai` | The copilot: model client, tool definitions over the circuit API, prompt templates, the **verification loop**, RAG over the parts index, and offline heuristics. |
+| `ohmforge-fmt` | File formats & interop: the **native project format**, SPICE netlist import/export, KiCad import + BOM export, waveform export (CSV/VCD). |
+| `ohmforge-ai` | The copilot: model client, tool definitions over the circuit API, prompt templates, the **verification loop**, RAG over the parts index, and offline heuristics. |
 
 Depends on `sim-core` (to read/verify) and `ui-shell` (it emits the `Command` AST). The AI can do nothing a user couldn't — that's the trust model.
 
 ---
 
-## `ee-fmt` — formats & interop
+## `ohmforge-fmt` — formats & interop
 
 ### Native project format (`CP-AF-M0.1`) — foundational
 
@@ -44,11 +44,11 @@ KiCad netlist import; **BOM** export (CSV) listing every part with value/qty. (M
 
 ---
 
-## `ee-ai` — the copilot
+## `ohmforge-ai` — the copilot
 
 ### WASM-safe transport (from the architecture review)
 
-`ee-ai` talks to the model through a **`Transport` trait**, never a hard-wired HTTP client:
+`ohmforge-ai` talks to the model through a **`Transport` trait**, never a hard-wired HTTP client:
 
 ```rust
 #[async_trait]
@@ -111,6 +111,6 @@ With no API key: a bundled **RAG parts index** + local **heuristics** — value 
 
 ## State & next action
 
-- **Depends on:** the `Circuit` API + `Signal` + `Analysis` (sim-core) to read/verify, and the `Command` AST (ui-shell) to emit. `ee-fmt`'s native format (`CP-AF-M0.1`) has no AI dependency and can land first.
+- **Depends on:** the `Circuit` API + `Signal` + `Analysis` (sim-core) to read/verify, and the `Command` AST (ui-shell) to emit. `ohmforge-fmt`'s native format (`CP-AF-M0.1`) has no AI dependency and can land first.
 - **Current checkpoint:** `CP-AF-M0.1` — native project format save/load round-trip (the M0 persistence everything needs).
 - **Immediate next step:** implement the versioned `serde` project format + round-trip golden test (M0.1 gate); then, once the `Command` AST and a `Signal` read exist, stand up the `Transport` trait + mock and the tool-call loop (`CP-AF-M1.2`/`M1.3`) — network-free from day one.

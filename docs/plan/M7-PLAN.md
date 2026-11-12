@@ -10,8 +10,8 @@ Fanned out one agent per track, the proven merge-and-gate rhythm.
 The hardest items are sim-core's pole-zero extraction (a hand-rolled eigenproblem
 on the linearized MNA — no external linear-algebra crate is allowed) and the
 ESP32 core (a new instruction-set, scoped to a correct supported subset like the
-AVR/ARM cores before it). Standing rules hold: `ee-core`/`ee-sim` stay
-dependency-free + `wasm32`-clean + deterministic; `ee-mcu` keeps no `ee-sim`
+AVR/ARM cores before it). Standing rules hold: `ohmforge-core`/`ohmforge-sim` stay
+dependency-free + `wasm32`-clean + deterministic; `ohmforge-mcu` keeps no `ohmforge-sim`
 dependency; any new network/TLS dependency is gated behind an **opt-in feature**
 so the default workspace stays dependency-free and the `wasm32` core stays clean;
 and new multi-terminal elements are added as **circuit-level relations** (like
@@ -28,7 +28,7 @@ cross-crate match-arm cascade.
   input and output impedances at a chosen port, and the pole (and, where
   tractable, zero) locations. Pole extraction is a hand-rolled eigenproblem on
   the `(G, C)` matrices — **no external linear-algebra crate** (a compact QR /
-  shifted-QR iteration in `ee-sim`, bounded to modest system sizes with the
+  shifted-QR iteration in `ohmforge-sim`, bounded to modest system sizes with the
   coverage documented). *Gate:* an RC low-pass reports its pole at
   `-1/(RC)` (≈ the −3 dB corner), and a resistive divider's `.TF` gain +
   input/output impedances match hand analysis.
@@ -44,7 +44,7 @@ cross-crate match-arm cascade.
   instruction-accurate core over a correct **supported subset** of the Xtensa
   ISA (unimplemented encodings decode to an `Unknown`, with coverage + TODOs
   documented, exactly as the AVR/ARM cores do), and an `Esp32` board tying it to
-  a GPIO block. `ee-mcu` gains no `ee-sim` dependency. *Gate:* a hand-assembled
+  a GPIO block. `ohmforge-mcu` gains no `ohmforge-sim` dependency. *Gate:* a hand-assembled
   Xtensa blink toggles a GPIO pin; the decoder's covered-opcode set is asserted.
 
 ### ai-fmt — live HTTP transport

@@ -1,0 +1,52 @@
+[package]
+name = "ohmforge-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+description = "WASM browser front end: wasm-bindgen glue that parses a netlist, runs ohmforge-sim, and returns JSON + a braille scope string (CP-WEB.1)."
+
+[lints]
+workspace = true
+
+# A cdylib is what wasm-bindgen / wasm-pack link into a `.wasm`; `rlib` keeps the
+# pure pipeline logic (and its host-side #[test]s) available to `cargo test`.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# Opt-in NATIVE signaling relay (CP-WEB.6). The pure room/broadcast router lives
+# in the lib unconditionally (it is dep-free and host-tested); this feature adds
+# only the native socket `server` module + `relay` binary. It pulls NO new deps —
+# the WebSocket upgrade (SHA-1 accept key + frame parse) is hand-rolled over
+# `std::net`. Kept out of the DEFAULT and `wasm32` builds so both stay clean;
+# only `--features relay` compiles the server, which is why it is native-only.
+[features]
+relay = []
+
+# The native relay server binary. `required-features` keeps it out of the
+# default and `wasm32` builds entirely — `cargo build` without `--features relay`
+# never compiles it — so no server/socket code leaks into the browser bundle.
+[[bin]]
+name = "relay"
+required-features = ["relay"]
+
+# The whole-crate dependency graph on the HOST target is just the three
+# wasm-clean compute crates — no wasm-bindgen/js-sys/web-sys — so the crate stays
+# a normal workspace member and `cargo build/clippy/test --workspace` build it on
+# aarch64-apple-darwin exactly like any other crate. ohmforge-core/ohmforge-sim stay
+# dependency-free; the wasm glue lives only in this crate.
+[dependencies]
+ohmforge-core = { workspace = true }
+ohmforge-sim = { workspace = true }
+ohmforge-fmt = { workspace = true }
+
+# The browser-only glue. Gated behind the wasm32 target so it is absent on the
+# host build (wasm-bindgen does not compile for aarch64-apple-darwin), which is
+# what keeps the host workspace gates green.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"

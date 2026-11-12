@@ -49,12 +49,12 @@ These are the cross-track surfaces (per [`README.md`](README.md) §Inter-track c
 
 | Contract | Change | Owner → affected |
 |---|---|---|
-| `Signal` (`ee-core`) | add `SignalData::Complex` for AC magnitude/phase | sim-core → tui, ai, instruments |
-| `Analysis` (`ee-sim`) | add `DcSweep`, `Ac`, `Parametric` variants (the `Ac` stub already exists) | sim-core → shell, ai |
-| nonlinear `Device` trait (`ee-sim`, internal) | load/stamp + Jacobian contribution per NR iteration | sim-core only |
-| `Command` AST (`ee-shell`) | add `set <ref> <param> <value>`, instrument + script commands | ui-shell → ai |
-| `Transport` trait (`ee-ai`) | new; `send(ModelRequest)->ModelResponse`, native/wasm/mock impls | ai-fmt only |
-| `McuCore` trait + pin↔net map (`ee-mcu`) | define the shape now (co-sim wiring is M2) | boards → `ee` co-sim loop |
+| `Signal` (`ohmforge-core`) | add `SignalData::Complex` for AC magnitude/phase | sim-core → tui, ai, instruments |
+| `Analysis` (`ohmforge-sim`) | add `DcSweep`, `Ac`, `Parametric` variants (the `Ac` stub already exists) | sim-core → shell, ai |
+| nonlinear `Device` trait (`ohmforge-sim`, internal) | load/stamp + Jacobian contribution per NR iteration | sim-core only |
+| `Command` AST (`ohmforge-shell`) | add `set <ref> <param> <value>`, instrument + script commands | ui-shell → ai |
+| `Transport` trait (`ohmforge-ai`) | new; `send(ModelRequest)->ModelResponse`, native/wasm/mock impls | ai-fmt only |
+| `McuCore` trait + pin↔net map (`ohmforge-mcu`) | define the shape now (co-sim wiring is M2) | boards → `of` co-sim loop |
 
 **Do early, before the dependents need them:** `SignalData::Complex` and the `Analysis` variants (small, unblock AC + sweeps + the AI's run requests). I recommend landing these as a tiny first sim-core change so other tracks compile against the final shape.
 
@@ -98,7 +98,7 @@ Waves are a dependency ordering, not a schedule: within a track, an agent runs i
 
 - **NR convergence (highest):** gmin stepping + source stepping + junction-voltage limiting (per [`track-sim-core.md`](track-sim-core.md) §Nonlinear). Keep a growing corpus of known-stiff netlists as regression gates (`CP-SIM-M1.3`). Surface *which node/device stalled* in plain language — a differentiator, not just an error string.
 - **AVR accuracy (deep well):** instruction-accurate first; cycle-accuracy only where it matters (timers/PWM). Validate against existing AVR test-vector suites (`CP-BRD-M1.3` gate).
-- **AC needs complex numbers:** add a minimal `SignalData::Complex` to `ee-core`; the compute core stays dependency-free (hand-rolled complex or a tiny inline type — **no `num-complex` dep** to preserve the wasm/zero-dep rule). Decide at `CP-SIM-M1.4`.
+- **AC needs complex numbers:** add a minimal `SignalData::Complex` to `ohmforge-core`; the compute core stays dependency-free (hand-rolled complex or a tiny inline type — **no `num-complex` dep** to preserve the wasm/zero-dep rule). Decide at `CP-SIM-M1.4`.
 - **Function generator ↔ time-varying sources:** the funcgen panel (`CP-UX-M1.2`) needs sources whose value varies with time (sine/pulse). That's the M0 follow-up we deferred. Land a small "source waveform" addition in sim-core as a prerequisite — fold it into Wave 2 sim work.
 - **AI determinism & secrets:** no network in any test — the mock `Transport` returns canned tool-call sequences ([`track-ai-fmt.md`](track-ai-fmt.md)). API key is read from env/keyring **at runtime**, never committed; `.env` stays gitignored. The AI can only do what a user could (emits the `Command` AST, reads `Signal`s).
 
@@ -119,4 +119,4 @@ The repo stays green (`cargo test --workspace`, clippy `-D warnings`, fmt, wasm 
 1. **First MCU = ATmega328P / Arduino Uno?** (the ledger's default, and the best-documented AVR case). Confirm or redirect.
 2. **Land the `SignalData::Complex` + `Analysis` variant bump first** as a tiny standalone sim-core change, so AC/sweeps/AI compile against the final contract? (Recommended.)
 3. **Fan-out breadth for Wave 1:** all four track agents at once (recommended — three are NR-independent), or sim-core's NR keystone solo first, then the rest?
-4. **Default Claude model** for `ee-ai` (configurable; key is runtime-only) — pick when we reach `CP-AF-M1.2`, or pin a default now.
+4. **Default Claude model** for `ohmforge-ai` (configurable; key is runtime-only) — pick when we reach `CP-AF-M1.2`, or pin a default now.

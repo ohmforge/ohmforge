@@ -1,4 +1,4 @@
-# The AI copilot (`ee-ai`)
+# The AI copilot (`ohmforge-ai`)
 
 The copilot's job is to make EE *approachable* without being a black box. Its guiding rule: **the AI works through the same API you do, and verifies its own claims by running the simulator.** No hand-waving — proposals are simulated before they're presented, and you always see and approve changes.
 
@@ -14,7 +14,7 @@ The copilot's job is to make EE *approachable* without being a black box. Its gu
 
 ## How it works — tool-using and verified
 
-The model is given **tools** that map onto the same `ee-core`/`ee-sim` API the shell uses. It doesn't emit prose that a human must transcribe; it *acts*, observes results, and iterates.
+The model is given **tools** that map onto the same `ohmforge-core`/`ohmforge-sim` API the shell uses. It doesn't emit prose that a human must transcribe; it *acts*, observes results, and iterates.
 
 ```
 add_part(type, ref, value, nodes)      run_transient(duration)
@@ -30,8 +30,8 @@ propose_patch(...)  →  staged, needs   read_regs(board) / read_pins(board)
 
 ```
 1. model proposes a change via propose_patch(...)     # staged, not yet applied
-2. ee-ai applies it to a scratch copy of the project
-3. ee-sim runs the relevant analysis
+2. ohmforge-ai applies it to a scratch copy of the project
+3. ohmforge-sim runs the relevant analysis
 4. model reads the real results (read_signal/measure)
 5. if the result misses the spec → iterate (back to 1)
    if it meets the spec         → present the diff + the sim evidence

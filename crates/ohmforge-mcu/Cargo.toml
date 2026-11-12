@@ -1,0 +1,26 @@
+[package]
+name = "ohmforge-mcu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+description = "Microcontroller cores + peripherals and the co-simulation bridge to the circuit engines."
+
+[lints]
+workspace = true
+
+[features]
+# Opt-in external-toolchain compile orchestration (CP-BRD-M2.5). OFF by default
+# so the normal `cargo test --workspace` needs no external compiler and the
+# default/wasm build pulls in no `std::process` code. It adds no dependencies;
+# it only shells out to a system `arduino-cli` / `avr-gcc` when explicitly used.
+toolchain = []
+
+[dependencies]
+ohmforge-core = { workspace = true }
+ohmforge-digital = { workspace = true }

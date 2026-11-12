@@ -16,16 +16,16 @@
 ```
 
 > **Shell limitation.** A bipolar transistor is a 3-terminal device
-> ([`ee_core::graph::PartKind::Bjt`], Ebers–Moll). The stdin shell's `add` only
+> ([`ohmforge_core::graph::PartKind::Bjt`], Ebers–Moll). The stdin shell's `add` only
 > places 2-terminal parts, so this circuit ships as a **built-in demo** you can run
 > directly:
 >
 > ```sh
-> cargo run -p ee amp
+> cargo run -p ohmforge amp
 > ```
 >
 > It is also exercised by the `bjt_common_emitter_bias` and
-> `bjt_ce_small_signal_gain` regression tests in `ee-sim`.
+> `bjt_ce_small_signal_gain` regression tests in `ohmforge-sim`.
 
 ## The circuit
 
@@ -50,7 +50,7 @@ Newton–Raphson over the full 3×3 Ebers–Moll Jacobian (two junction diodes p
 the transport source), with the gmin / source-stepping convergence aids available
 if the cold-start guess is too far off.
 
-## Expected result (verified — `cargo run -p ee amp`)
+## Expected result (verified — `cargo run -p ohmforge amp`)
 
 ```
   Vb = 2.00 V   Vc = 9.09 V   Ve = 1.33 V   →   Vbe = 0.662 V, Ic ≈ 1.33 mA (active region)

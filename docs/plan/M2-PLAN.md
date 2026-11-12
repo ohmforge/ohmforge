@@ -10,7 +10,7 @@ Sequencing + fan-out strategy on top of the M2 checkpoints already in [`CHECKPOI
 
 The risk register names it: **co-simulation timing — the MCU clock vs. the analog timestep is fiddly.** Everything in the M2 demo (firmware driving real nodes, the logic analyzer, the Pico) stands on **`CP-BRD-M2.1`**, the lockstep bridge. So the bridge goes first.
 
-**Architectural constraint (locked in [`track-boards.md`](track-boards.md)):** `ee-mcu` does **not** depend on `ee-sim`. The lockstep *loop* lives in the **`ee` binary** — the only place that legitimately links both engines. The MCU exposes a pure **`PinIo`** surface (digital drives out, sampled node voltages in) plus `next_event()` / `step_to(t, &mut io)`; the loop reconciles that with the graph:
+**Architectural constraint (locked in [`track-boards.md`](track-boards.md)):** `ohmforge-mcu` does **not** depend on `ohmforge-sim`. The lockstep *loop* lives in the **`of` binary** — the only place that legitimately links both engines. The MCU exposes a pure **`PinIo`** surface (digital drives out, sampled node voltages in) plus `next_event()` / `step_to(t, &mut io)`; the loop reconciles that with the graph:
 
 ```
 loop:
@@ -20,7 +20,7 @@ loop:
   sample node voltages back into io.inputs (ADC, digital thresholds)
 ```
 
-So `CP-BRD-M2.1` splits in two: the **bridge surface** (in `ee-mcu`, unit-testable — a boards-track agent) and the **lockstep loop + demo** (in `ee` — the integrator, after the surface merges). The gate — *`analogRead` returns a divider's voltage; `digitalWrite` lights a sim LED* — is proven by the loop in the binary.
+So `CP-BRD-M2.1` splits in two: the **bridge surface** (in `ohmforge-mcu`, unit-testable — a boards-track agent) and the **lockstep loop + demo** (in `of` — the integrator, after the surface merges). The gate — *`analogRead` returns a divider's voltage; `digitalWrite` lights a sim LED* — is proven by the loop in the binary.
 
 ---
 
@@ -54,12 +54,12 @@ platform: WASM browser front end (core already wasm-clean) · PLAT.2 aarch64 · 
 
 | Contract | Change | Owner → affected |
 |---|---|---|
-| `PinIo` / `McuCore` (`ee-mcu`) | digital drive-out + analog sample-in + `next_event`/`step_to(t, &mut io)` | boards → the `ee` co-sim loop |
+| `PinIo` / `McuCore` (`ohmforge-mcu`) | digital drive-out + analog sample-in + `next_event`/`step_to(t, &mut io)` | boards → the `of` co-sim loop |
 | Boundary elements | digital↔analog at a pin (threshold in, drive-strength/rise-fall out) | boards/sim → co-sim loop |
-| Controlled sources | `PartKind` VCVS/VCCS/CCVS/CCCS (or a behavioral device) | sim → ee-fmt/ee-tui/ee-shell (the usual match reconciliation) |
+| Controlled sources | `PartKind` VCVS/VCCS/CCVS/CCCS (or a behavioral device) | sim → ohmforge-fmt/ohmforge-tui/ohmforge-shell (the usual match reconciliation) |
 | `Analysis::Noise`, `Analysis::MonteCarlo` | new variants; MC carries a **seed** (deterministic — an in-crate PRNG, never unseeded) | sim → `Engine` match only |
-| VCD/CSV waveform format | new `ee-fmt` export module | fmt → consumers |
-| Staged patch / verification | `ee-ai` apply/reject over a scratch circuit | ai (builds on M1 tool layer) |
+| VCD/CSV waveform format | new `ohmforge-fmt` export module | fmt → consumers |
+| Staged patch / verification | `ohmforge-ai` apply/reject over a scratch circuit | ai (builds on M1 tool layer) |
 
 Land the small foundational ones early (controlled sources; the `PinIo` surface), so dependents compile against the final shape — same discipline as M1's `Signal::Complex` bump.
 
@@ -72,12 +72,12 @@ One agent per track per wave, each in its worktree; merge + reconcile + full gat
 ### Wave 1 — retire the risk, start the long poles, land the trust piece
 | Agent | Worktree | Checkpoint |
 |---|---|---|
-| boards | `track/boards` | **CP-BRD-M2.1** bridge *surface* in `ee-mcu` (PinIo, event scheduling, unit-tested) |
+| boards | `track/boards` | **CP-BRD-M2.1** bridge *surface* in `ohmforge-mcu` (PinIo, event scheduling, unit-tested) |
 | sim | `track/sim-core` | **CP-SIM-M2.3** controlled/behavioral sources (VCVS/VCCS → op-amp) |
 | ui-shell | `track/ui-shell` | **CP-UX-M2.3** Bode/spectrum panel + scope FFT (makes AC visible) |
 | ai-fmt | `track/ai-fmt` | **CP-AF-M2.1** verification loop (propose → scratch-apply → re-sim → measure → apply/reject) |
 
-*Integrator, after Wave 1 merges:* build the **lockstep co-sim loop in `ee`** on the merged `PinIo` surface, with the `analogRead`/`digitalWrite` demo — the `CP-BRD-M2.1` gate.
+*Integrator, after Wave 1 merges:* build the **lockstep co-sim loop in `of`** on the merged `PinIo` surface, with the `analogRead`/`digitalWrite` demo — the `CP-BRD-M2.1` gate.
 
 ### Wave 2 — build on the bridge
 | Agent | Checkpoint |
@@ -100,7 +100,7 @@ One agent per track per wave, each in its worktree; merge + reconcile + full gat
 
 ## 5. Risks & handling
 
-- **Co-sim timing (highest):** lockstep to the nearest event (never fixed-ratio); start with the well-documented AVR/Uno case and validate pin+node golden traces against reference sketches; keep the loop deterministic (shared `ee-core::time` clock, no wall-clock).
+- **Co-sim timing (highest):** lockstep to the nearest event (never fixed-ratio); start with the well-documented AVR/Uno case and validate pin+node golden traces against reference sketches; keep the loop deterministic (shared `ohmforge-core::time` clock, no wall-clock).
 - **MCU accuracy (RP2040):** ARMv6-M (Thumb) instruction-accurate first; validate against published test vectors; cycle-accuracy only for timing-critical peripherals.
 - **Monte-Carlo determinism:** an in-crate seeded PRNG (xorshift/PCG), seed in the request; a fixed seed reproduces bit-for-bit (the compute core never uses unseeded `rand`).
 - **AI trust:** nothing auto-applies — the verification loop stages a patch on a **scratch** circuit, re-simulates, cites measured values, and gates on explicit `apply`/`reject` ([`../AI.md`](../AI.md)). Tests use a stub model + real sim.
@@ -116,7 +116,7 @@ Repo stays green (tests, clippy `-D warnings`, fmt, wasm core, docs) and the dem
 
 ## 7. Decisions (defaults chosen; override anytime)
 
-1. **Co-sim loop in `ee`**, bridge surface in `ee-mcu` — per the architecture review. (Locked.)
+1. **Co-sim loop in `of`**, bridge surface in `ohmforge-mcu` — per the architecture review. (Locked.)
 2. **Second MCU = RP2040 / Pico** (Cortex-M0+), per the ledger. (Default.)
 3. **Monte-Carlo PRNG:** in-crate seeded (no dependency), seed in the `Analysis`. (Default.)
 4. **WASM front end** scoped to Wave 3 as a thin browser shell over the already-wasm-clean core (not a full UI port). (Default.)

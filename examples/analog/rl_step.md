@@ -11,7 +11,7 @@
 Run it:
 
 ```sh
-cat examples/analog/rl_step.eesh | cargo run -p ee
+cat examples/analog/rl_step.eesh | cargo run -p ohmforge
 ```
 
 ## The circuit

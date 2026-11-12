@@ -1,0 +1,36 @@
+[package]
+name = "ohmforge-sim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+description = "Analog / mixed-signal engine: MNA, Newton-Raphson, transient/DC/AC/noise analyses."
+
+[lints]
+workspace = true
+
+[features]
+# Native-only parallel execution of independent analyses (Monte-Carlo samples,
+# DC/parametric sweep points) across OS threads via `std::thread` — no extra
+# dependencies. OFF by default and a no-op on wasm32, so the default build stays
+# single-threaded, dependency-free and wasm-clean. Results are identical to the
+# single-threaded path regardless of thread scheduling. (CP-SIM-M4.3.)
+parallel = []
+
+[dependencies]
+ohmforge-core = { workspace = true }
+
+[dev-dependencies]
+# Benches only; dev-deps never ship in the library crate, so this keeps ohmforge-sim
+# itself dependency-free and wasm/MSRV-clean. Default features off; we only need
+# `cargo_bench_support` to run a `harness = false` bench under `cargo bench`.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "solve"
+harness = false

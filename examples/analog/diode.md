@@ -11,7 +11,7 @@
 Run it:
 
 ```sh
-cat examples/analog/diode.eesh | cargo run -p ee
+cat examples/analog/diode.eesh | cargo run -p ohmforge
 ```
 
 > The shell's `add D1 a gnd 1e-14` places a diode whose value is its **saturation
@@ -56,7 +56,7 @@ to.
 ## Note — a true half-wave rectifier
 
 Rectifying an AC waveform needs a **time-varying (sine) source**, which the
-engine supports ([`ee_core::Waveform::Sine`]) but the current stdin shell grammar
+engine supports ([`ohmforge_core::Waveform::Sine`]) but the current stdin shell grammar
 cannot yet express (`add` only places DC sources). See
 [`half_wave_rectifier.md`](half_wave_rectifier.md) for that circuit, driven
 through the engine API directly.

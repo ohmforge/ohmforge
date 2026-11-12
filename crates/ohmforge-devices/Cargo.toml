@@ -1,0 +1,24 @@
+[package]
+name = "ohmforge-devices"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+description = "Device models (R/L/C, diode, BJT, MOSFET, op-amp, ICs), board definitions, and the parts library."
+
+[lints]
+workspace = true
+
+[dependencies]
+ohmforge-core = { workspace = true }
+
+[dev-dependencies]
+# Used only by the subcircuit gate tests to confirm the stamped primitives
+# actually simulate; the library itself keeps the ohmforge-core-only dependency set
+# and stays wasm32-clean.
+ohmforge-sim = { workspace = true }

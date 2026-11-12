@@ -1,4 +1,4 @@
-* ee-assist example: a diode drop from a 5 V rail through 1 kOhm (CP-AF-M4.1)
+* ohmforge example: a diode drop from a 5 V rail through 1 kOhm (CP-AF-M4.1)
 * The `.model` card gives D1 a real saturation current; the importer maps the
 * SPICE IS parameter onto the engine's Shockley diode model, so the operating
 * point settles at a genuine forward junction drop rather than a default guess.

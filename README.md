@@ -1,8 +1,12 @@
-# ee-assist
+<p align="center">
+  <img src="assets/ohmforge-logo.svg" alt="ohmforge" width="360">
+</p>
+
+# ohmforge
 
 **A fast, friendly, AI-assisted electrical-engineering playground that lives in your terminal.**
 
-`ee-assist` is a terminal-native EE workbench for tinkerers, students, and makers. It combines:
+`ohmforge` is a terminal-native EE workbench for tinkerers, students, and makers. It combines:
 
 - a **circuit simulator** (analog SPICE-style + digital logic + mixed-signal),
 - **microcontroller & board emulation** (Arduino/AVR, Raspberry Pi Pico/RP2040, Cortex-M, RISC-V, plus specialized boards),
@@ -30,17 +34,19 @@ Real EE tools are powerful but heavy, GUI-bound, and often expensive. Tinkerers 
 What runs today: a real analog/mixed-signal simulator, AVR + RP2040 emulation with co-simulation, instruments, an AI copilot, and a browser build — ~500 tests, all green.
 
 ```text
-cargo run -p ee -- demo     # build an RC low-pass, run a transient, see the braille scope
-cargo run -p ee -- bode     # AC sweep → Bode plot, −3 dB at 1 kHz
-cargo run -p ee -- amp      # common-emitter BJT amplifier, op-point with a color overlay
-cargo run -p ee -- cosim    # real AVR firmware drives D13 → a simulated LED lights (19.4 mA)
-cargo run -p ee -- view     # a static snapshot of the composed TUI (overlay · scope · shell)
-cargo run -p ee -- tui      # the live interactive dockable panels
-cargo run -p ee             # the eesh REPL;  or:  cat examples/tutorial/rc_lowpass.eesh | cargo run -p ee
+cargo run -p ohmforge -- demo     # build an RC low-pass, run a transient, see the braille scope
+cargo run -p ohmforge -- bode     # AC sweep → Bode plot, −3 dB at 1 kHz
+cargo run -p ohmforge -- amp      # common-emitter BJT amplifier, op-point with a color overlay
+cargo run -p ohmforge -- cosim    # real AVR firmware drives D13 → a simulated LED lights (19.4 mA)
+cargo run -p ohmforge -- view     # a static snapshot of the composed TUI (overlay · scope · shell)
+cargo run -p ohmforge -- tui      # the live interactive dockable panels
+cargo run -p ohmforge             # the eesh REPL;  or:  cat examples/tutorial/rc_lowpass.eesh | cargo run -p ohmforge
 
 # in the browser (WebAssembly):
-wasm-pack build crates/ee-web --target web --out-dir www/pkg   # then serve crates/ee-web/www/
+wasm-pack build crates/ohmforge-web --target web --out-dir www/pkg   # then serve crates/ohmforge-web/www/
 ```
+
+ohmforge ships two binaries: **`of`** (the primary CLI — subcommands above) and **`eesh`**, which launches straight into the shell REPL.
 
 New here? Start with the **[getting-started tutorial](docs/tutorials/getting-started.md)**.
 
@@ -83,7 +89,7 @@ eesh> ask "why is the LED dimmer than I expected?"
 
 ## Status
 
-**M0–M8 complete** (99/99 checkpoints, **v0.6.0**; see [`docs/plan/CHECKPOINTS.md`](docs/plan/CHECKPOINTS.md)). M8 was a hardening pass from a four-track QA audit — killed TUI flicker, unblocked AC/noise/`.TF` on DC-floating nodes (capacitive dividers), fixed an O(N²) shell hang, corrected AI design-rule checks + added an HTTP timeout, and closed the reachability gaps: the shell now drives every analysis (`run ac/dc/noise/mc/tf`) and places multi-terminal parts, and the copilot is reachable from the CLI (`ee review`/`ee drc` offline, `ee ask` live). Working today: linear + nonlinear analog (diode with `IS/N/RS`, BJT/MOSFET, Newton–Raphson with **gmin/source-stepping convergence aids**), **mutual inductance / transformers**, **transmission lines** (lossless + lossy), AC/Bode, noise, Monte-Carlo, transient with adaptive timestep, **pole-zero + small-signal transfer-function (`.TF`) analysis** (hand-rolled eigensolver), a **KLU-class ordered/reusable sparse solver wired into the engine's hot loop** (+ multithreaded analyses), expression/behavioral sources + temperature; an event-driven digital kernel + **HDL-lite** (truth-table/ROM/RAM/tri-state); instruction-accurate **AVR (328P/2560/ATtiny)**, **RP2040 (Cortex-M0+)**, **STM32 (Cortex-M3/M4, Thumb-2)** and **ESP32 (Xtensa LX6)** cores with peripherals (GPIO/timers/PWM/ADC/USART/**SPI/I²C**/**external + pin-change interrupts**) and **lockstep co-simulation** — including a **closed loop** where firmware reads a real analog node through the ADC and drives a pin back — plus manifest boards, drop-in modules (7-seg/servo/WS2812), and composite device subcircuits (op-amp/switch/relay); oscilloscope/DMM/funcgen/PSU, a logic analyzer with UART/SPI/I²C decode, a Bode/FFT panel, a breadboard view, a **dataflow patcher**, **live schematic editing + component tuning with current-flow animation**, and **transient playback/scrub**; a dockable TUI; SPICE (incl. `.model` devices)/KiCad/VCD/CSV/Fritzing/BOM and a lossless native project format; an AI copilot (Ask/Design/Debug/Firmware + offline mode) whose tools drive a real sim with a verification loop and **spec-driven auto-tune**, a **live HTTP transport** to the Claude API (opt-in `http` feature), and a tutor with graded challenges; and a **WebAssembly browser build** with an editor, shareable-session links, and **real-time co-editing** backed by a **hosted signaling relay**. Whole workspace stays green — `clippy -D warnings`, `wasm32` core + `ee-web`, `-D warnings` docs.
+**M0–M8 complete** (99/99 checkpoints, **v0.6.0**; see [`docs/plan/CHECKPOINTS.md`](docs/plan/CHECKPOINTS.md)). M8 was a hardening pass from a four-track QA audit — killed TUI flicker, unblocked AC/noise/`.TF` on DC-floating nodes (capacitive dividers), fixed an O(N²) shell hang, corrected AI design-rule checks + added an HTTP timeout, and closed the reachability gaps: the shell now drives every analysis (`run ac/dc/noise/mc/tf`) and places multi-terminal parts, and the copilot is reachable from the CLI (`of review`/`of drc` offline, `of ask` live). Working today: linear + nonlinear analog (diode with `IS/N/RS`, BJT/MOSFET, Newton–Raphson with **gmin/source-stepping convergence aids**), **mutual inductance / transformers**, **transmission lines** (lossless + lossy), AC/Bode, noise, Monte-Carlo, transient with adaptive timestep, **pole-zero + small-signal transfer-function (`.TF`) analysis** (hand-rolled eigensolver), a **KLU-class ordered/reusable sparse solver wired into the engine's hot loop** (+ multithreaded analyses), expression/behavioral sources + temperature; an event-driven digital kernel + **HDL-lite** (truth-table/ROM/RAM/tri-state); instruction-accurate **AVR (328P/2560/ATtiny)**, **RP2040 (Cortex-M0+)**, **STM32 (Cortex-M3/M4, Thumb-2)** and **ESP32 (Xtensa LX6)** cores with peripherals (GPIO/timers/PWM/ADC/USART/**SPI/I²C**/**external + pin-change interrupts**) and **lockstep co-simulation** — including a **closed loop** where firmware reads a real analog node through the ADC and drives a pin back — plus manifest boards, drop-in modules (7-seg/servo/WS2812), and composite device subcircuits (op-amp/switch/relay); oscilloscope/DMM/funcgen/PSU, a logic analyzer with UART/SPI/I²C decode, a Bode/FFT panel, a breadboard view, a **dataflow patcher**, **live schematic editing + component tuning with current-flow animation**, and **transient playback/scrub**; a dockable TUI; SPICE (incl. `.model` devices)/KiCad/VCD/CSV/Fritzing/BOM and a lossless native project format; an AI copilot (Ask/Design/Debug/Firmware + offline mode) whose tools drive a real sim with a verification loop and **spec-driven auto-tune**, a **live HTTP transport** to the Claude API (opt-in `http` feature), and a tutor with graded challenges; and a **WebAssembly browser build** with an editor, shareable-session links, and **real-time co-editing** backed by a **hosted signaling relay**. Whole workspace stays green — `clippy -D warnings`, `wasm32` core + `ohmforge-web`, `-D warnings` docs.
 
 ## License
 

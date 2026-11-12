@@ -1,0 +1,20 @@
+[package]
+name = "ohmforge-digital"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+description = "Event-driven digital logic simulation (gates, flip-flops, buses) with X/Z states and delays."
+
+[lints]
+workspace = true
+
+[dependencies]
+# The kernel is self-contained: integer femtosecond time and index-based nets,
+# no shared ohmforge-core types needed yet. Kept dependency-free so it stays trivially
+# WASM/MSRV-clean. (M2 bus/protocol work may reintroduce an ohmforge-core dep.)

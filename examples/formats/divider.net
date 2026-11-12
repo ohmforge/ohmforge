@@ -1,7 +1,7 @@
 (export (version "E")
   (design
     (source "divider.kicad_sch")
-    (tool "ee-assist example"))
+    (tool "ohmforge example"))
   (components
     (comp (ref "V1")
       (value "DC 10")

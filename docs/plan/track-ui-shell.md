@@ -1,6 +1,6 @@
-# Track design: **ui-shell** (`ee-tui`, `ee-shell`, `ee-instruments`)
+# Track design: **ui-shell** (`ohmforge-tui`, `ohmforge-shell`, `ohmforge-instruments`)
 
-> How a human drives ee-assist: the `eesh` command language, the terminal UI, and the LabVIEW-style virtual instruments. Everything here mutates the same `ee-core` graph and consumes `Signal`s — "type it," "click it," and "ask for it" all lower to the same API.
+> How a human drives ohmforge: the `eesh` command language, the terminal UI, and the LabVIEW-style virtual instruments. Everything here mutates the same `ohmforge-core` graph and consumes `Signal`s — "type it," "click it," and "ask for it" all lower to the same API.
 >
 > Checkpoints: `CP-UX-M0.1 … CP-UX-M2.4`. Full shell spec: [`../SHELL.md`](../SHELL.md). Contracts: [`README.md`](README.md#inter-track-contracts).
 
@@ -8,19 +8,19 @@
 
 | Crate | Owns |
 |---|---|
-| `ee-shell` | `eesh`: the command grammar, parser, the **`Command` AST**, tab-completion, history, and (M1) the embedded scripting engine. |
-| `ee-tui` | The terminal UI (`ratatui` + `crossterm`): schematic renderer, braille waveform plots, dockable panels, mouse placement, themes, help. |
-| `ee-instruments` | Virtual instruments over the engines: scope, DMM, function generator, logic analyzer, PSU, Bode/spectrum — presented as front panels. |
+| `ohmforge-shell` | `eesh`: the command grammar, parser, the **`Command` AST**, tab-completion, history, and (M1) the embedded scripting engine. |
+| `ohmforge-tui` | The terminal UI (`ratatui` + `crossterm`): schematic renderer, braille waveform plots, dockable panels, mouse placement, themes, help. |
+| `ohmforge-instruments` | Virtual instruments over the engines: scope, DMM, function generator, logic analyzer, PSU, Bode/spectrum — presented as front panels. |
 
-Until `ee-sim` produces real signals, this track develops against a **stub `Signal` producer** (a sine/RC generator) so the render and instrument work isn't blocked on the solver.
+Until `ohmforge-sim` produces real signals, this track develops against a **stub `Signal` producer** (a sine/RC generator) so the render and instrument work isn't blocked on the solver.
 
 ---
 
-## `ee-shell` — the command language
+## `ohmforge-shell` — the command language
 
 ### The `Command` AST (contract)
 
-The parser produces a `Command` enum that the `ee` binary dispatches. **The AI emits the same AST**, so anything the copilot does is something you could have typed — and every action is inspectable and replayable.
+The parser produces a `Command` enum that the `of` binary dispatches. **The AI emits the same AST**, so anything the copilot does is something you could have typed — and every action is inspectable and replayable.
 
 ```rust
 pub enum Command {
@@ -28,7 +28,7 @@ pub enum Command {
     Wire(NetRef, NetRef),
     Set { target: ParamRef, value: Value },
     Probe(SignalRef),
-    Analysis(ee_sim::Analysis),        // run/op/ac/sweep/... lower to this
+    Analysis(ohmforge_sim::Analysis),        // run/op/ac/sweep/... lower to this
     Show(Selector), List(Kind),
     Board(BoardCmd), Flash(FlashCmd), Mcu(McuCmd),
     Instrument(InstrumentCmd),         // scope/dmm/funcgen/psu/la/decode
@@ -41,7 +41,7 @@ pub enum Command {
 ### Parsing & UX (`CP-UX-M0.1`)
 
 - Terse, positional-with-options grammar: `add r R1 4k7 a b`, `set R1.value 10k`, `add led D1 anode=a cathode=b`.
-- Values parse through `ee-core::value` everywhere.
+- Values parse through `ohmforge-core::value` everywhere.
 - **`run` is the transient sim** (`run 3ms`); **`source <file.eesh>`** runs a script — the two are distinct verbs (this disambiguation was a doc-review fix).
 - *Gate:* parser unit tests; a scripted session builds the expected `Circuit` graph.
 
@@ -55,7 +55,7 @@ Tab-completes commands, part types, existing refs/nodes, and `k=v` keys; `?` sho
 
 ---
 
-## `ee-tui` — the terminal UI
+## `ohmforge-tui` — the terminal UI
 
 **`ratatui` + `crossterm`** for a portable, SSH-friendly UI. Rendering is **decoupled from simulation** via a snapshot/observer channel, so a slow redraw never stalls the solver (and vice-versa).
 
@@ -78,7 +78,7 @@ Braille sub-cell plotting packs a 2×4 grid of dots per character cell → high 
 
 ---
 
-## `ee-instruments` — LabVIEW-flavored front panels
+## `ohmforge-instruments` — LabVIEW-flavored front panels
 
 Instruments are **consumers of `Signal`s + controllers of sources**; the TUI renders their panels.
 
@@ -100,7 +100,7 @@ Breadboard view (`CP-UX-M2.2`) renders the circuit as a breadboard layout — th
 - **Snapshot tests** for rendering (schematic, braille plots, panels) against golden ASCII — deterministic by construction.
 - **Parser tests** for the full `Command` grammar + error suggestions.
 - **Interaction/event tests** for panel docking, trigger locking, cursor math.
-- Instrument tests run against the **stub signal producer** first, then real `ee-sim` signals once available.
+- Instrument tests run against the **stub signal producer** first, then real `ohmforge-sim` signals once available.
 
 ---
 
