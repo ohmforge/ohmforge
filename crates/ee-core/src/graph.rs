@@ -217,6 +217,26 @@ pub enum Waveform {
     Expr(String),
 }
 
+/// A magnetic-coupling relation between two inductors — the circuit-level record
+/// behind a transformer (`CP-SIM-M6.1`). It names the two inductors by reference
+/// designator and carries their coupling coefficient `k` (`|k| ≤ 1`); the mutual
+/// inductance the solver stamps is `M = k·√(L₁·L₂)`.
+///
+/// This is deliberately a *relation on existing parts*, recorded via
+/// [`Circuit::couple`], rather than a new data-carrying [`PartKind`]: the two
+/// windings stay ordinary [`Inductor`](PartKind::Inductor) parts, so no match arm
+/// anywhere else in the workspace has to learn a new variant.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Coupling {
+    /// Reference designator of the first coupled inductor.
+    pub a: String,
+    /// Reference designator of the second coupled inductor.
+    pub b: String,
+    /// Coupling coefficient `k` (`|k| ≤ 1`; `1` is an ideal, lossless transformer,
+    /// `0` is no coupling). Negative `k` reverses the relative winding sense.
+    pub k: f64,
+}
+
 /// A part instance: a kind, a human reference (`R1`), a primary value, the nets
 /// its terminals connect to, and (for sources) a time [`Waveform`].
 #[derive(Debug, Clone)]
@@ -259,6 +279,12 @@ pub struct Circuit {
     /// about the nominal 27 °C. Defaults to [`NOMINAL_TEMP_C`], so an untouched
     /// circuit matches the temperature-independent solver bit-for-bit. (`CP-SIM-M3.1`.)
     temp_c: f64,
+    /// Magnetic-coupling relations between inductor pairs, recorded by
+    /// [`couple`](Circuit::couple). Empty ⇒ every inductor is independent (the
+    /// pre-M6 behavior, bit-for-bit). Only the transient and AC engines read it; it
+    /// is otherwise inert metadata, like [`tolerances`](Circuit::tolerance).
+    /// (`CP-SIM-M6.1`.)
+    couplings: Vec<Coupling>,
 }
 
 // `Default` is hand-written (not derived) so net 0 is pre-seeded as ground: the
@@ -273,6 +299,7 @@ impl Default for Circuit {
             tolerances: BTreeMap::new(),
             tempcos: BTreeMap::new(),
             temp_c: NOMINAL_TEMP_C,
+            couplings: Vec::new(),
         }
     }
 }
@@ -480,6 +507,48 @@ impl Circuit {
         }
     }
 
+    /// Magnetically couple two inductors with coupling coefficient `k`, recording
+    /// the transformer relation the transient and AC engines stamp as a mutual
+    /// inductance `M = k·√(L_a·L_b)` (`CP-SIM-M6.1`).
+    ///
+    /// Both references must name existing [`Inductor`](PartKind::Inductor) parts,
+    /// they must be distinct, and `k` must be finite with `|k| ≤ 1` (`1` is an
+    /// ideal transformer, `0` no coupling); otherwise the call is a no-op and
+    /// returns `false`. Re-coupling the same unordered pair replaces the earlier
+    /// coefficient rather than recording a duplicate, so the relation stays
+    /// single-valued regardless of argument order. The coupling is pure metadata on
+    /// the two existing inductors — it adds no part and no [`PartKind`] variant.
+    pub fn couple(&mut self, a: &str, b: &str, k: f64) -> bool {
+        if a == b || !k.is_finite() || k.abs() > 1.0 {
+            return false;
+        }
+        let is_inductor = |r: &str| {
+            self.part_by_ref(r)
+                .is_some_and(|p| matches!(p.kind, PartKind::Inductor))
+        };
+        if !is_inductor(a) || !is_inductor(b) {
+            return false;
+        }
+        // Keep the pair single-valued, independent of the order it was named in.
+        let same_pair = |c: &Coupling| (c.a == a && c.b == b) || (c.a == b && c.b == a);
+        if let Some(existing) = self.couplings.iter_mut().find(|c| same_pair(c)) {
+            existing.k = k;
+        } else {
+            self.couplings.push(Coupling {
+                a: a.to_string(),
+                b: b.to_string(),
+                k,
+            });
+        }
+        true
+    }
+
+    /// The magnetic-coupling relations recorded by [`couple`](Circuit::couple), in
+    /// insertion order. Empty for a circuit with no transformers.
+    pub fn couplings(&self) -> &[Coupling] {
+        &self.couplings
+    }
+
     pub fn parts(&self) -> &[Part] {
         &self.parts
     }
@@ -680,5 +749,52 @@ mod tests {
         // A finite temperature is accepted and read back.
         assert!(c.set_temperature(85.0));
         assert_eq!(c.temperature(), 85.0);
+    }
+
+    #[test]
+    fn couple_records_inductor_pairs_and_validates_its_arguments() {
+        let mut c = Circuit::new("xfmr");
+        let (a, b, d) = (c.new_net(), c.new_net(), c.new_net());
+        c.add_part(
+            "L1",
+            PartKind::Inductor,
+            Some(Value::new(1e-3, Unit::Henry)),
+            vec![a, b],
+        );
+        c.add_part(
+            "L2",
+            PartKind::Inductor,
+            Some(Value::new(1e-3, Unit::Henry)),
+            vec![b, d],
+        );
+        c.add_part(
+            "R1",
+            PartKind::Resistor,
+            Some(Value::new(1000.0, Unit::Ohm)),
+            vec![a, d],
+        );
+
+        // A fresh circuit has no couplings.
+        assert!(c.couplings().is_empty());
+
+        // A valid pair is recorded.
+        assert!(c.couple("L1", "L2", 0.9));
+        assert_eq!(c.couplings().len(), 1);
+        assert_eq!(c.couplings()[0].k, 0.9);
+
+        // Re-coupling the same pair (either order) replaces the coefficient, never
+        // duplicates.
+        assert!(c.couple("L2", "L1", 1.0));
+        assert_eq!(c.couplings().len(), 1);
+        assert_eq!(c.couplings()[0].k, 1.0);
+
+        // Rejected: a non-inductor, a self-pair, a missing part, and |k| > 1.
+        assert!(!c.couple("L1", "R1", 0.5));
+        assert!(!c.couple("L1", "L1", 0.5));
+        assert!(!c.couple("L1", "L9", 0.5));
+        assert!(!c.couple("L1", "L2", 1.5));
+        // All rejections left the single valid coupling untouched.
+        assert_eq!(c.couplings().len(), 1);
+        assert_eq!(c.couplings()[0].k, 1.0);
     }
 }
