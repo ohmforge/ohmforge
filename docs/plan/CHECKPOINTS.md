@@ -152,7 +152,7 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 - [x] **CP-AF-M6.2** (ai-fmt) AI auto-tune: closed-loop component-value optimization against a measured spec via the verify loop (deterministic gradient-free search), offline. — *gate:* `auto_tune_converges_on_the_divider_target` — from a wrong R2 the bisection lands v(out) within 1e-4 V of 3.3 V on a real sim, deterministically, no network/key.
 - [x] **CP-UX-M6.1** (ui-shell) Live interactive tuning + current-flow animation: adjust a selected component through the app event loop and re-solve live; animate branch-current direction/magnitude on the overlay (deferred since M1). — *gate:* `app_live_tuning_resolves_op_point_and_current_flow` (`+` nudge → `EditAction::Tune`→shell `set` → `Backend::op_point` re-solve; v(out) 5V→4.76V, R1 current falls, V1 current leaves the + terminal) + `set_retargets_a_value_reflects_in_op_point_and_is_undoable`; pure `branch_currents` (Ohm's law + source KCL) and `flow_glyph` density/phase tests (`current::tests`), overlay flow render at exact visible width. All on data, no tty.
 - [x] **CP-WEB.5** (web) Real-time co-edit relay: op-based merge layer (`Replica` + clock-tagged `EditOp`, LWW by `(lamport, site)`, log replayed via `BTreeMap`) so two browsers converge on one circuit, plus a thin hand-rolled `BroadcastChannel` `CoEdit` binding gated to `wasm32` (no `web-sys`). — *gate:* `two_replicas_converge_to_identical_netlist`, `conflicting_edits_resolve_deterministically_either_order`, `concurrent_add_remove_of_same_part_is_deterministic`, `merge_is_idempotent_and_order_free_on_the_same_set`, `op_encode_decode_round_trips`, `garbage_ops_decode_to_clean_error` (6 new host tests, 29 total in `ee-web`); no new deps. _(Closes the documented M5 follow-up; hosted signaling relay stays deferred.)_
-- [ ] **CP-SHIP.2** (platform) Polish & tag **v0.4.0**: refresh docs/examples/README for M6, full CI-parity gate sweep, tag the release. Done on `main` during reconcile.
+- [x] **CP-SHIP.2** (platform) Polish & tag **v0.4.0**: refresh docs/examples/README for M6, full CI-parity gate sweep, tag the release. — *gate:* fmt + `clippy -D warnings` + `cargo test --workspace` + `wasm32` (core **and** `ee-web`) + `-D warnings` docs all green on fully-merged `main`; README status refreshed to M0–M6; **v0.4.0** tagged.
 
 ---
 
@@ -164,9 +164,9 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 | boards | 16 | 0 | 16 |
 | ui-shell | 17 | 0 | 17 |
 | ai-fmt | 16 | 0 | 16 |
-| platform | 6 | 0 | 7 |
+| platform | 7 | 0 | 7 |
 | web | 5 | 0 | 5 |
-| **Total** | **83** | **0** | **84** |
+| **Total** | **84** | **0** | **84** |
 
 _**67/67 — M0 through M4 all complete** (M0–M3 tagged v0.1.0; M4 adds the rest). M4 delivered the **plugin device-model API** + an **instrument/block plugin trait**, a **KLU-class ordered/reusable sparse solver** and **multithreaded analyses**, a **Cortex-M3/M4 (Thumb-2)** core with an STM32 board, **SPICE `.model` import** + a vendor model library, and **shareable circuit links** in the browser. Deferred by design: real-time collaboration, the QEMU full-SBC bridge, and full vendor-SPICE `.model` fidelity — the standing M-next horizon._
 
