@@ -110,7 +110,7 @@ pub mod tutor;
 pub mod verify;
 
 pub use client::{Client, RunResult, ToolHandler, DEFAULT_MAX_TOKENS, DEFAULT_MAX_TOOL_TURNS};
-pub use config::{api_key_from_env, model_from_env, DEFAULT_MODEL};
+pub use config::{api_key_from_env, base_url_from_env, model_from_env, DEFAULT_MODEL};
 pub use error::AiError;
 pub use message::{
     response_to_events, CacheControl, ContentBlock, ContentDelta, Message, ModelRequest,

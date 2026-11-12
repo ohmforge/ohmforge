@@ -154,6 +154,10 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 - [x] **CP-WEB.5** (web) Real-time co-edit relay: op-based merge layer (`Replica` + clock-tagged `EditOp`, LWW by `(lamport, site)`, log replayed via `BTreeMap`) so two browsers converge on one circuit, plus a thin hand-rolled `BroadcastChannel` `CoEdit` binding gated to `wasm32` (no `web-sys`). — *gate:* `two_replicas_converge_to_identical_netlist`, `conflicting_edits_resolve_deterministically_either_order`, `concurrent_add_remove_of_same_part_is_deterministic`, `merge_is_idempotent_and_order_free_on_the_same_set`, `op_encode_decode_round_trips`, `garbage_ops_decode_to_clean_error` (6 new host tests, 29 total in `ee-web`); no new deps. _(Closes the documented M5 follow-up; hosted signaling relay stays deferred.)_
 - [x] **CP-SHIP.2** (platform) Polish & tag **v0.4.0**: refresh docs/examples/README for M6, full CI-parity gate sweep, tag the release. — *gate:* fmt + `clippy -D warnings` + `cargo test --workspace` + `wasm32` (core **and** `ee-web`) + `-D warnings` docs all green on fully-merged `main`; README status refreshed to M0–M6; **v0.4.0** tagged.
 
+### Maintenance (post-v0.4.0)
+
+- **Configurable AI endpoint** (ai-fmt): `HttpTransport::from_env` now resolves the API base URL from `EE_BASE_URL`, then `ANTHROPIC_BASE_URL`, then the stock `api.anthropic.com` endpoint — so the copilot can be routed at a proxy/gateway without a code change, mirroring the `EE_MODEL`/`ANTHROPIC_MODEL` precedence. Pure `resolve_base_url` resolver (test `base_url_defaults_and_env_overrides`); re-exported as `ee_ai::base_url_from_env`; documented in [`docs/guide/ai-copilot.md`](../guide/ai-copilot.md). Not a numbered checkpoint — an additive config knob on the M1 Claude client.
+
 ---
 
 ### Progress summary

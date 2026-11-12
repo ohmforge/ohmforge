@@ -2,7 +2,7 @@
 //! assembly, the request shape (prompt-cache markers + default model), and
 //! the missing-key error. Everything runs against `MockTransport`.
 
-use ee_ai::config::{resolve_api_key, resolve_model};
+use ee_ai::config::{resolve_api_key, resolve_base_url, resolve_model};
 use ee_ai::{
     response_to_events, AiError, CacheControl, Client, ContentBlock, Message, ModelResponse, Role,
     StopReason, StreamAssembler, StreamEvent, SystemBlock, Tool, Usage, DEFAULT_MODEL,
@@ -242,6 +242,33 @@ fn default_model_is_pinned_sonnet_and_env_overrides() {
         "anthropic-pick"
     );
     assert_eq!(resolve_model(Some(""), None), "claude-sonnet-5-5");
+}
+
+#[test]
+fn base_url_defaults_and_env_overrides() {
+    const DEFAULT: &str = "https://api.anthropic.com/v1/messages";
+    // No override → the stock endpoint.
+    assert_eq!(resolve_base_url(None, None, DEFAULT), DEFAULT);
+    // EE_BASE_URL wins over ANTHROPIC_BASE_URL.
+    assert_eq!(
+        resolve_base_url(
+            Some("https://ee.proxy/v1"),
+            Some("https://anthropic.proxy/v1"),
+            DEFAULT
+        ),
+        "https://ee.proxy/v1"
+    );
+    // ANTHROPIC_BASE_URL used when EE_BASE_URL is absent — the var the user asked for.
+    assert_eq!(
+        resolve_base_url(None, Some("https://gateway.internal/v1/messages"), DEFAULT),
+        "https://gateway.internal/v1/messages"
+    );
+    // Blank/whitespace values are ignored and fall through to the default.
+    assert_eq!(
+        resolve_base_url(Some("   "), Some("https://anthropic.proxy/v1"), DEFAULT),
+        "https://anthropic.proxy/v1"
+    );
+    assert_eq!(resolve_base_url(Some(""), None, DEFAULT), DEFAULT);
 }
 
 #[test]

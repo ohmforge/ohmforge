@@ -18,6 +18,10 @@ pub const ENV_MODEL_PRIMARY: &str = "EE_MODEL";
 pub const ENV_MODEL_FALLBACK: &str = "ANTHROPIC_MODEL";
 /// Environment variable holding the API key.
 pub const ENV_API_KEY: &str = "ANTHROPIC_API_KEY";
+/// Environment variable checked first for a base-URL override.
+pub const ENV_BASE_URL_PRIMARY: &str = "EE_BASE_URL";
+/// Environment variable checked second for a base-URL override.
+pub const ENV_BASE_URL_FALLBACK: &str = "ANTHROPIC_BASE_URL";
 
 /// Resolve the model id from the two possible overrides, falling back to
 /// [`DEFAULT_MODEL`]. `EE_MODEL` wins over `ANTHROPIC_MODEL`; a value that is
@@ -57,4 +61,34 @@ pub fn model_from_env() -> String {
 pub fn api_key_from_env() -> Result<String, AiError> {
     let raw = std::env::var(ENV_API_KEY).ok();
     resolve_api_key(raw.as_deref())
+}
+
+/// Resolve the API base URL from the two possible overrides, falling back to
+/// `default`. `EE_BASE_URL` wins over `ANTHROPIC_BASE_URL`; a value that is empty
+/// or only whitespace is treated as unset — so an override that routes the client
+/// at a proxy or gateway reaches it, while an unset or blank var keeps the stock
+/// endpoint.
+///
+/// Pure and deterministic — this is the function under test; [`base_url_from_env`]
+/// is the thin wrapper that reads the real environment.
+pub fn resolve_base_url(
+    ee_base_url: Option<&str>,
+    anthropic_base_url: Option<&str>,
+    default: &str,
+) -> String {
+    [ee_base_url, anthropic_base_url]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|v| !v.is_empty())
+        .unwrap_or(default)
+        .to_string()
+}
+
+/// The API base URL to use, consulting `EE_BASE_URL`, then `ANTHROPIC_BASE_URL`,
+/// then `default`.
+pub fn base_url_from_env(default: &str) -> String {
+    let primary = std::env::var(ENV_BASE_URL_PRIMARY).ok();
+    let fallback = std::env::var(ENV_BASE_URL_FALLBACK).ok();
+    resolve_base_url(primary.as_deref(), fallback.as_deref(), default)
 }

@@ -113,12 +113,15 @@ impl HttpTransport {
     /// The Messages API endpoint.
     pub const DEFAULT_BASE_URL: &'static str = "https://api.anthropic.com/v1/messages";
 
-    /// Build a transport, reading `ANTHROPIC_API_KEY` from the environment.
-    /// Returns [`AiError::MissingApiKey`] if it is absent or blank.
+    /// Build a transport from the environment: the API key from
+    /// `ANTHROPIC_API_KEY` and the endpoint from `EE_BASE_URL` (then
+    /// `ANTHROPIC_BASE_URL`, then [`DEFAULT_BASE_URL`](Self::DEFAULT_BASE_URL)),
+    /// so a proxy or gateway can be selected without a code change. Returns
+    /// [`AiError::MissingApiKey`] if no key is present or it is blank.
     pub fn from_env() -> Result<Self, AiError> {
         Ok(HttpTransport {
             api_key: crate::config::api_key_from_env()?,
-            base_url: Self::DEFAULT_BASE_URL.to_string(),
+            base_url: crate::config::base_url_from_env(Self::DEFAULT_BASE_URL),
         })
     }
 

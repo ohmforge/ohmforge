@@ -50,10 +50,13 @@ Resolved from the environment at runtime, never hard-coded or committed:
 |---|---|
 | `EE_MODEL`, then `ANTHROPIC_MODEL` | override the pinned `DEFAULT_MODEL` (first non-blank wins) |
 | `ANTHROPIC_API_KEY` | the key the real HTTP transport reads; the mock never needs one |
+| `EE_BASE_URL`, then `ANTHROPIC_BASE_URL` | override the API endpoint — point the client at a proxy or gateway (first non-blank wins; else the stock `api.anthropic.com` endpoint) |
 
-The precedence lives in pure resolvers (`resolve_model`, `resolve_api_key`) so
-it is unit-tested without mutating the process environment. A missing/blank key
-is a clear `AiError::MissingApiKey`; the key is held, never logged.
+The precedence lives in pure resolvers (`resolve_model`, `resolve_api_key`,
+`resolve_base_url`) so it is unit-tested without mutating the process
+environment. A missing/blank key is a clear `AiError::MissingApiKey`; the key is
+held, never logged. The base URL is read by `HttpTransport::from_env` alongside
+the key, so a proxy or gateway is selected without a code change.
 
 ---
 
