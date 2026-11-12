@@ -148,6 +148,10 @@
             <label>&nbsp;</label>
             <button id="share" disabled>Copy session link</button>
           </div>
+          <div>
+            <label>&nbsp;</label>
+            <button id="coedit" disabled>Co-edit: sync tabs</button>
+          </div>
         </div>
 
         <div class="editor">
@@ -199,6 +203,7 @@
         edit_remove,
         encode_session_share,
         decode_session_share,
+        CoEdit,
       } from "./pkg/ee_web.js";
 
       const DEMOS = {
@@ -366,13 +371,11 @@ C2 out gnd 100n
       function addPart() {
         editErr.textContent = "";
         try {
-          netlist.value = edit_add(
-            netlist.value,
-            $("p-ref").value,
-            $("p-a").value,
-            $("p-b").value,
-            $("p-val").value
-          );
+          // With co-edit on, route the edit through the replica so it is
+          // broadcast as an op; otherwise rewrite the text directly (CP-WEB.3).
+          netlist.value = co
+            ? co.add_part($("p-ref").value, $("p-a").value, $("p-b").value, $("p-val").value)
+            : edit_add(netlist.value, $("p-ref").value, $("p-a").value, $("p-b").value, $("p-val").value);
         } catch (e) {
           editErr.textContent = String(e);
           return;
@@ -384,12 +387,56 @@ C2 out gnd 100n
       function removePart(ref) {
         editErr.textContent = "";
         try {
-          netlist.value = edit_remove(netlist.value, ref);
+          netlist.value = co ? co.remove_part(ref) : edit_remove(netlist.value, ref);
         } catch (e) {
           editErr.textContent = String(e);
           return;
         }
         runSim(); // re-simulate on edit
+      }
+
+      // --- Real-time co-edit (CP-WEB.5) ----------------------------------
+      // A thin layer over the host-tested op-merge: `CoEdit` wraps a replica and
+      // a same-origin `BroadcastChannel`; local part edits broadcast an op, and a
+      // sibling channel feeds incoming ops back through `co.receive`. Two tabs on
+      // the same room converge to one netlist. (A hosted relay for cross-machine
+      // sessions is deferred; the WebSocket client would drop in right here.)
+      let co = null; // active replica, or null when co-edit is off
+      let rx = null; // inbound channel
+      function toggleCoedit() {
+        if (co) {
+          rx.close();
+          co.close();
+          co = rx = null;
+          $("coedit").textContent = "Co-edit: sync tabs";
+          statusEl.textContent = "Co-edit off.";
+          return;
+        }
+        const room = "ee-coedit"; // same-origin room shared by every tab
+        const site = BigInt(Math.floor(Math.random() * 2 ** 31)); // distinct per tab
+        co = new CoEdit(site, room);
+        // Seed the replica from the current parts so this tab contributes its
+        // state (each add is broadcast as an op the other tabs merge).
+        try {
+          const model = JSON.parse(list_parts(netlist.value));
+          if (model.title) co.set_title(model.title);
+          for (const p of model.parts) co.add_part(p.reference, p.node_a, p.node_b, p.value);
+          netlist.value = co.netlist();
+        } catch (e) {
+          editErr.textContent = String(e);
+        }
+        rx = new BroadcastChannel(room);
+        rx.onmessage = (e) => {
+          try {
+            netlist.value = co.receive(e.data); // garbage ops throw → ignored
+            refreshParts();
+            runSim();
+          } catch {}
+        };
+        $("coedit").textContent = "Co-edit: ON (stop)";
+        statusEl.textContent = "Co-edit on — part edits sync to other tabs on this origin.";
+        refreshParts();
+        runSim();
       }
 
       init()
@@ -398,9 +445,11 @@ C2 out gnd 100n
           $("run").disabled = false;
           $("share").disabled = false;
           $("p-add").disabled = false;
+          $("coedit").disabled = false;
           $("run").addEventListener("click", runSim);
           $("share").addEventListener("click", shareLink);
           $("p-add").addEventListener("click", addPart);
+          $("coedit").addEventListener("click", toggleCoedit);
           // Typing in the netlist keeps the parts list in sync (no re-run).
           netlist.addEventListener("input", refreshParts);
           // A shared link (#…) wins over the default demo: load it, then run.

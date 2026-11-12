@@ -166,9 +166,33 @@ link** encodes `{netlist, duration, step, probes}`, and on load (and `hashchange
 the page decodes it, restores every field, and re-runs — falling back to a legacy
 netlist-only token if the fragment is not a session.
 
-**Out of scope: real-time co-editing.** A session link is a point-in-time
-snapshot (async collaboration — you send a link, they open it later). Live
-multi-cursor co-editing is deliberately *not* built here: it needs a server-side
-relay or a CRDT backend to merge concurrent edits, which this static,
-backend-free page (just `.wasm` + `.js` + `.html`, served from any file host)
-has no place for.
+## Real-time co-edit (CP-WEB.5)
+
+A session link is an async snapshot; live co-editing needs edits from two
+browsers to *converge*. That merge layer is `ee_web::Replica` + `EditOp`: every
+edit is a small, clock-tagged op (add/remove/update part, set value, re-wire,
+set title), replicas exchange ops over any transport in any order (with
+duplicates), and each replica **materializes** the circuit by replaying its op
+log in `(lamport, site)` order. Final state is a pure function of the *set* of
+ops, so replicas converge to an identical netlist; conflicting concurrent edits
+resolve last-writer-wins by clock, with the site id as the deterministic
+tiebreak. It is plain host Rust (one `BTreeMap`, no new deps), unit-tested in CI:
+
+```text
+two replicas edit, swap ops in different orders → identical netlist
+two concurrent writes to one value         → same winner on both, either order
+a garbage op token                         → clean Err (never a panic)
+```
+
+The browser side is the thin `CoEdit` binding: a `Replica` wired to a same-origin
+`BroadcastChannel` (a hand-rolled `wasm-bindgen` extern — no `web-sys`). Local
+part edits broadcast their op; the page feeds inbound messages back through
+`CoEdit::receive`. Each op is a URL/transport-safe base64url token
+(`EditOp::encode`/`decode`), so the exact same tokens would travel over a
+WebSocket unchanged.
+
+**Still deferred: the hosted signaling/relay server.** `BroadcastChannel` only
+reaches tabs on the same origin on one machine. Cross-machine sessions need a
+relay (a WebSocket the tokens flow through); that server is a standalone backend
+effort and stays out of scope — the client binding + merge logic ship here, and
+the WebSocket client would drop straight in where `CoEdit` holds its channel.
