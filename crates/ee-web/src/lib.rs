@@ -493,9 +493,10 @@ impl CircuitModel {
 // makes the round trip *exact*: its comments, blank lines, CRLFs and trailing
 // newline all survive, because nothing re-parses or re-emits them.
 //
-// Real-time co-editing is deliberately **out of scope**: a shared link is a
-// point-in-time snapshot (async collaboration). Live multi-cursor editing needs
-// a relay / CRDT backend, which this static, backend-free page has no place for.
+// A shared link is a point-in-time snapshot (async collaboration). Live
+// multi-cursor co-editing — where two browsers *converge* on one circuit — is a
+// separate concern handled by the op-based merge layer below (CP-WEB.5); only
+// the hosted signaling relay for cross-machine sessions stays deferred.
 
 /// A full workbench snapshot: the circuit (as netlist text) plus the view
 /// settings the page holds (transient `duration`/`step` and the scoped `probes`).
@@ -611,6 +612,436 @@ impl Session {
     }
 }
 
+// --- Real-time co-edit merge layer (CP-WEB.5) ------------------------------
+//
+// CP-WEB.4 left real-time co-editing deferred because a shared *snapshot* link
+// can't converge two people typing at once. This is the merge layer that lets
+// them: an **op-based** scheme where every edit is a small, clock-tagged
+// [`EditOp`], replicas exchange ops over any transport in any order, and each
+// replica deterministically derives the same [`CircuitModel`] — hence the same
+// netlist — from the same *set* of ops.
+//
+// ## Why it converges (the deterministic rule)
+//
+// Each op carries a [`Clock`] = (Lamport counter, site id). A [`Replica`] keeps
+// its ops in a log deduplicated by clock; the model is **materialized** by
+// replaying that log in `(lamport, site)` order. Two things make this provably
+// convergent without a CRDT library:
+//
+//  * **Order independence.** Final state is a pure function of the *set* of ops
+//    (they get sorted into one canonical order before replay), so ops may arrive
+//    in any order, be redelivered, or be merged in batches — the result is the
+//    same.
+//  * **Last-writer-wins.** When two ops touch the same part/field, replay visits
+//    them in clock order, so the higher `(lamport, site)` wins. The site id
+//    breaks ties between truly concurrent edits at the *same* Lamport time, so
+//    the winner is identical on every replica regardless of delivery order.
+//
+// Parts are keyed by reference (a `BTreeMap`), so the emitted netlist is ordered
+// deterministically too. The whole layer is plain host Rust (one `BTreeMap`, no
+// new deps) and is unit-tested in CI without a browser; the `wasm` module adds
+// only a thin [`BroadcastChannel`] outbound binding (see `CoEdit`).
+
+use std::collections::BTreeMap;
+
+/// A logical clock: a Lamport counter plus the id of the site that stamped it.
+///
+/// The derived `Ord` compares `lamport` first, then `site`, giving a **total**
+/// order over ops from every replica — the backbone of the last-writer-wins
+/// rule. The `site` field is what makes two concurrent edits (same `lamport`)
+/// resolve to the same winner everywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Clock {
+    /// Lamport timestamp: bumped on every local edit, pulled forward to
+    /// `max(local, incoming)` on merge so causally-later ops sort later.
+    pub lamport: u64,
+    /// Originating site (replica) id; the deterministic tiebreak for a tie on
+    /// `lamport`.
+    pub site: u64,
+}
+
+/// What one edit does, with the target part identified by its `reference`.
+///
+/// This is the vocabulary the spec calls for — add / remove / update a part,
+/// set a value, re-wire — plus a title set, since the netlist carries a title.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpKind {
+    /// Add (or overwrite) a whole part.
+    AddPart {
+        /// Reference designator (`R1`, `C2`, …); the part's identity.
+        reference: String,
+        /// First terminal node name.
+        node_a: String,
+        /// Second terminal node name.
+        node_b: String,
+        /// Raw value field (`"1k"`, `"100n"`).
+        value: String,
+    },
+    /// Delete the part with this reference.
+    RemovePart {
+        /// Reference designator to remove.
+        reference: String,
+    },
+    /// Change just the value of an existing part.
+    SetValue {
+        /// Reference designator to retune.
+        reference: String,
+        /// New raw value field.
+        value: String,
+    },
+    /// Re-wire an existing part's two terminals.
+    Wire {
+        /// Reference designator to re-wire.
+        reference: String,
+        /// New first terminal node name.
+        node_a: String,
+        /// New second terminal node name.
+        node_b: String,
+    },
+    /// Set (or clear, with `None`) the circuit title.
+    SetTitle {
+        /// The new `.title` text, or `None` to drop it.
+        title: Option<String>,
+    },
+}
+
+/// A clock-tagged edit — the unit two replicas exchange.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditOp {
+    /// When/where this edit was stamped; the sort key for replay.
+    pub clock: Clock,
+    /// The edit itself.
+    pub kind: OpKind,
+}
+
+/// An op-based replica of a circuit: a site id, a Lamport counter, and the
+/// merged op log. Local edits ([`add_part`](Replica::add_part), …) return the
+/// [`EditOp`] to broadcast; incoming ops go through [`merge`](Replica::merge).
+/// Any two replicas fed the **same set of ops** (in any order, with duplicates)
+/// [`materialize`](Replica::materialize) to an identical [`CircuitModel`] and
+/// hence an identical [`to_netlist`](Replica::to_netlist).
+#[derive(Debug, Clone)]
+pub struct Replica {
+    site: u64,
+    lamport: u64,
+    /// Ops sorted by `clock`, deduplicated by `clock` (idempotent redelivery).
+    log: Vec<EditOp>,
+}
+
+/// Reject an empty or whitespace-bearing token (the netlist is whitespace-
+/// delimited), mirroring [`CircuitModel::add_part`]'s validation.
+fn check_token(what: &str, tok: &str) -> Result<(), String> {
+    if tok.is_empty() {
+        return Err(format!("{what} must not be empty"));
+    }
+    if tok.split_whitespace().count() != 1 {
+        return Err(format!("{what} {tok:?} must not contain whitespace"));
+    }
+    Ok(())
+}
+
+impl Replica {
+    /// A fresh replica for `site`. Distinct replicas MUST use distinct site ids
+    /// (that is what makes the last-writer-wins tiebreak deterministic).
+    pub fn new(site: u64) -> Replica {
+        Replica {
+            site,
+            lamport: 0,
+            log: Vec::new(),
+        }
+    }
+
+    /// This replica's site id.
+    pub fn site(&self) -> u64 {
+        self.site
+    }
+
+    /// Stamp the next local clock (bump the Lamport counter).
+    fn tick(&mut self) -> Clock {
+        self.lamport += 1;
+        Clock {
+            lamport: self.lamport,
+            site: self.site,
+        }
+    }
+
+    /// Record a locally-stamped op into the log and hand it back to broadcast.
+    fn commit(&mut self, kind: OpKind) -> EditOp {
+        let op = EditOp {
+            clock: self.tick(),
+            kind,
+        };
+        self.merge(op.clone());
+        op
+    }
+
+    /// Add a part locally. Validates like [`CircuitModel::add_part`] (known kind,
+    /// no empty/whitespace tokens) but — unlike the single-user editor — does
+    /// **not** reject a duplicate reference: a concurrent add of the same ref on
+    /// another replica is a legitimate conflict the merge rule resolves by clock.
+    pub fn add_part(
+        &mut self,
+        reference: &str,
+        node_a: &str,
+        node_b: &str,
+        value: &str,
+    ) -> Result<EditOp, String> {
+        kind_label(reference.trim())?;
+        check_token("reference", reference.trim())?;
+        check_token("first node", node_a.trim())?;
+        check_token("second node", node_b.trim())?;
+        check_token("value", value.trim())?;
+        Ok(self.commit(OpKind::AddPart {
+            reference: reference.trim().to_string(),
+            node_a: node_a.trim().to_string(),
+            node_b: node_b.trim().to_string(),
+            value: value.trim().to_string(),
+        }))
+    }
+
+    /// Remove a part locally.
+    pub fn remove_part(&mut self, reference: &str) -> Result<EditOp, String> {
+        check_token("reference", reference.trim())?;
+        Ok(self.commit(OpKind::RemovePart {
+            reference: reference.trim().to_string(),
+        }))
+    }
+
+    /// Retune a part's value locally.
+    pub fn set_value(&mut self, reference: &str, value: &str) -> Result<EditOp, String> {
+        check_token("reference", reference.trim())?;
+        check_token("value", value.trim())?;
+        Ok(self.commit(OpKind::SetValue {
+            reference: reference.trim().to_string(),
+            value: value.trim().to_string(),
+        }))
+    }
+
+    /// Re-wire a part's terminals locally.
+    pub fn wire(&mut self, reference: &str, node_a: &str, node_b: &str) -> Result<EditOp, String> {
+        check_token("reference", reference.trim())?;
+        check_token("first node", node_a.trim())?;
+        check_token("second node", node_b.trim())?;
+        Ok(self.commit(OpKind::Wire {
+            reference: reference.trim().to_string(),
+            node_a: node_a.trim().to_string(),
+            node_b: node_b.trim().to_string(),
+        }))
+    }
+
+    /// Set (or clear) the title locally.
+    pub fn set_title(&mut self, title: Option<&str>) -> EditOp {
+        self.commit(OpKind::SetTitle {
+            title: title.map(str::to_string),
+        })
+    }
+
+    /// Merge one op (local or remote) into the log. Pulls the Lamport counter
+    /// forward past the op's clock, then inserts it in sorted position — unless
+    /// an op with the identical clock is already present, making redelivery and
+    /// double-merge idempotent.
+    pub fn merge(&mut self, op: EditOp) {
+        if op.clock.lamport > self.lamport {
+            self.lamport = op.clock.lamport;
+        }
+        match self.log.binary_search_by(|e| e.clock.cmp(&op.clock)) {
+            Ok(_) => {} // already have this exact op (dedup) → idempotent
+            Err(pos) => self.log.insert(pos, op),
+        }
+    }
+
+    /// Merge a batch of ops (any order; duplicates fine).
+    pub fn merge_many(&mut self, ops: &[EditOp]) {
+        for op in ops {
+            self.merge(op.clone());
+        }
+    }
+
+    /// Every op this replica currently holds, in canonical `(lamport, site)`
+    /// order — the set to hand another replica so both converge.
+    pub fn ops(&self) -> &[EditOp] {
+        &self.log
+    }
+
+    /// Derive the circuit from the op log by replaying it in clock order, so the
+    /// highest-clock edit to each part/field wins (last-writer-wins). Pure in the
+    /// log: calling it twice, or on another replica holding the same ops, yields
+    /// an identical [`CircuitModel`].
+    pub fn materialize(&self) -> CircuitModel {
+        let mut title: Option<String> = None;
+        let mut parts: BTreeMap<String, Part> = BTreeMap::new();
+        for op in &self.log {
+            match &op.kind {
+                OpKind::AddPart {
+                    reference,
+                    node_a,
+                    node_b,
+                    value,
+                } => {
+                    parts.insert(
+                        reference.clone(),
+                        Part {
+                            reference: reference.clone(),
+                            node_a: node_a.clone(),
+                            node_b: node_b.clone(),
+                            value: value.clone(),
+                        },
+                    );
+                }
+                OpKind::RemovePart { reference } => {
+                    parts.remove(reference);
+                }
+                OpKind::SetValue { reference, value } => {
+                    if let Some(p) = parts.get_mut(reference) {
+                        p.value = value.clone();
+                    }
+                }
+                OpKind::Wire {
+                    reference,
+                    node_a,
+                    node_b,
+                } => {
+                    if let Some(p) = parts.get_mut(reference) {
+                        p.node_a = node_a.clone();
+                        p.node_b = node_b.clone();
+                    }
+                }
+                OpKind::SetTitle { title: t } => title = t.clone(),
+            }
+        }
+        CircuitModel {
+            title,
+            parts: parts.into_values().collect(),
+        }
+    }
+
+    /// The materialized circuit as netlist text (what two replicas must match).
+    pub fn to_netlist(&self) -> String {
+        self.materialize().to_netlist()
+    }
+}
+
+impl EditOp {
+    /// Encode an op into a URL/transport-safe token (base64url, no padding),
+    /// round-tripping exactly through [`EditOp::decode`]. The payload is a small
+    /// line-oriented blob wrapped in the same base64url as the share links, so a
+    /// token drops straight into a `BroadcastChannel`/WebSocket message.
+    pub fn encode(&self) -> String {
+        let mut b = String::new();
+        b.push_str("EEOP1\n");
+        b.push_str(&format!("{}\n{}\n", self.clock.lamport, self.clock.site));
+        match &self.kind {
+            OpKind::AddPart {
+                reference,
+                node_a,
+                node_b,
+                value,
+            } => {
+                b.push_str("add\n");
+                b.push_str(&format!("{reference}\n{node_a}\n{node_b}\n{value}\n"));
+            }
+            OpKind::RemovePart { reference } => {
+                b.push_str(&format!("rm\n{reference}\n"));
+            }
+            OpKind::SetValue { reference, value } => {
+                b.push_str(&format!("val\n{reference}\n{value}\n"));
+            }
+            OpKind::Wire {
+                reference,
+                node_a,
+                node_b,
+            } => {
+                b.push_str(&format!("wire\n{reference}\n{node_a}\n{node_b}\n"));
+            }
+            OpKind::SetTitle { title } => match title {
+                Some(t) => b.push_str(&format!("title\nsome\n{t}\n")),
+                None => b.push_str("title\nnone\n"),
+            },
+        }
+        encode(&b)
+    }
+
+    /// Decode a token produced by [`EditOp::encode`]. Tolerant of a leading `#`
+    /// (via [`decode`]) but otherwise strict: a bad base64url token, wrong
+    /// magic, a non-numeric clock, an unknown op tag, or a truncated body is a
+    /// clean `Err` — **never** a panic. This is the guard that keeps a garbage
+    /// message off the wire from crashing the page.
+    pub fn decode(token: &str) -> Result<EditOp, String> {
+        let raw = decode(token)?;
+        let rest = raw
+            .strip_prefix("EEOP1\n")
+            .ok_or("not an edit op (bad magic/version)")?;
+
+        let (lamport_s, rest) = take_line(rest)?;
+        let lamport = lamport_s
+            .parse::<u64>()
+            .map_err(|_| format!("bad op lamport: {lamport_s:?}"))?;
+        let (site_s, rest) = take_line(rest)?;
+        let site = site_s
+            .parse::<u64>()
+            .map_err(|_| format!("bad op site: {site_s:?}"))?;
+        let (tag, rest) = take_line(rest)?;
+
+        let kind = match tag {
+            "add" => {
+                let (reference, rest) = take_line(rest)?;
+                let (node_a, rest) = take_line(rest)?;
+                let (node_b, rest) = take_line(rest)?;
+                let (value, _) = take_line(rest)?;
+                OpKind::AddPart {
+                    reference: reference.to_string(),
+                    node_a: node_a.to_string(),
+                    node_b: node_b.to_string(),
+                    value: value.to_string(),
+                }
+            }
+            "rm" => {
+                let (reference, _) = take_line(rest)?;
+                OpKind::RemovePart {
+                    reference: reference.to_string(),
+                }
+            }
+            "val" => {
+                let (reference, rest) = take_line(rest)?;
+                let (value, _) = take_line(rest)?;
+                OpKind::SetValue {
+                    reference: reference.to_string(),
+                    value: value.to_string(),
+                }
+            }
+            "wire" => {
+                let (reference, rest) = take_line(rest)?;
+                let (node_a, rest) = take_line(rest)?;
+                let (node_b, _) = take_line(rest)?;
+                OpKind::Wire {
+                    reference: reference.to_string(),
+                    node_a: node_a.to_string(),
+                    node_b: node_b.to_string(),
+                }
+            }
+            "title" => {
+                let (present, rest) = take_line(rest)?;
+                match present {
+                    "none" => OpKind::SetTitle { title: None },
+                    "some" => {
+                        let (t, _) = take_line(rest)?;
+                        OpKind::SetTitle {
+                            title: Some(t.to_string()),
+                        }
+                    }
+                    other => return Err(format!("bad title op presence: {other:?}")),
+                }
+            }
+            other => return Err(format!("unknown op tag: {other:?}")),
+        };
+
+        Ok(EditOp {
+            clock: Clock { lamport, site },
+            kind,
+        })
+    }
+}
+
 /// The browser-facing API — a thin `#[wasm_bindgen]` shell over [`run`]. Compiled
 /// only for `wasm32`, so `wasm-bindgen` never enters the host build.
 #[cfg(target_arch = "wasm32")]
@@ -722,6 +1153,132 @@ mod wasm {
         super::decode_session(token)
             .map(|s| s.to_json())
             .map_err(|e| JsValue::from_str(&e))
+    }
+
+    // --- Real-time co-edit relay (CP-WEB.5) --------------------------------
+    //
+    // A hand-rolled binding to the browser's `BroadcastChannel` (same-origin
+    // tabs) — no `web-sys`/`js-sys` dependency, matching the house style. Only
+    // the *outbound* `postMessage` is bound here: the page wires the inbound
+    // side with `channel.onmessage = e => coedit.receive(e.data)`, so this stays
+    // a thin client binding. A hosted signaling/relay **server** (for cross-
+    // machine sessions over a WebSocket) stays out of scope — deferred — and
+    // would slot in exactly here by swapping the transport for a socket whose
+    // `send`/`onmessage` carry the very same op tokens.
+
+    #[wasm_bindgen]
+    extern "C" {
+        type BroadcastChannel;
+        #[wasm_bindgen(constructor)]
+        fn new(name: &str) -> BroadcastChannel;
+        #[wasm_bindgen(method, js_name = postMessage)]
+        fn post_message(this: &BroadcastChannel, msg: &str);
+        #[wasm_bindgen(method)]
+        fn close(this: &BroadcastChannel);
+    }
+
+    /// A live co-editing session: a [`Replica`](super::Replica) wired to a
+    /// same-origin `BroadcastChannel`. Local edits mutate the replica, broadcast
+    /// their op, and return the updated netlist; [`receive`](CoEdit::receive)
+    /// merges an op the page read off the channel. Two tabs sharing a channel
+    /// name converge to an identical netlist.
+    #[wasm_bindgen]
+    pub struct CoEdit {
+        replica: super::Replica,
+        channel: BroadcastChannel,
+    }
+
+    #[wasm_bindgen]
+    impl CoEdit {
+        /// Join the co-edit session named `channel` as site `site` (give each
+        /// tab a distinct id so the merge tiebreak is deterministic).
+        #[wasm_bindgen(constructor)]
+        pub fn new(site: u64, channel: &str) -> CoEdit {
+            CoEdit {
+                replica: super::Replica::new(site),
+                channel: BroadcastChannel::new(channel),
+            }
+        }
+
+        /// Broadcast a locally-committed op and return the updated netlist.
+        fn emit(&self, op: &super::EditOp) -> String {
+            self.channel.post_message(&op.encode());
+            self.replica.to_netlist()
+        }
+
+        /// Add a part locally, broadcast it, return the new netlist. Throws on
+        /// an invalid part (unknown kind / empty / whitespace token).
+        pub fn add_part(
+            &mut self,
+            reference: &str,
+            node_a: &str,
+            node_b: &str,
+            value: &str,
+        ) -> Result<String, JsValue> {
+            let op = self
+                .replica
+                .add_part(reference, node_a, node_b, value)
+                .map_err(|e| JsValue::from_str(&e))?;
+            Ok(self.emit(&op))
+        }
+
+        /// Remove a part locally, broadcast it, return the new netlist.
+        pub fn remove_part(&mut self, reference: &str) -> Result<String, JsValue> {
+            let op = self
+                .replica
+                .remove_part(reference)
+                .map_err(|e| JsValue::from_str(&e))?;
+            Ok(self.emit(&op))
+        }
+
+        /// Retune a part's value locally, broadcast it, return the new netlist.
+        pub fn set_value(&mut self, reference: &str, value: &str) -> Result<String, JsValue> {
+            let op = self
+                .replica
+                .set_value(reference, value)
+                .map_err(|e| JsValue::from_str(&e))?;
+            Ok(self.emit(&op))
+        }
+
+        /// Re-wire a part locally, broadcast it, return the new netlist.
+        pub fn wire(
+            &mut self,
+            reference: &str,
+            node_a: &str,
+            node_b: &str,
+        ) -> Result<String, JsValue> {
+            let op = self
+                .replica
+                .wire(reference, node_a, node_b)
+                .map_err(|e| JsValue::from_str(&e))?;
+            Ok(self.emit(&op))
+        }
+
+        /// Set (or clear, with an empty string) the title locally and broadcast.
+        pub fn set_title(&mut self, title: &str) -> String {
+            let title = (!title.is_empty()).then_some(title);
+            let op = self.replica.set_title(title);
+            self.emit(&op)
+        }
+
+        /// Merge an op token read off the channel and return the updated
+        /// netlist. Throws (never panics) on a malformed/garbage token, so the
+        /// page can ignore a bad message.
+        pub fn receive(&mut self, token: &str) -> Result<String, JsValue> {
+            let op = super::EditOp::decode(token).map_err(|e| JsValue::from_str(&e))?;
+            self.replica.merge(op);
+            Ok(self.replica.to_netlist())
+        }
+
+        /// The current materialized netlist.
+        pub fn netlist(&self) -> String {
+            self.replica.to_netlist()
+        }
+
+        /// Close the underlying channel (call before dropping the session).
+        pub fn close(&self) {
+            self.channel.close();
+        }
     }
 }
 
@@ -1072,5 +1629,249 @@ C1 out gnd 1u
         assert!(json.contains("\"duration\":0.005"));
         assert!(json.contains("\"step\":null"));
         assert!(json.contains("\"probes\":[\"out\"]"));
+    }
+
+    // --- co-edit merge layer (CP-WEB.5) ------------------------------------
+
+    /// Seed a replica from the RC netlist so two sites can start equal: lift
+    /// the netlist into a model and replay its parts/title as ops. Returns the
+    /// seeding ops so the other replica can merge the identical set.
+    fn seed(site: u64) -> (Replica, Vec<EditOp>) {
+        let model = CircuitModel::from_netlist(RC).unwrap();
+        let mut r = Replica::new(site);
+        let mut ops = Vec::new();
+        if let Some(t) = &model.title {
+            ops.push(r.set_title(Some(t)));
+        }
+        for p in &model.parts {
+            ops.push(
+                r.add_part(&p.reference, &p.node_a, &p.node_b, &p.value)
+                    .unwrap(),
+            );
+        }
+        (r, ops)
+    }
+
+    #[test]
+    fn op_encode_decode_round_trips() {
+        let ops = [
+            EditOp {
+                clock: Clock {
+                    lamport: 7,
+                    site: 2,
+                },
+                kind: OpKind::AddPart {
+                    reference: "R9".into(),
+                    node_a: "out".into(),
+                    node_b: "gnd".into(),
+                    value: "2k".into(),
+                },
+            },
+            EditOp {
+                clock: Clock {
+                    lamport: 1,
+                    site: 0,
+                },
+                kind: OpKind::RemovePart {
+                    reference: "C1".into(),
+                },
+            },
+            EditOp {
+                clock: Clock {
+                    lamport: 42,
+                    site: 9,
+                },
+                kind: OpKind::SetValue {
+                    reference: "R1".into(),
+                    value: "3k3".into(),
+                },
+            },
+            EditOp {
+                clock: Clock {
+                    lamport: 3,
+                    site: 1,
+                },
+                kind: OpKind::Wire {
+                    reference: "R1".into(),
+                    node_a: "a".into(),
+                    node_b: "b".into(),
+                },
+            },
+            EditOp {
+                clock: Clock {
+                    lamport: 5,
+                    site: 4,
+                },
+                kind: OpKind::SetTitle {
+                    title: Some("café-π".into()),
+                },
+            },
+            EditOp {
+                clock: Clock {
+                    lamport: 6,
+                    site: 4,
+                },
+                kind: OpKind::SetTitle { title: None },
+            },
+        ];
+        for op in ops {
+            let token = op.encode();
+            // URL/transport-safe (same guarantee as the share links).
+            assert!(
+                token
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+                "op token must be pure base64url: {token}"
+            );
+            assert_eq!(EditOp::decode(&token).unwrap(), op, "op round trip exact");
+            // Leading '#' tolerated, like the other decoders.
+            assert_eq!(EditOp::decode(&format!("#{token}")).unwrap(), op);
+        }
+    }
+
+    #[test]
+    fn two_replicas_converge_to_identical_netlist() {
+        // Both sites start from the identical seed (same op set).
+        let (mut a, seed_ops) = seed(1);
+        let mut b = Replica::new(2);
+        b.merge_many(&seed_ops);
+        assert_eq!(a.to_netlist(), b.to_netlist(), "equal after seeding");
+
+        // Each site makes independent local edits.
+        let a_ops = [
+            a.add_part("R2", "out", "gnd", "2k").unwrap(),
+            a.set_value("R1", "4k7").unwrap(),
+        ];
+        let b_ops = [
+            b.remove_part("C1").unwrap(),
+            b.add_part("L1", "out", "gnd", "10m").unwrap(),
+        ];
+
+        // Exchange the ops — deliberately in *different* orders on each side,
+        // including a redundant redelivery — and they still converge.
+        a.merge_many(&b_ops);
+        b.merge(a_ops[1].clone());
+        b.merge(a_ops[0].clone());
+        b.merge(a_ops[1].clone()); // duplicate delivery is idempotent
+
+        let na = a.to_netlist();
+        let nb = b.to_netlist();
+        assert_eq!(na, nb, "replicas converge to one netlist:\n{na}\n---\n{nb}");
+        // And the converged netlist reflects every edit and still simulates.
+        assert!(na.contains("R2 out gnd 2k"));
+        assert!(na.contains("R1 in out 4k7"));
+        assert!(na.contains("L1 out gnd 10m"));
+        assert!(!na.contains("C1"), "C1 was removed on b: {na}");
+        run(&na, 5e-3, Some(5e-6)).expect("converged netlist simulates");
+    }
+
+    #[test]
+    fn conflicting_edits_resolve_deterministically_either_order() {
+        // Two replicas start equal, then concurrently edit the SAME part/value.
+        let (mut a, seed_ops) = seed(1);
+        let mut b = Replica::new(2);
+        b.merge_many(&seed_ops);
+
+        // Concurrent writes to R1's value. They may land at the same Lamport
+        // time; the site id is the deterministic tiebreak (higher site wins).
+        let op_a = a.set_value("R1", "100").unwrap();
+        let op_b = b.set_value("R1", "200").unwrap();
+
+        // Deliver in opposite orders on the two replicas.
+        a.merge(op_b.clone());
+        b.merge(op_a.clone());
+
+        let na = a.to_netlist();
+        let nb = b.to_netlist();
+        assert_eq!(na, nb, "same winner regardless of delivery order");
+
+        // The winner is a pure function of the clocks: higher (lamport, site).
+        let winner = if op_a.clock > op_b.clock {
+            "100"
+        } else {
+            "200"
+        };
+        assert!(
+            na.contains(&format!("R1 in out {winner}")),
+            "deterministic LWW winner {winner}: {na}"
+        );
+
+        // A third, independent delivery order reaches the identical state.
+        let (mut c, _) = seed(1);
+        c.merge(op_b);
+        c.merge(op_a);
+        assert_eq!(c.to_netlist(), na, "a third order converges to the same");
+    }
+
+    #[test]
+    fn concurrent_add_remove_of_same_part_is_deterministic() {
+        // One site re-adds a part the other removes, concurrently. LWW by clock
+        // must pick the same outcome on both regardless of delivery order.
+        let (mut a, seed_ops) = seed(1);
+        let mut b = Replica::new(2);
+        b.merge_many(&seed_ops);
+
+        let add = a.add_part("C1", "out", "gnd", "5u").unwrap(); // overwrite C1
+        let rm = b.remove_part("C1").unwrap();
+
+        a.merge(rm.clone());
+        b.merge(add.clone());
+        assert_eq!(
+            a.to_netlist(),
+            b.to_netlist(),
+            "converge on add/remove race"
+        );
+    }
+
+    #[test]
+    fn garbage_ops_decode_to_clean_error() {
+        let junk = [
+            "has spaces",                           // not base64url
+            "plus+sign",                            // reserved char
+            &encode("not an op"),                   // valid base64url, wrong magic
+            &encode("EEOP1\n"),                     // right magic, truncated
+            &encode("EEOP1\nnotanum\n0\nrm\nR1\n"), // non-numeric lamport
+            &encode("EEOP1\n1\n0\nbogus\nR1\n"),    // unknown op tag
+            &encode("EEOP1\n1\n0\ntitle\nmaybe\n"), // bad title presence
+            &encode("EEOP1\n1\n0\nadd\nR1\nin\n"),  // add missing fields
+        ];
+        for token in junk {
+            let got = EditOp::decode(token);
+            assert!(
+                got.is_err(),
+                "garbage {token:?} must be clean Err, got {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_is_idempotent_and_order_free_on_the_same_set() {
+        // The same set of ops, fed in forward vs reverse vs duplicated order,
+        // always materializes to the identical netlist (order independence).
+        let (donor, mut ops) = seed(7);
+        ops.push({
+            let mut d = donor;
+            d.set_value("R1", "9k1").unwrap()
+        });
+
+        let mut forward = Replica::new(0);
+        forward.merge_many(&ops);
+
+        let mut reverse = Replica::new(0);
+        let mut rev: Vec<EditOp> = ops.clone();
+        rev.reverse();
+        reverse.merge_many(&rev);
+
+        let mut dupes = Replica::new(0);
+        dupes.merge_many(&ops);
+        dupes.merge_many(&ops); // every op twice
+
+        assert_eq!(forward.to_netlist(), reverse.to_netlist());
+        assert_eq!(forward.to_netlist(), dupes.to_netlist());
+        assert_eq!(
+            forward.ops().len(),
+            dupes.ops().len(),
+            "dedup collapsed dupes"
+        );
     }
 }

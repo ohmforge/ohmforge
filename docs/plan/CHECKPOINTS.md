@@ -151,7 +151,7 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 - [~] **CP-AF-M6.1** (ai-fmt) Native-project device-model param round-trip: diode `IS/N/RS`, BJT `IS/BF/BR`, MOSFET `VTO/KP/LAMBDA` survive `save`→`load` byte-identically (`.model`-style directive). — *gate:* a circuit with a custom diode/BJT/MOSFET model round-trips exactly. _(Closes the documented M5 follow-up.)_
 - [~] **CP-AF-M6.2** (ai-fmt) AI auto-tune: closed-loop component-value optimization against a measured spec via the verify loop (deterministic gradient-free search), offline. — *gate:* given `v(out)=3.3 V`, the tuner adjusts a divider resistor and converges to the measured target; no network/key.
 - [~] **CP-UX-M6.1** (ui-shell) Live interactive tuning + current-flow animation: adjust a selected component through the app event loop and re-solve live; animate branch-current direction/magnitude on the overlay (deferred since M1). — *gate:* a tune event changes a component and the recomputed op-point/overlay reflects it; current-flow arrows computed from branch currents; asserted on data, no tty.
-- [~] **CP-WEB.5** (web) Real-time co-edit relay: op-based merge layer so two browsers converge on one circuit — pure deterministic conflict resolution (host-tested) + a thin `BroadcastChannel`/WebSocket binding gated to `wasm32`. — *gate:* two `CircuitModel` replicas exchange ops and converge to an identical netlist; conflicting edits resolve deterministically; garbage ops → clean `Err`. _(Closes the documented M5 follow-up; hosted signaling relay stays deferred.)_
+- [x] **CP-WEB.5** (web) Real-time co-edit relay: op-based merge layer (`Replica` + clock-tagged `EditOp`, LWW by `(lamport, site)`, log replayed via `BTreeMap`) so two browsers converge on one circuit, plus a thin hand-rolled `BroadcastChannel` `CoEdit` binding gated to `wasm32` (no `web-sys`). — *gate:* `two_replicas_converge_to_identical_netlist`, `conflicting_edits_resolve_deterministically_either_order`, `concurrent_add_remove_of_same_part_is_deterministic`, `merge_is_idempotent_and_order_free_on_the_same_set`, `op_encode_decode_round_trips`, `garbage_ops_decode_to_clean_error` (6 new host tests, 29 total in `ee-web`); no new deps. _(Closes the documented M5 follow-up; hosted signaling relay stays deferred.)_
 - [ ] **CP-SHIP.2** (platform) Polish & tag **v0.4.0**: refresh docs/examples/README for M6, full CI-parity gate sweep, tag the release. Done on `main` during reconcile.
 
 ---
@@ -165,8 +165,8 @@ Conventions and how tracks relate: [`README.md`](README.md). Design detail per c
 | ui-shell | 16 | 1 | 17 |
 | ai-fmt | 14 | 2 | 16 |
 | platform | 6 | 1 | 7 |
-| web | 4 | 1 | 5 |
-| **Total** | **76** | **8** | **84** |
+| web | 5 | 0 | 5 |
+| **Total** | **77** | **7** | **84** |
 
 _**67/67 — M0 through M4 all complete** (M0–M3 tagged v0.1.0; M4 adds the rest). M4 delivered the **plugin device-model API** + an **instrument/block plugin trait**, a **KLU-class ordered/reusable sparse solver** and **multithreaded analyses**, a **Cortex-M3/M4 (Thumb-2)** core with an STM32 board, **SPICE `.model` import** + a vendor model library, and **shareable circuit links** in the browser. Deferred by design: real-time collaboration, the QEMU full-SBC bridge, and full vendor-SPICE `.model` fidelity — the standing M-next horizon._
 
