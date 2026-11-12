@@ -84,6 +84,18 @@
 //!   goal, and [`define_term`]/[`glossary`] are the contextual term lookup. All
 //!   offline; [`coach`] optionally layers the model for prose hints, but the
 //!   grade never depends on it.
+//!
+//! ## This checkpoint (CP-AF-M6.2): AI auto-tune — a closed loop around verify
+//!
+//! The copilot can now *search* for a component value, not just check one:
+//!
+//! * [`tune`] — [`auto_tune`] takes an [`AutoTune`] (the part to adjust, the
+//!   measured goal, and a value range) and drives a deterministic, gradient-free
+//!   **bisection** through the [`verify`](fn@crate::verify) clone-and-measure
+//!   path, converging on the value that makes the spec pass and returning a
+//!   [`TuneResult`] with the verified [`Verdict`]. Fully offline (real `ee-sim`
+//!   solves, no model/key/network) and deterministic — the live circuit is never
+//!   touched, only clones.
 
 pub mod client;
 pub mod config;
@@ -93,6 +105,7 @@ pub mod modes;
 pub mod offline;
 pub mod tools;
 pub mod transport;
+pub mod tune;
 pub mod tutor;
 pub mod verify;
 
@@ -113,6 +126,7 @@ pub use offline::{
 };
 pub use tools::{ask, CircuitTools, EESH_TOOL, READ_OP_TOOL};
 pub use transport::{MockTransport, Transport};
+pub use tune::{auto_tune, AutoTune, TuneResult};
 pub use tutor::{
     coach, define as define_term, glossary, search_terms, Challenge, Lesson, LessonRunner, Step,
     StepGoal, StepReport, Term,

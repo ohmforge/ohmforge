@@ -48,8 +48,23 @@
 //! .tempco R1 0.01              // 1/°C
 //! ```
 //!
-//! (Transistor Ebers–Moll / level-1 model coefficients still default on load —
-//! a separate documented follow-up; everything else round-trips exactly.)
+//! * **Device-model coefficients (`CP-AF-M6.1`).** A diode's/transistor's model
+//!   parameters ride on a `.model <ref> KEY=VALUE …` directive emitted right after
+//!   the part, the same way `.wave`/`.tol` do. The keys mirror SPICE and the
+//!   [`crate::spice`] `.model` cards — diode `IS`/`N`/`RS`, BJT `IS`/`BF`/`BR`/`VT`,
+//!   MOSFET `VTO`/`KP`/`LAMBDA` — and each value is a base-SI decimal (shortest
+//!   round-trip `f64` `Display`). The directive is emitted **only** when the model
+//!   differs from the kind's default, so a stock device writes nothing and stays
+//!   byte-identical with older files; when it is emitted it carries every field,
+//!   so a loaded model equals the original exactly. The polarity still comes from
+//!   the part line's `QN`/`QP`/`MN`/`MP`, not the directive.
+//!
+//! ```text
+//! D1 D - n2 gnd                // kind `D`; the model rides on the next line
+//! .model D1 IS=0.00000000252 N=1.75 RS=0.5
+//! Q1 QN - n1 n2 gnd            // an NPN (polarity from the `QN` kind letter)
+//! .model Q1 IS=0.00000000000002 BF=250 BR=3 VT=0.025852
+//! ```
 //!
 //! Zero dependencies beyond `ee-core`; the parser is hand-written like the
 //! netlist's.
@@ -193,10 +208,11 @@ pub fn save(circuit: &Circuit) -> String {
         }
         out.push('\n');
         // Per-part metadata the `REF KIND VALUE NET...` line cannot carry: a
-        // source's time waveform, and the part's tolerance/tempco. Each is emitted
-        // right after its part so load sees the part first, in a fixed order so
-        // save→load→save stays byte-identical. Defaults (`Dc`, no tolerance, no
-        // tempco) emit nothing.
+        // device model, a source's time waveform, and the part's tolerance/tempco.
+        // Each is emitted right after its part so load sees the part first, in a
+        // fixed order so save→load→save stays byte-identical. Defaults (a stock
+        // model, `Dc`, no tolerance, no tempco) emit nothing.
+        write_model(&mut out, &part.reference, &part.kind);
         write_waveform(&mut out, &part.reference, &part.waveform);
         if let Some(tol) = circuit.tolerance(&part.reference) {
             let _ = writeln!(out, ".tol {} {}", part.reference, tol);
@@ -241,6 +257,36 @@ fn write_waveform(out: &mut String, reference: &str, waveform: &Waveform) {
         Waveform::Expr(expr) => {
             let _ = writeln!(out, ".wave {reference} expr {expr}");
         }
+    }
+}
+
+/// Emit a device's model parameters as a `.model <ref> KEY=VALUE …` directive,
+/// but only when the model differs from its kind's default — a stock device
+/// writes nothing, so untouched circuits (and files from before this directive
+/// existed) stay byte-identical. When it is emitted it carries every field of the
+/// model struct, so [`load`] reconstructs an identical model. Values are base-SI
+/// decimals via `f64`'s shortest-round-trip `Display`. Non-model kinds (and
+/// controlled sources, whose gains ride on the kind token) emit nothing.
+fn write_model(out: &mut String, reference: &str, kind: &PartKind) {
+    match kind {
+        PartKind::Diode(m) if *m != DiodeModel::default() => {
+            let _ = writeln!(out, ".model {reference} IS={} N={} RS={}", m.is, m.n, m.rs);
+        }
+        PartKind::Bjt(_, m) if *m != BjtModel::default() => {
+            let _ = writeln!(
+                out,
+                ".model {reference} IS={} BF={} BR={} VT={}",
+                m.is, m.bf, m.br, m.vt
+            );
+        }
+        PartKind::Mosfet(_, m) if *m != MosfetModel::default() => {
+            let _ = writeln!(
+                out,
+                ".model {reference} VTO={} KP={} LAMBDA={}",
+                m.vth, m.kp, m.lambda
+            );
+        }
+        _ => {}
     }
 }
 
@@ -303,7 +349,7 @@ fn parse_header(text: &str, line: usize) -> Result<(), ProjectError> {
 }
 
 /// Handle a `.directive` line: `.name`, the circuit `.temp`, and the per-part
-/// `.wave`/`.tol`/`.tempco` metadata.
+/// `.model`/`.wave`/`.tol`/`.tempco` metadata.
 fn apply_directive(circuit: &mut Circuit, rest: &str, line: usize) -> Result<(), ProjectError> {
     let mut it = rest.splitn(2, char::is_whitespace);
     let name = it.next().unwrap_or("");
@@ -324,6 +370,7 @@ fn apply_directive(circuit: &mut Circuit, rest: &str, line: usize) -> Result<(),
             Ok(())
         }
         "wave" => apply_wave(circuit, arg, line),
+        "model" => apply_model(circuit, arg, line),
         "tol" => apply_scalar(circuit, arg, line, Scalar::Tolerance),
         "tempco" => apply_scalar(circuit, arg, line, Scalar::Tempco),
         other => Err(err(line, ErrorKind::UnknownDirective(other.to_string()))),
@@ -404,6 +451,113 @@ fn apply_wave(circuit: &mut Circuit, arg: &str, line: usize) -> Result<(), Proje
     let waveform = parse_waveform(kind, params, line)?;
     circuit.set_waveform(reference, waveform);
     Ok(())
+}
+
+/// Apply a `.model <ref> KEY=VALUE …` directive, overriding the device model of
+/// an existing diode/transistor. The part must be defined earlier in the file and
+/// be a model-backed kind (`D`/`QN`/`QP`/`MN`/`MP`); the recognized keys depend on
+/// that kind (diode `IS`/`N`/`RS`, BJT `IS`/`BF`/`BR`/`VT`, MOSFET
+/// `VTO`/`KP`/`LAMBDA`), case-insensitively. Parsing starts from the kind's default
+/// model and overrides each key present, so an absent key keeps its default and a
+/// full directive (what [`save`] always writes) reconstructs the model exactly.
+fn apply_model(circuit: &mut Circuit, arg: &str, line: usize) -> Result<(), ProjectError> {
+    let (reference, params) = split_first_token(arg);
+    if reference.is_empty() {
+        return Err(err(
+            line,
+            ErrorKind::BadDirective("`.model` expects `<ref> KEY=VALUE …`".to_string()),
+        ));
+    }
+    let part = circuit
+        .part_by_ref(reference)
+        .ok_or_else(|| err(line, ErrorKind::UnknownReference(reference.to_string())))?;
+    // Match on the part's kind to know which model to build and which setter to
+    // call; the polarity stays with the part, not the directive.
+    let applied = match &part.kind {
+        PartKind::Diode(_) => {
+            let mut m = DiodeModel::default();
+            for (key, value) in model_pairs(params, line)? {
+                match key.as_str() {
+                    "is" => m.is = value,
+                    "n" => m.n = value,
+                    "rs" => m.rs = value,
+                    other => return Err(unknown_model_key(line, other, "a diode")),
+                }
+            }
+            circuit.set_diode_model(reference, m)
+        }
+        PartKind::Bjt(_, _) => {
+            let mut m = BjtModel::default();
+            for (key, value) in model_pairs(params, line)? {
+                match key.as_str() {
+                    "is" => m.is = value,
+                    "bf" => m.bf = value,
+                    "br" => m.br = value,
+                    "vt" => m.vt = value,
+                    other => return Err(unknown_model_key(line, other, "a BJT")),
+                }
+            }
+            circuit.set_bjt_model(reference, m)
+        }
+        PartKind::Mosfet(_, _) => {
+            let mut m = MosfetModel::default();
+            for (key, value) in model_pairs(params, line)? {
+                match key.as_str() {
+                    "vto" => m.vth = value,
+                    "kp" => m.kp = value,
+                    "lambda" => m.lambda = value,
+                    other => return Err(unknown_model_key(line, other, "a MOSFET")),
+                }
+            }
+            circuit.set_mosfet_model(reference, m)
+        }
+        _ => {
+            return Err(err(
+                line,
+                ErrorKind::BadDirective(format!(
+                    "`.model` applies only to diodes/transistors, not {reference:?}"
+                )),
+            ))
+        }
+    };
+    // The lookup above already proved the kind matches, so the setter cannot fail.
+    debug_assert!(applied, "`.model` setter rejected a matched kind");
+    Ok(())
+}
+
+/// Parse the `KEY=VALUE …` tail of a `.model` directive into `(lowercase-key,
+/// f64-value)` pairs. A token without `=`, with an empty key, or with a
+/// non-numeric value is a [`ErrorKind::BadDirective`].
+fn model_pairs(params: &str, line: usize) -> Result<Vec<(String, f64)>, ProjectError> {
+    params
+        .split_whitespace()
+        .map(|tok| {
+            let (key, value) = tok.split_once('=').ok_or_else(|| {
+                err(
+                    line,
+                    ErrorKind::BadDirective(format!(
+                        "`.model` parameter {tok:?} is not `KEY=VALUE`"
+                    )),
+                )
+            })?;
+            if key.is_empty() {
+                return Err(err(
+                    line,
+                    ErrorKind::BadDirective(format!("`.model` parameter {tok:?} has an empty key")),
+                ));
+            }
+            let value = parse_f64(value, line, "`.model` value is not a number")?;
+            Ok((key.to_ascii_lowercase(), value))
+        })
+        .collect()
+}
+
+/// A `.model` key the part's kind does not accept.
+fn unknown_model_key(line: usize, key: &str, kind: &str) -> ProjectError {
+    err(
+        line,
+        ErrorKind::BadDirective(format!("unknown `.model` key {key:?} for {kind}")),
+    )
 }
 
 /// Parse a waveform spelling (`dc`/`sine`/`pulse`/`expr`) and its parameter tail
@@ -556,11 +710,12 @@ fn take_kind(rest: &str) -> Result<(PartKind, &str), ErrorKind> {
         "L" => PartKind::Inductor,
         "V" => PartKind::VoltageSource,
         "I" => PartKind::CurrentSource,
-        // Diode model params default on load (custom-param round-trip is a
-        // documented follow-up, same as transistors).
+        // Diodes/transistors start at their default model; a trailing `.model`
+        // directive (see `apply_model`) overrides the parameters when the saved
+        // device was non-default. (`CP-AF-M6.1`.)
         "D" => PartKind::Diode(DiodeModel::default()),
-        // Transistors: polarity preserved; model params default on load
-        // (custom-param round-trip is a documented follow-up).
+        // Transistors: polarity comes from the kind letter; the `.model` directive
+        // carries the parameters.
         "QN" => PartKind::Bjt(Polarity::N, BjtModel::default()),
         "QP" => PartKind::Bjt(Polarity::P, BjtModel::default()),
         "MN" => PartKind::Mosfet(Polarity::N, MosfetModel::default()),
@@ -1052,6 +1207,130 @@ R3 R 1k a ground
         // Parts without metadata stay at their defaults.
         assert_eq!(back.part_by_ref("R1").unwrap().waveform, Waveform::Dc);
         assert_eq!(back.tolerance("V1"), None);
+    }
+
+    // ── device-model param round-trip (CP-AF-M6.1) ───────────────────────────
+
+    /// The M6.1 gate: a circuit with a custom diode AND custom BJT AND custom
+    /// MOSFET model round-trips exactly — save→load→save is byte-identical, and
+    /// every loaded model struct equals the original.
+    #[test]
+    fn custom_device_models_round_trip_exactly() {
+        let mut c = Circuit::new("device models");
+        let (a, b, e) = (c.new_net(), c.new_net(), c.new_net());
+
+        // Awkward, non-default parameters on all three model-backed kinds.
+        let diode = DiodeModel {
+            is: 2.52e-9,
+            n: 1.752,
+            rs: 0.5,
+        };
+        let bjt = BjtModel {
+            is: 2e-14,
+            bf: 250.0,
+            br: 3.0,
+            vt: 1.0 / 38.0,
+        };
+        let mosfet = MosfetModel {
+            vth: 1.5,
+            kp: 2e-3,
+            lambda: 0.02,
+        };
+        c.add_part("D1", PartKind::Diode(diode), None, vec![a, b]);
+        // A PNP and a PMOS, to prove the polarity (from the kind letter) and the
+        // model (from the directive) both survive and stay independent.
+        c.add_part("Q1", PartKind::Bjt(Polarity::P, bjt), None, vec![a, b, e]);
+        c.add_part(
+            "M1",
+            PartKind::Mosfet(Polarity::N, mosfet),
+            None,
+            vec![a, b, e],
+        );
+        // A stock diode writes no `.model` line (defaults stay byte-identical).
+        c.add_part(
+            "D2",
+            PartKind::Diode(DiodeModel::default()),
+            None,
+            vec![b, NetId::GROUND],
+        );
+
+        let text = save(&c);
+        let back = load(&text).unwrap();
+
+        // save→load→save is byte-identical.
+        assert_eq!(
+            save(&back),
+            text,
+            "re-save must reproduce the file exactly:\n{text}"
+        );
+
+        // Each loaded model struct equals the original exactly (f64 equality).
+        assert!(matches!(back.part_by_ref("D1").unwrap().kind, PartKind::Diode(m) if m == diode));
+        assert!(matches!(
+            back.part_by_ref("Q1").unwrap().kind,
+            PartKind::Bjt(Polarity::P, m) if m == bjt
+        ));
+        assert!(matches!(
+            back.part_by_ref("M1").unwrap().kind,
+            PartKind::Mosfet(Polarity::N, m) if m == mosfet
+        ));
+        // The stock diode came back at the default — and emitted no directive.
+        assert!(matches!(
+            back.part_by_ref("D2").unwrap().kind,
+            PartKind::Diode(m) if m == DiodeModel::default()
+        ));
+        assert_eq!(
+            text.matches(".model").count(),
+            3,
+            "one per custom model:\n{text}"
+        );
+        assert!(
+            text.contains("\n.model D1 IS=0.00000000252 N=1.752 RS=0.5\n"),
+            "{text}"
+        );
+        assert!(
+            !text.contains(".model D2"),
+            "a default model emits nothing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn model_directive_errors_point_at_the_line() {
+        // `.model` on a non-device part.
+        let e = load("!ee-project v1\nR1 R 1k a b\n.model R1 IS=1e-14").unwrap_err();
+        assert_eq!(e.line, 3);
+        assert!(matches!(e.kind, ErrorKind::BadDirective(_)), "{e}");
+
+        // `.model` naming an unknown part.
+        let e = load("!ee-project v1\nD1 D - a b\n.model D9 IS=1e-14").unwrap_err();
+        assert_eq!(e, err(3, ErrorKind::UnknownReference("D9".into())));
+
+        // A key the diode kind does not accept.
+        let e = load("!ee-project v1\nD1 D - a b\n.model D1 BF=100").unwrap_err();
+        assert_eq!(e.line, 3);
+        assert!(matches!(e.kind, ErrorKind::BadDirective(_)), "{e}");
+
+        // A malformed (non KEY=VALUE) parameter.
+        let e = load("!ee-project v1\nD1 D - a b\n.model D1 IS").unwrap_err();
+        assert_eq!(e.line, 3);
+        assert!(matches!(e.kind, ErrorKind::BadDirective(_)), "{e}");
+
+        // A non-numeric value.
+        let e = load("!ee-project v1\nD1 D - a b\n.model D1 IS=hot").unwrap_err();
+        assert_eq!(e.line, 3);
+        assert!(matches!(e.kind, ErrorKind::BadDirective(_)), "{e}");
+    }
+
+    /// A `.model` need not list every key: absent keys keep the kind's default,
+    /// so a hand-written partial directive still loads.
+    #[test]
+    fn partial_model_directive_keeps_defaults_for_absent_keys() {
+        let c = load("!ee-project v1\nD1 D - a b\n.model D1 RS=0.75").unwrap();
+        let expected = DiodeModel {
+            rs: 0.75,
+            ..DiodeModel::default()
+        };
+        assert!(matches!(c.part_by_ref("D1").unwrap().kind, PartKind::Diode(m) if m == expected));
     }
 
     #[test]
