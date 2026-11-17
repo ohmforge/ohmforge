@@ -807,6 +807,7 @@ name = "ohmforge-mcu"
 version = "0.7.0"
 dependencies = [
  "ohmforge-core",
+ "ohmforge-devices",
  "ohmforge-digital",
 ]
 
