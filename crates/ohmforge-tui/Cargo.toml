@@ -20,4 +20,7 @@ ohmforge-instruments = { workspace = true }
 # ratatui   = { workspace = true }   # uncomment at M0 render work
 # Terminal input + raw-mode I/O for the live app (CP-UX-M1.4). Kept to the thin
 # `run` wrapper; the event logic is a pure, tty-free state machine in `app`.
-crossterm = { version = "0.28", default-features = false, features = ["events"] }
+# `windows` re-enables crossterm's Windows backend (winapi/crossterm_winapi, which
+# crossterm target-gates to `cfg(windows)`, so it's inert elsewhere). Without it,
+# `cargo build` on Windows hits crossterm's own compile_error. (CI: windows-latest.)
+crossterm = { version = "0.28", default-features = false, features = ["events", "windows"] }
