@@ -358,6 +358,36 @@ section.gallery { padding: 40px 0; border-top: 1px solid var(--border); }
 }
 .gallery-card .gc-notice { color: var(--muted); font-size: 13px; line-height: 1.45; }
 
+/* ---- Schematic canvas (CP-WEB.8) ------------------------------------ */
+section.canvas-sec { padding: 40px 0; border-top: 1px solid var(--border); }
+.canvas-panel { display: block; }
+.cv-tools { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; }
+.cv-group { display: inline-flex; flex-wrap: wrap; gap: 8px; }
+.cv-group.cv-actions { margin-left: auto; }
+.cv-tool.active { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); color: var(--accent); }
+.cv-hint { margin: 12px 0 0; font-size: 13px; color: var(--muted); }
+.cv-stage { margin-top: 10px; }
+.cv-svg {
+  width: 100%;
+  height: auto;
+  background: var(--field);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  touch-action: none;
+  cursor: crosshair;
+  user-select: none;
+}
+.cv-mobile-note { display: none; margin: 0; font-size: 13px; color: var(--muted); }
+/* SVG primitives (stroke/fill track the theme tokens). */
+.cv-dot { fill: var(--border); }
+.cv-wire { stroke: var(--muted); stroke-width: 2; stroke-linecap: round; }
+.cv-gnd { stroke: var(--muted); stroke-width: 2; stroke-linecap: round; }
+.cv-lead { stroke: var(--accent); stroke-width: 2; }
+.cv-body { fill: var(--panel); stroke: var(--accent); stroke-width: 2; }
+.cv-ref { fill: var(--ink); font: 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.cv-pin { fill: var(--accent); }
+.cv-pending { fill: none; stroke: var(--accent); stroke-width: 2; }
+
 /* ---- Responsive ----------------------------------------------------- */
 @media (max-width: 900px) {
   .feature-grid { grid-template-columns: repeat(2, 1fr); }
@@ -372,4 +402,11 @@ section.gallery { padding: 40px 0; border-top: 1px solid var(--border); }
   .gallery-grid { grid-template-columns: 1fr; }
   .nav-links { gap: 14px; }
   .hero .ctas .btn { flex: 1 1 auto; justify-content: center; }
+}
+/* The drawing canvas is mouse-driven; on a phone hide the grid and point to
+   the text/parts form above, which still builds and simulates circuits. */
+@media (max-width: 640px) {
+  .cv-svg, .cv-group:first-child, #cv-tools .cv-tool[data-tool="move"] { display: none; }
+  .cv-mobile-note { display: block; }
+  .cv-group.cv-actions { margin-left: 0; }
 }

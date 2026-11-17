@@ -178,6 +178,49 @@
         <div class="gallery-grid" id="gallery"></div>
       </section>
 
+      <!-- ---- Drag-and-drop schematic canvas (CP-WEB.8) ------------ -->
+      <!-- Draw a circuit with the mouse: pick a part, click the grid to drop
+           it, wire terminals together, pin a ground, then Simulate. The canvas
+           serializes to the SAME R/C/L/V netlist the demo above runs — via the
+           host-tested `Schematic` model (canvas_netlist/canvas_layout bindings),
+           not a forked editor. Desktop-first (mouse); on a phone the grid is
+           hidden and the text/parts form above stays the way to build. -->
+      <section class="canvas-sec" id="canvas-sec" aria-label="Visual schematic canvas">
+        <h2 class="section-title">Or draw it — place parts, wire them, simulate</h2>
+        <section class="panel canvas-panel">
+          <div class="cv-tools" id="cv-tools" role="toolbar" aria-label="Canvas tools">
+            <span class="cv-group">
+              <button type="button" class="btn small cv-tool" data-tool="R">R · resistor</button>
+              <button type="button" class="btn small cv-tool" data-tool="C">C · cap</button>
+              <button type="button" class="btn small cv-tool" data-tool="L">L · inductor</button>
+              <button type="button" class="btn small cv-tool" data-tool="V">V · source</button>
+            </span>
+            <span class="cv-group">
+              <button type="button" class="btn small cv-tool" data-tool="wire">Wire</button>
+              <button type="button" class="btn small cv-tool" data-tool="gnd">Ground</button>
+              <button type="button" class="btn small cv-tool" data-tool="move">Move</button>
+              <button type="button" class="btn small cv-tool" data-tool="delete">Delete</button>
+            </span>
+            <span class="cv-group cv-actions">
+              <button type="button" id="cv-load" class="btn small" disabled>Load netlist above</button>
+              <button type="button" id="cv-clear" class="btn small">Clear</button>
+              <button type="button" id="cv-run" class="btn primary small" disabled>Simulate</button>
+            </span>
+          </div>
+          <p class="cv-hint" id="cv-hint">Pick a part, then click the grid to drop it.</p>
+          <div class="cv-stage">
+            <svg id="cv-svg" class="cv-svg" aria-label="Schematic grid — draw with the mouse"></svg>
+            <p class="cv-mobile-note">The drawing canvas needs a mouse — open this page on a desktop to draw, or use the parts form in the demo above.</p>
+          </div>
+          <div class="scope-label"><label style="margin:0">Generated netlist</label></div>
+          <pre class="scope" id="cv-netlist">(draw a circuit, then Simulate)</pre>
+          <div class="scope-label"><label style="margin:0">Scope — transient node voltages (braille)</label></div>
+          <pre class="scope" id="cv-scope">(nothing simulated yet)</pre>
+          <p id="cv-err" class="err"></p>
+          <p id="cv-status" class="status"></p>
+        </section>
+      </section>
+
       <!-- ---- Features --------------------------------------------- -->
       <section class="features" id="features">
         <h2 class="section-title">One workbench, from op-point to firmware</h2>
@@ -289,6 +332,8 @@
         edit_remove,
         encode_session_share,
         decode_session_share,
+        canvas_netlist,
+        canvas_layout,
         CoEdit,
       } = mod;
 
@@ -683,6 +728,269 @@ L1 mid gnd 0.1
         runSim();
       }
 
+      // --- Drag-and-drop schematic canvas (CP-WEB.8) ---------------------
+      // A small visual editor over the host-tested `Schematic` model. JS owns
+      // the geometry (parts on a grid, wires, ground markers); to simulate it
+      // serializes to the canvas blob the Rust `canvas_netlist` binding parses
+      // into the same R/C/L/V netlist the demo runs — so there is no forked
+      // editor and the canvas can never emit something the engine won't run.
+      const CV = (() => {
+        const svg = $("cv-svg");
+        const SVGNS = "http://www.w3.org/2000/svg";
+        const U = 26; // px per grid unit
+        const PAD = 20; // px border padding
+        const COLS = 22,
+          ROWS = 13; // grid extent (in units)
+        const DEFAULTS = { R: "1k", C: "100n", L: "1m", V: "5" };
+
+        let parts = []; // {ref, kind, value, a:{x,y}, b:{x,y}}
+        let wires = []; // {from:{x,y}, to:{x,y}}
+        let grounds = []; // {x,y}
+        let counters = { R: 0, C: 0, L: 0, V: 0 };
+        let tool = "R";
+        let wireStart = null; // first endpoint while wiring
+        let drag = null; // {ref, ox, oy} while moving
+
+        const sx = (gx) => PAD + gx * U;
+        const sy = (gy) => PAD + gy * U;
+        const toGrid = (clientX, clientY) => {
+          const r = svg.getBoundingClientRect();
+          return {
+            x: Math.max(0, Math.min(COLS, Math.round((clientX - r.left - PAD) / U))),
+            y: Math.max(0, Math.min(ROWS, Math.round((clientY - r.top - PAD) / U))),
+          };
+        };
+        const eqpt = (p, q) => p.x === q.x && p.y === q.y;
+        const dist2 = (px, py, x, y) => (px - x) ** 2 + (py - y) ** 2;
+
+        function setTool(t) {
+          tool = t;
+          wireStart = null;
+          for (const b of $("cv-tools").querySelectorAll(".cv-tool"))
+            b.classList.toggle("active", b.dataset.tool === t);
+          const hints = {
+            R: "Click the grid to drop a resistor.",
+            C: "Click the grid to drop a capacitor.",
+            L: "Click the grid to drop an inductor.",
+            V: "Click the grid to drop a voltage source.",
+            wire: "Click a terminal, then another, to run a wire.",
+            gnd: "Click a point to pin it to ground.",
+            move: "Drag a part to move it.",
+            delete: "Click a part, wire, or ground to delete it.",
+          };
+          $("cv-hint").textContent = hints[t] || "";
+        }
+
+        // --- rendering -----------------------------------------------------
+        function el(name, attrs, kids) {
+          const n = document.createElementNS(SVGNS, name);
+          for (const k in attrs) n.setAttribute(k, attrs[k]);
+          if (kids) for (const c of kids) n.appendChild(c);
+          return n;
+        }
+        function draw() {
+          svg.setAttribute("viewBox", `0 0 ${PAD * 2 + COLS * U} ${PAD * 2 + ROWS * U}`);
+          svg.innerHTML = "";
+          // grid dots
+          for (let i = 0; i <= COLS; i++)
+            for (let j = 0; j <= ROWS; j++)
+              svg.appendChild(el("circle", { cx: sx(i), cy: sy(j), r: 1, class: "cv-dot" }));
+          // wires
+          for (const w of wires)
+            svg.appendChild(
+              el("line", {
+                x1: sx(w.from.x), y1: sy(w.from.y), x2: sx(w.to.x), y2: sy(w.to.y),
+                class: "cv-wire",
+              })
+            );
+          // grounds
+          for (const g of grounds) {
+            const x = sx(g.x), y = sy(g.y);
+            svg.appendChild(el("line", { x1: x, y1: y, x2: x, y2: y + 10, class: "cv-wire" }));
+            svg.appendChild(el("line", { x1: x - 9, y1: y + 10, x2: x + 9, y2: y + 10, class: "cv-gnd" }));
+            svg.appendChild(el("line", { x1: x - 5, y1: y + 14, x2: x + 5, y2: y + 14, class: "cv-gnd" }));
+            svg.appendChild(el("line", { x1: x - 2, y1: y + 18, x2: x + 2, y2: y + 18, class: "cv-gnd" }));
+          }
+          // parts
+          for (const p of parts) {
+            const ax = sx(p.a.x), ay = sy(p.a.y), bx = sx(p.b.x), by = sy(p.b.y);
+            const mx = (ax + bx) / 2, my = (ay + by) / 2;
+            svg.appendChild(el("line", { x1: ax, y1: ay, x2: bx, y2: by, class: "cv-lead" }));
+            svg.appendChild(
+              el("rect", {
+                x: mx - 16, y: my - 10, width: 32, height: 20, rx: 4, class: "cv-body",
+                "data-ref": p.ref,
+              })
+            );
+            svg.appendChild(
+              el("text", { x: mx, y: my - 13, class: "cv-ref", "text-anchor": "middle" }, [
+                document.createTextNode(`${p.ref} ${p.value}`),
+              ])
+            );
+            for (const t of [p.a, p.b])
+              svg.appendChild(el("circle", { cx: sx(t.x), cy: sy(t.y), r: 3.5, class: "cv-pin" }));
+          }
+          if (wireStart)
+            svg.appendChild(el("circle", { cx: sx(wireStart.x), cy: sy(wireStart.y), r: 5, class: "cv-pending" }));
+        }
+
+        // --- hit testing ---------------------------------------------------
+        const nearPart = (g) =>
+          parts.find((p) => {
+            const mx = (p.a.x + p.b.x) / 2, my = (p.a.y + p.b.y) / 2;
+            return dist2(g.x, g.y, mx, my) <= 1.3 || eqpt(p.a, g) || eqpt(p.b, g);
+          });
+        const nearWire = (g) =>
+          wires.findIndex((w) => eqpt(w.from, g) || eqpt(w.to, g));
+        const nearGround = (g) => grounds.findIndex((gg) => eqpt(gg, g));
+
+        // --- mouse ---------------------------------------------------------
+        function onDown(ev) {
+          const g = toGrid(ev.clientX, ev.clientY);
+          if (["R", "C", "L", "V"].includes(tool)) {
+            counters[tool] += 1;
+            parts.push({
+              ref: tool + counters[tool], kind: tool, value: DEFAULTS[tool],
+              a: { x: g.x, y: g.y }, b: { x: Math.min(COLS, g.x + 3), y: g.y },
+            });
+            draw();
+          } else if (tool === "wire") {
+            if (!wireStart) wireStart = g;
+            else {
+              if (!eqpt(wireStart, g)) wires.push({ from: wireStart, to: g });
+              wireStart = null;
+            }
+            draw();
+          } else if (tool === "gnd") {
+            if (nearGround(g) < 0) grounds.push(g);
+            draw();
+          } else if (tool === "move") {
+            const p = nearPart(g);
+            if (p) drag = { ref: p.ref, ox: g.x - p.a.x, oy: g.y - p.a.y };
+          } else if (tool === "delete") {
+            const p = nearPart(g);
+            if (p) parts = parts.filter((q) => q.ref !== p.ref);
+            else {
+              const wi = nearWire(g);
+              if (wi >= 0) wires.splice(wi, 1);
+              else {
+                const gi = nearGround(g);
+                if (gi >= 0) grounds.splice(gi, 1);
+              }
+            }
+            draw();
+          }
+        }
+        function onMove(ev) {
+          if (!drag) return;
+          const g = toGrid(ev.clientX, ev.clientY);
+          const p = parts.find((q) => q.ref === drag.ref);
+          if (!p) return;
+          const dx = g.x - drag.ox - p.a.x, dy = g.y - drag.oy - p.a.y;
+          p.a = { x: p.a.x + dx, y: p.a.y + dy };
+          p.b = { x: p.b.x + dx, y: p.b.y + dy };
+          draw();
+        }
+        function onUp() {
+          drag = null;
+        }
+        function onDbl(ev) {
+          const p = nearPart(toGrid(ev.clientX, ev.clientY));
+          if (!p) return;
+          const v = window.prompt(`Value for ${p.ref}`, p.value);
+          if (v != null && v.trim()) p.value = v.trim();
+          draw();
+        }
+
+        // --- serialize to the canvas blob the Rust model parses -----------
+        function blob() {
+          const lines = [];
+          for (const p of parts)
+            lines.push(`P ${p.ref} ${p.value} ${p.a.x} ${p.a.y} ${p.b.x} ${p.b.y}`);
+          for (const w of wires)
+            lines.push(`W ${w.from.x} ${w.from.y} ${w.to.x} ${w.to.y}`);
+          for (const g of grounds) lines.push(`G ${g.x} ${g.y}`);
+          return lines.join("\n") + "\n";
+        }
+
+        function simulate_() {
+          $("cv-err").textContent = "";
+          if (parts.length === 0) {
+            $("cv-err").textContent = "Draw at least one part first.";
+            return;
+          }
+          let netlist;
+          try {
+            netlist = canvas_netlist(blob());
+          } catch (e) {
+            $("cv-err").textContent = String(e);
+            return;
+          }
+          $("cv-netlist").textContent = netlist.trim() || "(empty)";
+          try {
+            const r = JSON.parse(simulate(netlist, 0.005, 0));
+            $("cv-scope").textContent = r.scope || "(no scope)";
+            $("cv-status").textContent = `OK — ${r.nodes.length} node(s), ${r.x.length} transient sample(s).`;
+          } catch (e) {
+            $("cv-scope").textContent = "(simulation failed)";
+            $("cv-err").textContent = String(e);
+          }
+        }
+
+        // Pull the current demo netlist onto the canvas via `canvas_layout`.
+        function loadFromNetlist() {
+          $("cv-err").textContent = "";
+          let layout;
+          try {
+            layout = JSON.parse(canvas_layout(netlist.value));
+          } catch (e) {
+            $("cv-err").textContent = String(e);
+            return;
+          }
+          counters = { R: 0, C: 0, L: 0, V: 0 };
+          parts = layout.parts.map((p) => {
+            const kind = p.reference[0].toUpperCase();
+            const n = parseInt(p.reference.slice(1), 10);
+            if (counters[kind] != null && Number.isFinite(n))
+              counters[kind] = Math.max(counters[kind], n);
+            return {
+              ref: p.reference, kind, value: p.value,
+              a: { x: p.ax, y: p.ay }, b: { x: p.bx, y: p.by },
+            };
+          });
+          wires = layout.wires.map((w) => ({ from: { x: w.x1, y: w.y1 }, to: { x: w.x2, y: w.y2 } }));
+          grounds = layout.grounds.map((g) => ({ x: g.x, y: g.y }));
+          draw();
+          simulate_();
+        }
+
+        function clear_() {
+          parts = []; wires = []; grounds = [];
+          counters = { R: 0, C: 0, L: 0, V: 0 };
+          wireStart = null; drag = null;
+          $("cv-netlist").textContent = "(draw a circuit, then Simulate)";
+          $("cv-scope").textContent = "(nothing simulated yet)";
+          $("cv-err").textContent = "";
+          $("cv-status").textContent = "";
+          draw();
+        }
+
+        function wire() {
+          for (const b of $("cv-tools").querySelectorAll(".cv-tool"))
+            b.addEventListener("click", () => setTool(b.dataset.tool));
+          svg.addEventListener("mousedown", onDown);
+          svg.addEventListener("mousemove", onMove);
+          window.addEventListener("mouseup", onUp);
+          svg.addEventListener("dblclick", onDbl);
+          $("cv-run").addEventListener("click", simulate_);
+          $("cv-load").addEventListener("click", loadFromNetlist);
+          $("cv-clear").addEventListener("click", clear_);
+          setTool("R");
+          draw();
+        }
+        return { wire, enable: () => ($("cv-run").disabled = $("cv-load").disabled = false) };
+      })();
+
       init()
         .then(() => {
           statusEl.textContent = "Ready.";
@@ -690,6 +998,8 @@ L1 mid gnd 0.1
           $("share").disabled = false;
           $("p-add").disabled = false;
           $("coedit").disabled = false;
+          CV.wire();
+          CV.enable();
           $("run").addEventListener("click", runSim);
           $("share").addEventListener("click", shareLink);
           $("p-add").addEventListener("click", addPart);
