@@ -7,13 +7,17 @@
 //! A board is a manifest: MCU, pinout, and onboard parts. Custom boards drop in
 //! by writing a manifest — [`BoardDef::from_manifest`] parses the small text form
 //! in [`manifest`]; see docs/FEATURES.md §3. Drop-in part models (LED, 7-segment,
-//! servo, WS2812) live in [`modules`]. (Roadmap M1–M3.)
+//! servo, stepper, WS2812) live in [`modules`], and sensor/actuator models —
+//! thermistor, photoresistor, potentiometer, DC motor, built over the circuit
+//! primitives — live in [`sensors`]. (Roadmap M1–M9.)
 
 pub mod manifest;
 pub mod modules;
+pub mod sensors;
 pub mod subcircuits;
 
 pub use manifest::{ManifestError, OnboardPart};
+pub use sensors::{DcMotor, Ldr, Potentiometer, Thermistor};
 pub use subcircuits::{AnalogSwitch, OpAmp, Relay};
 
 /// A board the user can `board add`.

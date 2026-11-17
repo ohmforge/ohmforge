@@ -282,10 +282,61 @@ impl Ws2812 {
     }
 }
 
+/// A stepper motor tracked by step count: each step pulse advances the shaft by
+/// one full step, and the position maps to a shaft angle.
+///
+/// The model is the discrete counterpart of [`Servo`]: it carries no analog
+/// state, only the fixed `steps_per_rev` geometry, and turns a stream of step
+/// pulses (or a signed step delta) into a position. A driver that emits one pulse
+/// per step — counted here as rising edges on the step line — advances the rotor
+/// by [`step_angle`](Self::step_angle) degrees each time, so firmware can be
+/// checked against the angle it should have commanded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stepper {
+    /// Full steps per revolution (e.g. 200 for a 1.8° motor).
+    pub steps_per_rev: u32,
+}
+
+impl Default for Stepper {
+    /// A common 1.8°/step motor: 200 full steps per revolution.
+    fn default() -> Self {
+        Self { steps_per_rev: 200 }
+    }
+}
+
+impl Stepper {
+    /// The shaft advance per full step, in degrees (`360 / steps_per_rev`).
+    pub fn step_angle(&self) -> f64 {
+        if self.steps_per_rev == 0 {
+            return 0.0;
+        }
+        360.0 / self.steps_per_rev as f64
+    }
+
+    /// The shaft angle (degrees) for an absolute step position, wrapped into
+    /// `[0, 360)`. A negative position (the shaft driven backwards) wraps the
+    /// same way.
+    pub fn angle(&self, steps: i64) -> f64 {
+        let spr = self.steps_per_rev as i64;
+        if spr == 0 {
+            return 0.0;
+        }
+        let wrapped = steps.rem_euclid(spr);
+        wrapped as f64 * self.step_angle()
+    }
+
+    /// Count the step pulses in a level stream as its rising edges (`false→true`
+    /// transitions) — one pulse per commanded step.
+    pub fn count_steps(levels: &[bool]) -> usize {
+        levels.windows(2).filter(|w| !w[0] && w[1]).count()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        digit_segments, Led, Polarity, Rgb, Servo, SevenSeg, Ws2812, SEG_A, SEG_B, SEG_C, SEG_G,
+        digit_segments, Led, Polarity, Rgb, Servo, SevenSeg, Stepper, Ws2812, SEG_A, SEG_B, SEG_C,
+        SEG_G,
     };
 
     #[test]
@@ -372,6 +423,23 @@ mod tests {
 
         // Wrong length is rejected.
         assert_eq!(px.decode(&[true; 23]), None);
+    }
+
+    #[test]
+    fn stepper_counts_pulses_into_a_position() {
+        let m = Stepper::default(); // 200 steps/rev → 1.8°/step
+        assert!((m.step_angle() - 1.8).abs() < 1e-9);
+        // A train of five step pulses (rising edges) advances five steps = 9°.
+        let pulses = [
+            false, true, false, true, false, true, false, true, false, true,
+        ];
+        assert_eq!(Stepper::count_steps(&pulses), 5);
+        assert!((m.angle(5) - 9.0).abs() < 1e-9, "5 steps → 9°");
+        // A full revolution wraps back to 0°, and a quarter turn is 90°.
+        assert!((m.angle(200) - 0.0).abs() < 1e-9, "one rev wraps to 0°");
+        assert!((m.angle(50) - 90.0).abs() < 1e-9, "50 steps → 90°");
+        // Backwards steps wrap the same way (−1 step = 358.2°).
+        assert!((m.angle(-1) - 358.2).abs() < 1e-9);
     }
 
     #[test]

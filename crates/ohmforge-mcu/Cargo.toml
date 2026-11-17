@@ -24,3 +24,9 @@ toolchain = []
 [dependencies]
 ohmforge-core = { workspace = true }
 ohmforge-digital = { workspace = true }
+
+[dev-dependencies]
+# Used only by the co-sim gate test that drives an `ohmforge-devices` servo model
+# from an MCU PWM pin through the `PinIo` bridge. It is a behavioural model (no
+# analog engine), so this keeps `ohmforge-mcu` free of any `ohmforge-sim` dependency.
+ohmforge-devices = { workspace = true }
