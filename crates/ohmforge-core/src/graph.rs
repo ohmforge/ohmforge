@@ -287,6 +287,40 @@ pub enum LineKind {
     },
 }
 
+/// A controlled switching element between two nets — the circuit-level record
+/// behind a power-electronics switch (`CP-SIM-M9.1`). It is a resistor whose value
+/// snaps between a low on-resistance `ron` and a high off-resistance `roff`
+/// depending on whether the voltage at its control net `ctrl` (referenced to
+/// ground) is at or above `threshold`.
+///
+/// Like [`Coupling`] and [`Line`], this is deliberately a *relation on existing
+/// nets* recorded via [`Circuit::add_switch`], **not** a new data-carrying
+/// [`PartKind`]: the switch adds no part, so no exhaustive match arm anywhere else
+/// in the workspace has to learn a new variant. Only the transient engine reads it
+/// (it is a time-domain, control-driven element); it is otherwise inert metadata.
+///
+/// Drive the control net with a PWM stimulus — an independent voltage source
+/// carrying a [`Waveform::Pulse`], whose `width`/`period` set the duty cycle — and
+/// the switch chops its `a`–`b` branch at that duty. A buck/boost converter is a
+/// switch, a diode, an inductor, and an output capacitor wired around one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Switch {
+    /// Control net, referenced to ground. The switch is **on** (resistance `ron`)
+    /// when `V(ctrl) ≥ threshold`, **off** (`roff`) below it.
+    pub ctrl: NetId,
+    /// First switched terminal.
+    pub a: NetId,
+    /// Second switched terminal.
+    pub b: NetId,
+    /// On-resistance `R_on` (Ω) — the switch closed. Small but strictly positive.
+    pub ron: f64,
+    /// Off-resistance `R_off` (Ω) — the switch open. Large but finite, so an open
+    /// switch never floats a node into a singular solve.
+    pub roff: f64,
+    /// Control threshold (V): `V(ctrl) ≥ threshold` closes the switch.
+    pub threshold: f64,
+}
+
 /// A part instance: a kind, a human reference (`R1`), a primary value, the nets
 /// its terminals connect to, and (for sources) a time [`Waveform`].
 #[derive(Debug, Clone)]
@@ -340,6 +374,10 @@ pub struct Circuit {
     /// circuit, bit-for-bit). Only the transient and AC engines read it.
     /// (`CP-SIM-M7.2`.)
     lines: Vec<Line>,
+    /// Controlled switching elements recorded by [`add_switch`](Circuit::add_switch).
+    /// Empty ⇒ no switches (every pre-M9 circuit, bit-for-bit). Only the transient
+    /// engine reads it. (`CP-SIM-M9.1`.)
+    switches: Vec<Switch>,
 }
 
 // `Default` is hand-written (not derived) so net 0 is pre-seeded as ground: the
@@ -356,6 +394,7 @@ impl Default for Circuit {
             temp_c: NOMINAL_TEMP_C,
             couplings: Vec::new(),
             lines: Vec::new(),
+            switches: Vec::new(),
         }
     }
 }
@@ -671,6 +710,51 @@ impl Circuit {
         &self.lines
     }
 
+    /// Record a **controlled switch** between nets `a` and `b`, gated by the voltage
+    /// at control net `ctrl` (referenced to ground): the branch is `ron` ohms when
+    /// `V(ctrl) ≥ threshold` and `roff` ohms below it (`CP-SIM-M9.1`).
+    ///
+    /// `ron` and `roff` must both be finite and strictly positive and `threshold`
+    /// finite; otherwise the call is a no-op returning `false`. `roff` is a large
+    /// *finite* resistance rather than a true open so an off switch never floats a
+    /// node into a singular solve. Like [`couple`](Circuit::couple) and
+    /// [`add_line`](Circuit::add_line), this is pure metadata on existing nets — it
+    /// adds no part and no [`PartKind`] variant. Only the transient engine reads it;
+    /// drive `ctrl` with a [`Waveform::Pulse`] source to switch at a set duty cycle.
+    pub fn add_switch(
+        &mut self,
+        ctrl: NetId,
+        a: NetId,
+        b: NetId,
+        ron: f64,
+        roff: f64,
+        threshold: f64,
+    ) -> bool {
+        if !(ron.is_finite()
+            && ron > 0.0
+            && roff.is_finite()
+            && roff > 0.0
+            && threshold.is_finite())
+        {
+            return false;
+        }
+        self.switches.push(Switch {
+            ctrl,
+            a,
+            b,
+            ron,
+            roff,
+            threshold,
+        });
+        true
+    }
+
+    /// The controlled switches recorded by [`add_switch`](Circuit::add_switch), in
+    /// insertion order. Empty for a circuit with no switches.
+    pub fn switches(&self) -> &[Switch] {
+        &self.switches
+    }
+
     pub fn parts(&self) -> &[Part] {
         &self.parts
     }
@@ -950,5 +1034,29 @@ mod tests {
         assert!(!c.add_lossy_line(pa, pb, 50.0, 1e-9, 0.0, -1.0));
         // Every rejection left the two valid lines untouched.
         assert_eq!(c.lines().len(), 2);
+    }
+
+    #[test]
+    fn add_switch_records_the_relation_and_validates() {
+        let mut c = Circuit::new("buck");
+        let (ctrl, a, b) = (c.new_net(), c.new_net(), c.new_net());
+
+        // A fresh circuit has no switches.
+        assert!(c.switches().is_empty());
+
+        // A valid switch is recorded with its parameters.
+        assert!(c.add_switch(ctrl, a, b, 0.01, 1e6, 2.5));
+        assert_eq!(c.switches().len(), 1);
+        let sw = &c.switches()[0];
+        assert_eq!((sw.ctrl, sw.a, sw.b), (ctrl, a, b));
+        assert_eq!((sw.ron, sw.roff, sw.threshold), (0.01, 1e6, 2.5));
+
+        // Rejected: non-positive/non-finite ron or roff, non-finite threshold.
+        assert!(!c.add_switch(ctrl, a, b, 0.0, 1e6, 2.5));
+        assert!(!c.add_switch(ctrl, a, b, 0.01, -1.0, 2.5));
+        assert!(!c.add_switch(ctrl, a, b, f64::NAN, 1e6, 2.5));
+        assert!(!c.add_switch(ctrl, a, b, 0.01, 1e6, f64::INFINITY));
+        // Every rejection left the single valid switch untouched.
+        assert_eq!(c.switches().len(), 1);
     }
 }
