@@ -14,11 +14,18 @@
   V+ = vin,  V− = vfb,  vout = A·(V+ − V−)
 ```
 
-> **Shell limitation.** An op-amp is modeled here as a **VCVS** (voltage-controlled
-> voltage source), a 4-terminal controlled source ([`ohmforge_core::graph::PartKind::Vcvs`]).
-> The stdin shell's `add` only places 2-terminal parts, so this example is driven
-> through the **engine API**. The VCVS stamp is exercised by the
-> `ideal_opamp_noninverting_gain` regression test in `ohmforge-sim`.
+> **Runnable from the shell.** An op-amp is modeled here as a **VCVS** (voltage-
+> controlled voltage source), a 4-terminal controlled source
+> ([`ohmforge_core::graph::PartKind::Vcvs`]), placed with
+> `add EOP <out+> <out-> <ctrl+> <ctrl-> <gain>`. So this example runs directly as a
+> script:
+>
+> ```sh
+> cat examples/analog/opamp_noninverting.eesh | cargo run -p ohmforge --bin eesh
+> ```
+>
+> The VCVS stamp is also exercised by the `ideal_opamp_noninverting_gain`
+> regression test in `ohmforge-sim`.
 
 ## The circuit
 

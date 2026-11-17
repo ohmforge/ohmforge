@@ -15,17 +15,18 @@
               gnd
 ```
 
-> **Shell limitation.** A bipolar transistor is a 3-terminal device
-> ([`ohmforge_core::graph::PartKind::Bjt`], Ebers–Moll). The stdin shell's `add` only
-> places 2-terminal parts, so this circuit ships as a **built-in demo** you can run
-> directly:
+> **Runnable from the shell.** A bipolar transistor is a 3-terminal device
+> ([`ohmforge_core::graph::PartKind::Bjt`], Ebers–Moll), placed with
+> `add Q1 <collector> <base> <emitter> [npn|pnp]`. So this circuit runs directly as
+> a script:
 >
 > ```sh
-> cargo run -p ohmforge amp
+> cat examples/analog/common_emitter_bjt.eesh | cargo run -p ohmforge --bin eesh
 > ```
 >
-> It is also exercised by the `bjt_common_emitter_bias` and
-> `bjt_ce_small_signal_gain` regression tests in `ohmforge-sim`.
+> The same bias is also the built-in `cargo run -p ohmforge amp` demo, and is
+> exercised by the `bjt_common_emitter_bias` and `bjt_ce_small_signal_gain`
+> regression tests in `ohmforge-sim`.
 
 ## The circuit
 

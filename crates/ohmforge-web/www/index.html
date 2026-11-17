@@ -84,6 +84,19 @@
           </div>
           <pre class="scope" id="scope">(loading…)</pre>
 
+          <!-- Live "tune" slider — sweeps one component of the loaded example and
+               re-runs the sim on every drag, through the real edit_remove/edit_add
+               + simulate bindings. Hidden until an example with a tunable part is
+               loaded. -->
+          <div class="tune" id="tune-wrap" hidden>
+            <div class="tune-head">
+              <label id="tune-label" style="margin:0">Tune</label>
+              <span class="tune-val" id="tune-val"></span>
+            </div>
+            <input type="range" id="tune" aria-label="Tune a component and re-run live" />
+            <p class="tune-hint" id="tune-hint"></p>
+          </div>
+
           <div class="scope-label">
             <label style="margin:0">Operating point</label>
           </div>
@@ -152,6 +165,18 @@
           </details>
         </section>
       </header>
+
+      <!-- ---- Example gallery -------------------------------------- -->
+      <!-- A row of selectable circuits. Clicking a card loads its netlist +
+           view settings into the live demo above and runs it through the same
+           WASM `simulate` binding — no forked sim logic. Every circuit here is
+           one the browser engine (R/C/L/V nodal solver) actually simulates;
+           nonlinear parts (diodes, BJTs, op-amps) need the native shell and are
+           shipped as CLI examples instead (see examples/analog/). -->
+      <section class="gallery" id="gallery-sec" aria-label="Example circuit gallery">
+        <h2 class="section-title">Load an example — it runs live in the demo above</h2>
+        <div class="gallery-grid" id="gallery"></div>
+      </section>
 
       <!-- ---- Features --------------------------------------------- -->
       <section class="features" id="features">
@@ -267,46 +292,205 @@
         CoEdit,
       } = mod;
 
-      const DEMOS = {
-        "RC low-pass": `# out charges toward the 5 V rail through R1
+      // Value formatters for the tune readout + the raw netlist value string.
+      const ohms = (n) =>
+        n >= 1000 ? (n / 1000).toFixed(n % 1000 ? 1 : 0) + " kΩ" : n + " Ω";
+
+      // The example gallery. Each entry carries the netlist, the transient view
+      // settings, and (optionally) a `tune` descriptor: the one part the live
+      // slider sweeps, with the node names needed to re-place it via edit_add.
+      // Every circuit is pure R/C/L/V, so the browser engine simulates it as-is.
+      const GALLERY = [
+        {
+          key: "rc-lowpass",
+          title: "RC low-pass",
+          notice: "First-order charge — out eases toward the 5 V rail as C1 fills through R1.",
+          netlist: `# out charges toward the 5 V rail through R1
 .title rc-lowpass
 V1 in  gnd 5
 R1 in  out 1k
 C1 out gnd 1u
 `,
-        "RLC resonator": `# a series RLC — the output rings on the step
-.title rlc
+          duration: 0.005, step: 0.000005, probes: ["out"],
+          tune: { ref: "R1", nodeA: "in", nodeB: "out", min: 200, max: 6000, step: 50,
+            value: 1000, label: "R1 — cutoff", toValue: (n) => String(n),
+            display: ohms, hint: "Smaller R → faster charge (higher cutoff)." },
+        },
+        {
+          key: "rlc",
+          title: "RLC resonator",
+          notice: "Underdamped ring — the L–C tank overshoots the step and oscillates as it settles.",
+          netlist: `# a series RLC — the output rings on the step
+.title rlc-resonator
 V1 in  gnd 5
 R1 in  a   50
 L1 a   out 10m
 C1 out gnd 100n
 `,
-        "RC divider chain": `# two cascaded RC sections
-.title rc2
+          duration: 0.001, step: 0.000001, probes: ["out"],
+          tune: { ref: "R1", nodeA: "in", nodeB: "a", min: 5, max: 500, step: 5,
+            value: 50, label: "R1 — damping", toValue: (n) => String(n),
+            display: ohms, hint: "Low R rings hard; raise it to critically damp the ringing." },
+        },
+        {
+          key: "lc-ladder",
+          title: "LC ladder low-pass",
+          notice: "Fourth-order L–C ladder — a sharp filter whose step response overshoots past the rail.",
+          netlist: `# two-section LC ladder — resonant overshoot on the step
+.title lc-ladder
+V1 in  gnd 5
+L1 in  a   1m
+C1 a   gnd 220n
+L2 a   out 1m
+C2 out gnd 220n
+`,
+          duration: 0.0004, step: 0.0000004, probes: ["out"],
+          tune: { ref: "C1", nodeA: "a", nodeB: "gnd", min: 50, max: 680, step: 10,
+            value: 220, label: "C1 — tuning capacitor", toValue: (n) => n + "n",
+            display: (n) => n + " nF", hint: "More C slows the ladder and changes the overshoot." },
+        },
+        {
+          key: "rc-highpass",
+          title: "RC high-pass",
+          notice: "Differentiator — the step jumps straight through C1, then decays to zero as it blocks DC.",
+          netlist: `# RC high-pass — the step spikes then decays through R1
+.title rc-highpass
+V1 in  gnd 5
+C1 in  out 1u
+R1 out gnd 1k
+`,
+          duration: 0.005, step: 0.000005, probes: ["out"],
+          tune: { ref: "R1", nodeA: "out", nodeB: "gnd", min: 200, max: 6000, step: 50,
+            value: 1000, label: "R1 — decay time constant", toValue: (n) => String(n),
+            display: ohms, hint: "Bigger R → slower decay (τ = R·C)." },
+        },
+        {
+          key: "rc-ladder",
+          title: "Cascaded RC",
+          notice: "Two RC sections in series — a gentler, S-shaped rise with more delay than one stage.",
+          netlist: `# two cascaded RC sections — a two-pole roll-off
+.title rc-ladder
 V1 in  gnd 5
 R1 in  a   1k
 C1 a   gnd 100n
 R2 a   out 1k
 C2 out gnd 100n
 `,
-      };
+          duration: 0.002, step: 0.000002, probes: ["out"],
+          tune: { ref: "R2", nodeA: "a", nodeB: "out", min: 200, max: 6000, step: 50,
+            value: 1000, label: "R2 — second-stage resistor", toValue: (n) => String(n),
+            display: ohms, hint: "Tune the second pole and watch the knee move." },
+        },
+        {
+          key: "rl-step",
+          title: "RL step",
+          notice: "Inductor step — v(mid) jumps to the rail, then collapses as L1's current ramps up.",
+          netlist: `# RL step — the inductor voltage decays as its current ramps
+.title rl-step
+V1 in  gnd 5
+R1 in  mid 100
+L1 mid gnd 0.1
+`,
+          duration: 0.005, step: 0.000005, probes: ["mid"],
+          tune: { ref: "R1", nodeA: "in", nodeB: "mid", min: 20, max: 1000, step: 10,
+            value: 100, label: "R1 — L/R time constant", toValue: (n) => String(n),
+            display: ohms, hint: "Larger R → faster decay (τ = L/R)." },
+        },
+      ];
 
       const demoSel = $("demo");
       const netlist = $("netlist");
       const editErr = $("edit-err");
+      const galleryEl = $("gallery");
 
-      for (const name of Object.keys(DEMOS)) {
+      // The part the tune slider currently drives (null = no tunable example).
+      let activeTune = null;
+
+      // Build the gallery cards from GALLERY; a click loads that example.
+      for (const d of GALLERY) {
+        const card = document.createElement("button");
+        card.type = "button";
+        card.className = "gallery-card";
+        card.dataset.key = d.key;
+        const t = document.createElement("span");
+        t.className = "gc-title";
+        t.textContent = d.title;
+        const n = document.createElement("span");
+        n.className = "gc-notice";
+        n.textContent = d.notice;
+        card.append(t, n);
+        card.addEventListener("click", () => loadDemo(d.key));
+        galleryEl.appendChild(card);
+
         const o = document.createElement("option");
-        o.value = name;
-        o.textContent = name;
+        o.value = d.key;
+        o.textContent = d.title;
         demoSel.appendChild(o);
       }
-      demoSel.addEventListener("change", () => {
-        netlist.value = DEMOS[demoSel.value];
+      demoSel.addEventListener("change", () => loadDemo(demoSel.value));
+
+      // Load one gallery example into the live demo: set the netlist + view
+      // settings, configure (or hide) the tune slider, and run it.
+      function loadDemo(key) {
+        const d = GALLERY.find((g) => g.key === key) || GALLERY[0];
+        netlist.value = d.netlist;
+        $("duration").value = d.duration;
+        $("step").value = d.step;
+        $("probes").value = (d.probes || []).join(" ");
+        demoSel.value = d.key;
+        for (const c of galleryEl.querySelectorAll(".gallery-card")) {
+          c.classList.toggle("active", c.dataset.key === d.key);
+        }
+        configureTune(d.tune);
         refreshParts();
         runSim();
-      });
-      netlist.value = DEMOS[Object.keys(DEMOS)[0]];
+      }
+
+      // Point the slider at an example's tunable part (or hide it).
+      function configureTune(tune) {
+        const wrap = $("tune-wrap");
+        if (!tune) {
+          activeTune = null;
+          wrap.hidden = true;
+          return;
+        }
+        activeTune = tune;
+        const s = $("tune");
+        s.min = tune.min;
+        s.max = tune.max;
+        s.step = tune.step;
+        s.value = tune.value;
+        $("tune-label").textContent = tune.label;
+        $("tune-val").textContent = tune.display(tune.value);
+        $("tune-hint").textContent = tune.hint || "";
+        wrap.hidden = false;
+      }
+
+      // Slider drag: rewrite the one part via the real edit_remove/edit_add
+      // bindings, then re-run through `simulate` — the engine's speed on show.
+      function applyTune() {
+        if (!activeTune) return;
+        const raw = parseFloat($("tune").value);
+        $("tune-val").textContent = activeTune.display(raw);
+        try {
+          const removed = edit_remove(netlist.value, activeTune.ref);
+          netlist.value = edit_add(
+            removed,
+            activeTune.ref,
+            activeTune.nodeA,
+            activeTune.nodeB,
+            activeTune.toValue(raw)
+          );
+        } catch (e) {
+          editErr.textContent = String(e);
+          return;
+        }
+        runSim();
+      }
+
+      // Pre-init: show the first example's netlist so the textarea isn't blank
+      // while the engine loads (handlers are wired once init() resolves).
+      netlist.value = GALLERY[0].netlist;
 
       // The probed node names, split on whitespace/commas (empty tokens dropped).
       const probeList = () =>
@@ -510,14 +694,27 @@ C2 out gnd 100n
           $("share").addEventListener("click", shareLink);
           $("p-add").addEventListener("click", addPart);
           $("coedit").addEventListener("click", toggleCoedit);
-          // Typing in the netlist keeps the parts list in sync (no re-run).
-          netlist.addEventListener("input", refreshParts);
-          // A shared link (#…) wins over the default demo: load it, then run.
-          loadFromHash();
-          runSim(); // first result visible on load — no tap needed
+          $("tune").addEventListener("input", applyTune);
+          // Typing in the netlist keeps the parts list in sync (no re-run); a
+          // hand edit also detaches the tune slider (it no longer matches).
+          netlist.addEventListener("input", () => {
+            configureTune(null);
+            refreshParts();
+          });
+          // A shared link (#…) wins over the default example; otherwise load the
+          // first gallery card. Either way the first result is visible on load.
+          if (loadFromHash()) {
+            configureTune(null);
+            runSim();
+          } else {
+            loadDemo(GALLERY[0].key);
+          }
           // Follow in-page hash changes (e.g. back/forward, pasted #link).
           window.addEventListener("hashchange", () => {
-            if (loadFromHash()) runSim();
+            if (loadFromHash()) {
+              configureTune(null);
+              runSim();
+            }
           });
         })
         .catch((e) => {

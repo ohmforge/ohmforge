@@ -1,0 +1,7 @@
+add V1 vcc gnd 12
+add R1 vcc base 47k
+add R2 base gnd 10k
+add RC vcc vc 2k2
+add RE emit gnd 1k
+add Q1 vc base emit npn
+run op

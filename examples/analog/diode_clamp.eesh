@@ -1,0 +1,5 @@
+add V1 in gnd 5
+add R1 in out 1k
+add D1 out clamp
+add V2 clamp gnd 3
+run op

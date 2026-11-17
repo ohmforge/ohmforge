@@ -6,11 +6,19 @@ how it solves these is in [`docs/guide/simulation.md`](../../docs/guide/simulati
 
 ## Runnable from the shell
 
-These are `.eesh` scripts the interactive shell accepts on **stdin**. Run one with:
+These are `.eesh` scripts the interactive shell accepts on **stdin**. The `ohmforge`
+package ships two binaries (`eesh`, the shell, and `of`, the CLI), so name the
+shell explicitly:
 
 ```sh
-cat examples/analog/<name>.eesh | cargo run -p ohmforge
+cat examples/analog/<name>.eesh | cargo run -p ohmforge --bin eesh
 ```
+
+The shell's `add` places two-terminal parts (`R C L V I`, and `D` diodes) **and**
+the multi-terminal devices the engine models: `Q` (BJT, `collector base emitter
+[npn|pnp]`), `M` (MOSFET), and the controlled sources `E`/`G` (VCVS/VCCS) and
+`H`/`F` (CCVS/CCCS). So every operating-point circuit below — including the
+nonlinear and multi-terminal ones — runs directly as a script:
 
 | Example | Analysis | What it shows |
 |---------|----------|---------------|
@@ -19,23 +27,22 @@ cat examples/analog/<name>.eesh | cargo run -p ohmforge
 | [`rl_step`](rl_step.md) | `run tran` | first-order RL, inductor voltage decaying as current ramps |
 | [`rlc_resonator`](rlc_resonator.md) | `run tran` | underdamped RLC step — a ringing, overshooting response |
 | [`diode`](diode.md) | `run op` | the nonlinear Newton–Raphson path — a silicon junction drop |
+| [`diode_clamp`](diode_clamp.md) | `run op` | a diode clamp pinning a node to a rail + one junction drop |
+| [`common_emitter_bjt`](common_emitter_bjt.md) | `run op` | NPN voltage-divider bias in the forward-active region (`Q1`) |
+| [`opamp_noninverting`](opamp_noninverting.md) | `run op` | ideal op-amp (VCVS `EOP`) closing a ×10 non-inverting loop |
 
-## Engine-API examples (beyond the current shell grammar)
-
-The stdin shell's `add <ref> <a> <b> <value>` places only **2-terminal, DC** parts
-(R, C, L, V, I, D). These three circuits need capabilities the engine has but that
-grammar cannot yet express — a time-varying source, a 4-terminal controlled source,
-or a 3-terminal transistor — so each writeup drives the circuit through the engine
-API (or a built-in `cargo run -p ohmforge <demo>`) and is backed by an `ohmforge-sim`
-regression test:
+## Engine-API examples (an AC stimulus the shell transient can't resolve yet)
 
 | Example | Needs | Verified by |
 |---------|-------|-------------|
-| [`half_wave_rectifier`](half_wave_rectifier.md) | sine source ([`Waveform::Sine`]) | engine-API snippet |
-| [`opamp_noninverting`](opamp_noninverting.md) | VCVS (4-terminal) | `ideal_opamp_noninverting_gain` test |
-| [`common_emitter_bjt`](common_emitter_bjt.md) | BJT (3-terminal) | `cargo run -p ohmforge amp`, `bjt_common_emitter_bias` test |
+| [`half_wave_rectifier`](half_wave_rectifier.md) | a sine *transient* | engine-API snippet |
 
-> Extending the shell grammar to place sines and multi-terminal devices (so these
-> three become `.eesh` scripts too) lives in `ohmforge-shell`, outside this engine crate.
-> The shell also has no comment syntax today, so `.eesh` files here are kept as pure
-> command lines with the prose in the paired `.md`.
+The shell can *attach* a sine with `set <ref> sine <amp> <freq>`, but `run tran`
+drives the engine with an adaptive timestep and no fixed-step override, so a
+purely-resistive sine circuit is sampled at its zero-crossings and reads flat.
+Rendering a clean rectified waveform therefore needs the fixed-step transient of
+the engine API (or the browser demo's `simulate(netlist, duration, step)`), so this
+one stays an engine-API writeup, backed by an `ohmforge-sim` regression test.
+
+> `.eesh` files are pure command lines — the shell has no comment syntax yet, so
+> the prose for each lives in the paired `.md`.

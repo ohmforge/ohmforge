@@ -1,0 +1,5 @@
+add Vin vin gnd 1
+add EOP vout gnd vin vfb 1e6
+add Rf vout vfb 9k
+add Rg vfb gnd 1k
+run op

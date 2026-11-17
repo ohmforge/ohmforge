@@ -28,11 +28,11 @@ ohmforge is a **SPICE-class analog + mixed-signal simulator**, an **instruction-
 ```sh
 git clone https://github.com/ohmforge/ohmforge && cd ohmforge
 
-cargo run -p ohmforge -- demo    # RC low-pass → transient → braille scope
-cargo run -p ohmforge -- bode    # AC sweep → Bode plot, −3 dB at 1 kHz
-cargo run -p ohmforge -- amp     # common-emitter BJT, op-point + color overlay
-cargo run -p ohmforge -- cosim   # real AVR firmware drives D13 → a simulated LED (19.4 mA)
-cargo run -p ohmforge -- tui     # the live, dockable terminal UI
+cargo run -p ohmforge --bin of -- demo    # RC low-pass → transient → braille scope
+cargo run -p ohmforge --bin of -- bode    # AC sweep → Bode plot, −3 dB at 1 kHz
+cargo run -p ohmforge --bin of -- amp     # common-emitter BJT, op-point + color overlay
+cargo run -p ohmforge --bin of -- cosim   # real AVR firmware drives D13 → a simulated LED (19.4 mA)
+cargo run -p ohmforge --bin of -- tui     # the live, dockable terminal UI
 ```
 
 In the browser — **[▶ try the live demo](https://ohmforge.github.io/ohmforge/)** (no install), or build it yourself:
@@ -67,7 +67,7 @@ show                     # render the braille scope
 set R1.value 2k          # retune a component and re-solve
 ```
 
-Scripts are plain `.eesh` files — see [`examples/`](examples/README.md). Pipe one in: `cat examples/tutorial/rc_lowpass.eesh | cargo run -p ohmforge`.
+Scripts are plain `.eesh` files — see [`examples/`](examples/README.md). Pipe one in: `cat examples/tutorial/rc_lowpass.eesh | cargo run -p ohmforge --bin of`.
 
 ## What works today
 
@@ -84,11 +84,11 @@ Full status and the 99-checkpoint ledger: [`docs/plan/CHECKPOINTS.md`](docs/plan
 
 ```sh
 # Offline — no key, no network. Design-rule review of a circuit:
-printf 'add V1 in gnd 5\nadd R1 in out 1k\nadd D1 out gnd\n' | cargo run -p ohmforge -- review
+printf 'add V1 in gnd 5\nadd R1 in out 1k\nadd D1 out gnd\n' | cargo run -p ohmforge --bin of -- review
 
 # Live — the model drives the real shell + engine and verifies itself:
 export ANTHROPIC_API_KEY=sk-...          # optional: EE_BASE_URL / ANTHROPIC_BASE_URL for a proxy
-cargo run -p ohmforge --features http -- ask "design a 5 V to 3.3 V divider and check it"
+cargo run -p ohmforge --features http --bin of -- ask "design a 5 V to 3.3 V divider and check it"
 ```
 
 The live transport is behind the opt-in `http` feature, so the default build (and the WASM core) pull **no network or TLS stack**. See [`docs/guide/ai-copilot.md`](docs/guide/ai-copilot.md).
