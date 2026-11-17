@@ -7,12 +7,18 @@ This directory is the static "try it in your browser" home for
 
 ```
 www/
-├── index.html         # hero + live demo + features + footer
-├── style.css          # theme tokens, layout (light/dark, forge-amber accent)
+├── index.html         # hero + live demo, example gallery, schematic canvas,
+│                      #   features, terminal snippet, closing CTA, footer
+├── style.css          # design system: tokens, type scale, layout
+│                      #   (light/dark, forge-amber accent, reduced-motion safe)
 ├── ohmforge-mark.svg  # square mark (favicon)
 ├── ohmforge-logo.svg  # wordmark
 └── pkg/               # generated WASM bundle (see below) — not checked in
 ```
+
+The page is a single self-contained document: a system-font stack, inline SVG
+icons, and CSS custom properties for the whole theme — no external fonts, icon
+fonts, or script CDNs, so it renders identically offline.
 
 ## 1. Build the WASM bundle
 
