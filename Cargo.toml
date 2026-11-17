@@ -23,8 +23,8 @@ edition = "2021"
 rust-version = "1.79"
 license = "Apache-2.0"
 repository = "https://github.com/ohmforge/ohmforge"
-homepage = "https://github.com/ohmforge/ohmforge"
-authors = ["The ohmforge Authors"]
+# (homepage omitted — cargo flags it as redundant with `repository`; authors live in
+#  LICENSE/NOTICE rather than a workspace field no crate inherits.)
 # Shared crates.io discovery metadata; crates inherit with `keywords.workspace = true`.
 keywords = ["electronics", "simulation", "spice", "circuit", "eda"]
 categories = ["simulation", "science", "command-line-utilities"]

@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 description = "ohmforge: the AI-assisted EE workbench binary — orchestrates the eesh shell, TUI, engines, and copilot."
 repository.workspace = true
-homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 readme = "README.md"
