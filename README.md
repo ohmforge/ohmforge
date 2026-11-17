@@ -35,7 +35,7 @@ cargo run -p ohmforge -- cosim   # real AVR firmware drives D13 → a simulated 
 cargo run -p ohmforge -- tui     # the live, dockable terminal UI
 ```
 
-In the browser (WebAssembly):
+In the browser — **[▶ try the live demo](https://ohmforge.github.io/ohmforge/)** (no install), or build it yourself:
 
 ```sh
 wasm-pack build crates/ohmforge-web --target web --out-dir www/pkg
