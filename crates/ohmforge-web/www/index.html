@@ -8,6 +8,8 @@
       name="description"
       content="ohmforge — the AI-native circuit & firmware workbench: one small Rust binary that simulates your analog, digital, and MCU firmware together, in your terminal or your browser."
     />
+    <meta name="theme-color" content="#fbfbfd" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#0f1115" media="(prefers-color-scheme: dark)" />
     <link rel="icon" href="./ohmforge-mark.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="./style.css" />
   </head>
@@ -38,133 +40,165 @@
       </defs>
     </svg>
 
-    <div class="wrap">
-      <!-- ---- Nav ---------------------------------------------------- -->
-      <nav class="nav">
+    <a class="skip-link" href="#try">Skip to the live demo</a>
+
+    <!-- ---- Site header / nav ------------------------------------- -->
+    <header class="site-header">
+      <div class="container nav">
         <a class="brand" href="./" aria-label="ohmforge home">
-          <svg class="mark" viewBox="0 0 64 64"><use href="#of-mark" /></svg>
+          <svg class="mark" viewBox="0 0 64 64" aria-hidden="true"><use href="#of-mark" /></svg>
           <span class="name">ohm<b>forge</b></span>
         </a>
-        <div class="nav-links">
-          <a href="#features">Features</a>
-          <a href="#terminal">Terminal</a>
-          <a href="https://github.com/ohmforge/ohmforge">GitHub</a>
-        </div>
-      </nav>
+        <nav class="nav-links" aria-label="Primary">
+          <a class="nav-link" href="#features">Features</a>
+          <a class="nav-link" href="#gallery-sec">Examples</a>
+          <a class="nav-link" href="#terminal">Terminal</a>
+          <a class="nav-gh" href="https://github.com/ohmforge/ohmforge">
+            <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+            GitHub
+          </a>
+        </nav>
+      </div>
+    </header>
 
+    <main>
       <!-- ---- Hero + live demo -------------------------------------- -->
-      <header class="hero">
-        <div class="hero-copy">
-          <svg class="hero-mark" viewBox="0 0 64 64" aria-hidden="true"><use href="#of-mark" /></svg>
-          <h1>The AI-native circuit &amp; <span class="amber">firmware</span> workbench.</h1>
-          <p class="lede">
-            One small Rust binary that simulates your analog, digital, and MCU
-            firmware together — in your terminal or your browser.
-          </p>
-          <div class="ctas">
-            <button id="run" class="btn primary" disabled>Run it</button>
-            <a class="btn" href="https://github.com/ohmforge/ohmforge">View on GitHub</a>
+      <section class="hero">
+        <div class="container hero-inner">
+          <div class="hero-copy">
+            <span class="pill">
+              <svg class="hero-spark" viewBox="0 0 64 64" aria-hidden="true"><use href="#of-mark" /></svg>
+              AI-native EDA · open source
+            </span>
+            <h1>The AI-native circuit &amp; <span class="amber">firmware</span> workbench.</h1>
+            <p class="lede">
+              One small Rust binary that simulates your analog, digital, and MCU
+              firmware together — in your terminal or your browser.
+            </p>
+            <div class="ctas">
+              <a class="btn primary" href="#try">
+                Try it now
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12l7 7 7-7"/></svg>
+              </a>
+              <a class="btn ghost" href="https://github.com/ohmforge/ohmforge">
+                <svg viewBox="0 0 16 16" width="17" height="17" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+                View on GitHub
+              </a>
+            </div>
+            <ul class="cred" aria-label="At a glance">
+              <li>Rust</li>
+              <li>Apache-2.0</li>
+              <li>M0&ndash;M9</li>
+              <li>runs offline</li>
+              <li>terminal + browser</li>
+            </ul>
           </div>
-          <p class="note">Runs entirely in your browser via WebAssembly — no install, no server.</p>
+
+          <!-- The live demo. The Rust ohmforge-sim engine, compiled to WASM,
+               parses the netlist, runs an op-point + transient, and draws the
+               braille scope. It auto-runs on load so the result is visible in
+               seconds. All element IDs below are wired by the module script. -->
+          <section class="panel hero-demo" id="try" aria-label="Live circuit simulation">
+            <div class="window-bar">
+              <span class="win-dots" aria-hidden="true"><span></span><span></span><span></span></span>
+              <span class="win-title">ohmforge — scope</span>
+              <span class="live"><span class="dot"></span> Live · in your browser</span>
+            </div>
+            <div class="demo-body">
+              <div class="demo-head">
+                <label for="netlist" style="margin:0">Netlist</label>
+                <button id="run" class="btn tiny" type="button" disabled>Run it</button>
+              </div>
+              <textarea id="netlist" spellcheck="false"></textarea>
+
+              <div class="scope-label">
+                <label style="margin:0">Scope — transient node voltages (braille)</label>
+              </div>
+              <pre class="scope" id="scope">(loading…)</pre>
+
+              <!-- Live "tune" slider — sweeps one component of the loaded example and
+                   re-runs the sim on every drag, through the real edit_remove/edit_add
+                   + simulate bindings. Hidden until an example with a tunable part is
+                   loaded. -->
+              <div class="tune" id="tune-wrap" hidden>
+                <div class="tune-head">
+                  <label id="tune-label" style="margin:0">Tune</label>
+                  <span class="tune-val" id="tune-val"></span>
+                </div>
+                <input type="range" id="tune" aria-label="Tune a component and re-run live" />
+                <p class="tune-hint" id="tune-hint"></p>
+              </div>
+
+              <div class="scope-label">
+                <label style="margin:0">Operating point</label>
+              </div>
+              <table id="op"><tbody></tbody></table>
+              <p id="error" class="err"></p>
+              <p id="status" class="status">Loading WebAssembly…</p>
+
+              <!-- Advanced controls — same host-tested bindings, tucked away so the
+                   first run stays front-and-center. -->
+              <details class="advanced">
+                <summary>Tweak the run · edit parts · share &amp; co-edit</summary>
+                <div class="row">
+                  <div>
+                    <label for="demo">Demo</label>
+                    <select id="demo"></select>
+                  </div>
+                  <div>
+                    <label for="duration">Duration (s)</label>
+                    <input id="duration" type="number" value="0.005" step="0.001" min="0" />
+                  </div>
+                  <div>
+                    <label for="step">Step (s, 0 = auto)</label>
+                    <input id="step" type="number" value="0.000005" step="0.000001" min="0" />
+                  </div>
+                  <div>
+                    <label for="probes">Probes (nodes)</label>
+                    <input id="probes" type="text" style="width:140px" placeholder="out in" spellcheck="false" />
+                  </div>
+                  <div>
+                    <label>&nbsp;</label>
+                    <button id="share" class="btn small" disabled>Copy session link</button>
+                  </div>
+                  <div>
+                    <label>&nbsp;</label>
+                    <button id="coedit" class="btn small" disabled>Co-edit: sync tabs</button>
+                  </div>
+                </div>
+
+                <div class="row" style="display:block">
+                  <label>Parts — add, list, remove (kept in sync with the netlist)</label>
+                  <table class="parts" id="parts"><tbody></tbody></table>
+                </div>
+                <div class="row">
+                  <div>
+                    <label for="p-ref">Ref</label>
+                    <input id="p-ref" type="text" placeholder="R2" spellcheck="false" />
+                  </div>
+                  <div>
+                    <label for="p-a">Node A</label>
+                    <input id="p-a" type="text" placeholder="out" spellcheck="false" />
+                  </div>
+                  <div>
+                    <label for="p-b">Node B</label>
+                    <input id="p-b" type="text" placeholder="gnd" spellcheck="false" />
+                  </div>
+                  <div>
+                    <label for="p-val">Value</label>
+                    <input id="p-val" type="text" placeholder="2k" spellcheck="false" />
+                  </div>
+                  <div>
+                    <label>&nbsp;</label>
+                    <button id="p-add" class="btn small" disabled>Add part</button>
+                  </div>
+                </div>
+                <p id="edit-err" class="err"></p>
+              </details>
+            </div>
+          </section>
         </div>
-
-        <!-- The live demo. The Rust ohmforge-sim engine, compiled to WASM,
-             parses the netlist, runs an op-point + transient, and draws the
-             braille scope. It auto-runs on load so the result is visible in
-             seconds. All element IDs below are wired by the module script. -->
-        <section class="panel hero-demo" aria-label="Live circuit simulation">
-          <div class="demo-head">
-            <label for="netlist" style="margin:0">Netlist</label>
-            <span class="live"><span class="dot"></span> Live · in your browser</span>
-          </div>
-          <textarea id="netlist" spellcheck="false"></textarea>
-
-          <div class="scope-label">
-            <label style="margin:0">Scope — transient node voltages (braille)</label>
-          </div>
-          <pre class="scope" id="scope">(loading…)</pre>
-
-          <!-- Live "tune" slider — sweeps one component of the loaded example and
-               re-runs the sim on every drag, through the real edit_remove/edit_add
-               + simulate bindings. Hidden until an example with a tunable part is
-               loaded. -->
-          <div class="tune" id="tune-wrap" hidden>
-            <div class="tune-head">
-              <label id="tune-label" style="margin:0">Tune</label>
-              <span class="tune-val" id="tune-val"></span>
-            </div>
-            <input type="range" id="tune" aria-label="Tune a component and re-run live" />
-            <p class="tune-hint" id="tune-hint"></p>
-          </div>
-
-          <div class="scope-label">
-            <label style="margin:0">Operating point</label>
-          </div>
-          <table id="op"><tbody></tbody></table>
-          <p id="error" class="err"></p>
-          <p id="status" class="status">Loading WebAssembly…</p>
-
-          <!-- Advanced controls — same host-tested bindings, tucked away so the
-               first run stays front-and-center. -->
-          <details class="advanced">
-            <summary>Tweak the run · edit parts · share &amp; co-edit</summary>
-            <div class="row">
-              <div>
-                <label for="demo">Demo</label>
-                <select id="demo"></select>
-              </div>
-              <div>
-                <label for="duration">Duration (s)</label>
-                <input id="duration" type="number" value="0.005" step="0.001" min="0" />
-              </div>
-              <div>
-                <label for="step">Step (s, 0 = auto)</label>
-                <input id="step" type="number" value="0.000005" step="0.000001" min="0" />
-              </div>
-              <div>
-                <label for="probes">Probes (nodes)</label>
-                <input id="probes" type="text" style="width:140px" placeholder="out in" spellcheck="false" />
-              </div>
-              <div>
-                <label>&nbsp;</label>
-                <button id="share" class="btn small" disabled>Copy session link</button>
-              </div>
-              <div>
-                <label>&nbsp;</label>
-                <button id="coedit" class="btn small" disabled>Co-edit: sync tabs</button>
-              </div>
-            </div>
-
-            <div class="row" style="display:block">
-              <label>Parts — add, list, remove (kept in sync with the netlist)</label>
-              <table class="parts" id="parts"><tbody></tbody></table>
-            </div>
-            <div class="row">
-              <div>
-                <label for="p-ref">Ref</label>
-                <input id="p-ref" type="text" placeholder="R2" spellcheck="false" />
-              </div>
-              <div>
-                <label for="p-a">Node A</label>
-                <input id="p-a" type="text" placeholder="out" spellcheck="false" />
-              </div>
-              <div>
-                <label for="p-b">Node B</label>
-                <input id="p-b" type="text" placeholder="gnd" spellcheck="false" />
-              </div>
-              <div>
-                <label for="p-val">Value</label>
-                <input id="p-val" type="text" placeholder="2k" spellcheck="false" />
-              </div>
-              <div>
-                <label>&nbsp;</label>
-                <button id="p-add" class="btn small" disabled>Add part</button>
-              </div>
-            </div>
-            <p id="edit-err" class="err"></p>
-          </details>
-        </section>
-      </header>
+      </section>
 
       <!-- ---- Example gallery -------------------------------------- -->
       <!-- A row of selectable circuits. Clicking a card loads its netlist +
@@ -173,9 +207,15 @@
            one the browser engine (R/C/L/V nodal solver) actually simulates;
            nonlinear parts (diodes, BJTs, op-amps) need the native shell and are
            shipped as CLI examples instead (see examples/analog/). -->
-      <section class="gallery" id="gallery-sec" aria-label="Example circuit gallery">
-        <h2 class="section-title">Load an example — it runs live in the demo above</h2>
-        <div class="gallery-grid" id="gallery"></div>
+      <section class="section gallery" id="gallery-sec" aria-labelledby="gallery-h">
+        <div class="container">
+          <div class="section-head">
+            <p class="eyebrow">Example gallery</p>
+            <h2 class="section-title" id="gallery-h">Load an example — it runs live in the demo above</h2>
+            <p class="section-lede">Six classic networks, each a pure R/C/L/V circuit the browser engine simulates as-is. Pick one and watch the scope redraw in milliseconds.</p>
+          </div>
+          <div class="gallery-grid" id="gallery"></div>
+        </div>
       </section>
 
       <!-- ---- Drag-and-drop schematic canvas (CP-WEB.8) ------------ -->
@@ -185,96 +225,144 @@
            host-tested `Schematic` model (canvas_netlist/canvas_layout bindings),
            not a forked editor. Desktop-first (mouse); on a phone the grid is
            hidden and the text/parts form above stays the way to build. -->
-      <section class="canvas-sec" id="canvas-sec" aria-label="Visual schematic canvas">
-        <h2 class="section-title">Or draw it — place parts, wire them, simulate</h2>
-        <section class="panel canvas-panel">
-          <div class="cv-tools" id="cv-tools" role="toolbar" aria-label="Canvas tools">
-            <span class="cv-group">
-              <button type="button" class="btn small cv-tool" data-tool="R">R · resistor</button>
-              <button type="button" class="btn small cv-tool" data-tool="C">C · cap</button>
-              <button type="button" class="btn small cv-tool" data-tool="L">L · inductor</button>
-              <button type="button" class="btn small cv-tool" data-tool="V">V · source</button>
-            </span>
-            <span class="cv-group">
-              <button type="button" class="btn small cv-tool" data-tool="wire">Wire</button>
-              <button type="button" class="btn small cv-tool" data-tool="gnd">Ground</button>
-              <button type="button" class="btn small cv-tool" data-tool="move">Move</button>
-              <button type="button" class="btn small cv-tool" data-tool="delete">Delete</button>
-            </span>
-            <span class="cv-group cv-actions">
-              <button type="button" id="cv-load" class="btn small" disabled>Load netlist above</button>
-              <button type="button" id="cv-clear" class="btn small">Clear</button>
-              <button type="button" id="cv-run" class="btn primary small" disabled>Simulate</button>
-            </span>
+      <section class="section canvas-sec" id="canvas-sec" aria-labelledby="canvas-h">
+        <div class="container">
+          <div class="section-head">
+            <p class="eyebrow">Visual capture</p>
+            <h2 class="section-title" id="canvas-h">Or draw it — place parts, wire them, simulate</h2>
+            <p class="section-lede">A schematic editor that serializes to the exact same netlist the engine runs — so what you draw is always what it simulates.</p>
           </div>
-          <p class="cv-hint" id="cv-hint">Pick a part, then click the grid to drop it.</p>
-          <div class="cv-stage">
-            <svg id="cv-svg" class="cv-svg" aria-label="Schematic grid — draw with the mouse"></svg>
-            <p class="cv-mobile-note">The drawing canvas needs a mouse — open this page on a desktop to draw, or use the parts form in the demo above.</p>
-          </div>
-          <div class="scope-label"><label style="margin:0">Generated netlist</label></div>
-          <pre class="scope" id="cv-netlist">(draw a circuit, then Simulate)</pre>
-          <div class="scope-label"><label style="margin:0">Scope — transient node voltages (braille)</label></div>
-          <pre class="scope" id="cv-scope">(nothing simulated yet)</pre>
-          <p id="cv-err" class="err"></p>
-          <p id="cv-status" class="status"></p>
-        </section>
+          <section class="panel canvas-panel">
+            <div class="cv-tools" id="cv-tools" role="toolbar" aria-label="Canvas tools">
+              <span class="cv-group">
+                <button type="button" class="btn small cv-tool" data-tool="R">R · resistor</button>
+                <button type="button" class="btn small cv-tool" data-tool="C">C · cap</button>
+                <button type="button" class="btn small cv-tool" data-tool="L">L · inductor</button>
+                <button type="button" class="btn small cv-tool" data-tool="V">V · source</button>
+              </span>
+              <span class="cv-group">
+                <button type="button" class="btn small cv-tool" data-tool="wire">Wire</button>
+                <button type="button" class="btn small cv-tool" data-tool="gnd">Ground</button>
+                <button type="button" class="btn small cv-tool" data-tool="move">Move</button>
+                <button type="button" class="btn small cv-tool" data-tool="delete">Delete</button>
+              </span>
+              <span class="cv-group cv-actions">
+                <button type="button" id="cv-load" class="btn small" disabled>Load netlist above</button>
+                <button type="button" id="cv-clear" class="btn small">Clear</button>
+                <button type="button" id="cv-run" class="btn primary small" disabled>Simulate</button>
+              </span>
+            </div>
+            <p class="cv-hint" id="cv-hint">Pick a part, then click the grid to drop it.</p>
+            <div class="cv-stage">
+              <svg id="cv-svg" class="cv-svg" aria-label="Schematic grid — draw with the mouse"></svg>
+              <p class="cv-mobile-note">The drawing canvas needs a mouse — open this page on a desktop to draw, or use the parts form in the demo above.</p>
+            </div>
+            <div class="scope-label"><label style="margin:0">Generated netlist</label></div>
+            <pre class="scope" id="cv-netlist">(draw a circuit, then Simulate)</pre>
+            <div class="scope-label"><label style="margin:0">Scope — transient node voltages (braille)</label></div>
+            <pre class="scope" id="cv-scope">(nothing simulated yet)</pre>
+            <p id="cv-err" class="err"></p>
+            <p id="cv-status" class="status"></p>
+          </section>
+        </div>
       </section>
 
       <!-- ---- Features --------------------------------------------- -->
-      <section class="features" id="features">
-        <h2 class="section-title">One workbench, from op-point to firmware</h2>
-        <div class="feature-grid">
-          <div class="feature">
-            <svg class="ficon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12h3l2 7 4-14 2 7h7"/></svg>
-            <h3>SPICE-class analog</h3>
-            <p>A nodal solver for R, L, C, diodes, and sources — DC operating point plus transient, drawn as a braille scope.</p>
+      <section class="section features" id="features" aria-labelledby="features-h">
+        <div class="container">
+          <div class="section-head">
+            <p class="eyebrow">One workbench</p>
+            <h2 class="section-title" id="features-h">From op-point to firmware, in a single binary</h2>
+            <p class="section-lede">Analog, digital, MCU firmware and an AI copilot share one engine, one clock, and one install.</p>
           </div>
-          <div class="feature">
-            <svg class="ficon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1.5"/><path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3"/></svg>
-            <h3>MCU co-simulation</h3>
-            <p>Co-simulate AVR, RP2040, STM32, and ESP32 firmware against the same nodes, so your code and your circuit share one clock.</p>
-          </div>
-          <div class="feature">
-            <svg class="ficon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l1.8 4.2L18 9l-4.2 1.8L12 15l-1.8-4.2L6 9l4.2-1.8z"/><path d="M5 17l.9 2.1L8 20l-2.1.9L5 23l-.9-2.1L2 20l2.1-.9z"/></svg>
-            <h3>AI copilot</h3>
-            <p>Describe a change in plain English; the copilot edits the netlist, explains the operating point, and reviews your design.</p>
-          </div>
-          <div class="feature">
-            <svg class="ficon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M13 15h4"/></svg>
-            <h3>Terminal + browser</h3>
-            <p>The whole workbench is a single Rust binary — run it as a TUI, a CLI, or compiled to WebAssembly in this very page.</p>
+          <div class="feature-grid">
+            <div class="feature">
+              <span class="ficon-wrap"><svg class="ficon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12h3l2 7 4-14 2 7h7"/></svg></span>
+              <h3>SPICE-class analog</h3>
+              <p>A nodal solver for R, L, C, diodes, and sources — DC operating point plus transient, drawn as a braille scope.</p>
+            </div>
+            <div class="feature">
+              <span class="ficon-wrap"><svg class="ficon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1.5"/><path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3"/></svg></span>
+              <h3>MCU co-simulation</h3>
+              <p>Co-simulate AVR, RP2040, STM32, and ESP32 firmware against the same nodes, so your code and your circuit share one clock.</p>
+            </div>
+            <div class="feature">
+              <span class="ficon-wrap"><svg class="ficon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l1.8 4.2L18 9l-4.2 1.8L12 15l-1.8-4.2L6 9l4.2-1.8z"/><path d="M5 17l.9 2.1L8 20l-2.1.9L5 23l-.9-2.1L2 20l2.1-.9z"/></svg></span>
+              <h3>AI copilot</h3>
+              <p>Describe a change in plain English; the copilot edits the netlist, explains the operating point, and reviews your design.</p>
+            </div>
+            <div class="feature">
+              <span class="ficon-wrap"><svg class="ficon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 2 4 14h6l-1 8 9-12h-6z"/></svg></span>
+              <h3>Power, sensors &amp; RF</h3>
+              <p>Switching converters with PWM, sensor front-ends, and 2-port S-parameters with Smith-chart and eye-diagram views.</p>
+            </div>
+            <div class="feature">
+              <span class="ficon-wrap"><svg class="ficon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M13 15h4"/></svg></span>
+              <h3>Terminal + browser</h3>
+              <p>The whole workbench is a single Rust binary — run it as a TUI, a CLI, or compiled to WebAssembly in this very page.</p>
+            </div>
           </div>
         </div>
       </section>
 
       <!-- ---- Terminal snippet ------------------------------------- -->
-      <section class="terminal" id="terminal">
-        <h2 class="section-title">Prefer the terminal? Same engine, one binary.</h2>
-        <div class="term">
-          <div class="term-bar">
-            <div class="term-dots"><span></span><span></span><span></span></div>
-            <button id="copy-term" class="btn small" type="button">Copy</button>
+      <section class="section terminal" id="terminal" aria-labelledby="terminal-h">
+        <div class="container">
+          <div class="section-head">
+            <p class="eyebrow">In your terminal</p>
+            <h2 class="section-title" id="terminal-h">Prefer the terminal? Same engine, one binary.</h2>
+            <p class="section-lede">No daemon, no cloud. Everything in the browser demo runs identically at the command line.</p>
           </div>
-          <pre id="term-code"><span class="cm"># run the prefilled demo and print the scope</span>
+          <div class="term">
+            <div class="term-bar">
+              <span class="win-dots" aria-hidden="true"><span></span><span></span><span></span></span>
+              <span class="win-title">zsh — ohmforge</span>
+              <button id="copy-term" class="btn tiny" type="button">
+                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+                Copy
+              </button>
+            </div>
+            <pre id="term-code"><span class="cm"># run the prefilled demo and print the scope</span>
 <span class="pr">$</span> cargo run -p ohmforge --bin of -- demo
 <span class="cm"># open the full terminal UI</span>
 <span class="pr">$</span> of tui
 <span class="cm"># let the AI copilot review your design</span>
 <span class="pr">$</span> of review</pre>
+          </div>
         </div>
       </section>
 
-      <!-- ---- Footer ----------------------------------------------- -->
-      <footer>
-        <div class="foot-links">
+      <!-- ---- Closing CTA ------------------------------------------ -->
+      <section class="section closing" aria-labelledby="closing-h">
+        <div class="container">
+          <div class="cta-card">
+            <svg class="cta-mark" viewBox="0 0 64 64" aria-hidden="true"><use href="#of-mark" /></svg>
+            <h2 class="cta-title" id="closing-h">Simulate your first circuit in seconds.</h2>
+            <p class="cta-lede">No install, no sign-up — the engine is already running above. Or clone the repo and run the same binary in your shell.</p>
+            <div class="ctas">
+              <a class="btn primary" href="#try">Try it now</a>
+              <a class="btn ghost" href="https://github.com/ohmforge/ohmforge">View on GitHub</a>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- ---- Footer ----------------------------------------------- -->
+    <footer class="site-footer">
+      <div class="container foot-inner">
+        <a class="brand" href="./" aria-label="ohmforge home">
+          <svg class="mark" viewBox="0 0 64 64" aria-hidden="true"><use href="#of-mark" /></svg>
+          <span class="name">ohm<b>forge</b></span>
+        </a>
+        <nav class="foot-links" aria-label="Footer">
           <a href="https://github.com/ohmforge/ohmforge">GitHub</a>
           <a href="https://github.com/ohmforge/ohmforge#readme">Docs</a>
           <a href="https://github.com/ohmforge/ohmforge/blob/main/LICENSE">License · MIT OR Apache-2.0</a>
-        </div>
+        </nav>
         <p class="tm">ohmforge is a trademark of its maintainers.</p>
-      </footer>
-    </div>
+      </div>
+    </footer>
 
     <script type="module">
       // The demo is driven by the Rust ohmforge-sim engine compiled to WASM.
