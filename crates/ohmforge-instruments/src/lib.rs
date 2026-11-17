@@ -13,6 +13,7 @@ mod fmt;
 
 pub mod bode;
 pub mod dmm;
+pub mod eye;
 pub mod fft;
 pub mod funcgen;
 pub mod logic_analyzer;
@@ -20,10 +21,12 @@ pub mod math;
 pub mod oscilloscope;
 pub mod patch;
 pub mod psu;
+pub mod smith;
 pub mod spectrum;
 
 pub use bode::{corner_3db, Bode};
 pub use dmm::{measure, DmmMode, DmmReading, Multimeter};
+pub use eye::{EyeDiagram, EyeMetrics};
 pub use fft::{fft, magnitude_spectrum, peak_bin, Window};
 pub use funcgen::{FuncGen, Waveform};
 pub use logic_analyzer::{
@@ -37,6 +40,7 @@ pub use patch::{
     PluginHandle, Port, ProcessingBlock, TestReport, TestSequence, VirtualInstrument, Wire,
 };
 pub use psu::{BenchPsu, PsuMode, PsuOutput};
+pub use smith::{impedance_from_gamma, reflection_coefficient, SmithChart};
 pub use spectrum::Spectrum;
 
 /// A named signal an instrument can display (a node voltage, a branch current,

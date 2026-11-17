@@ -36,6 +36,7 @@ use ohmforge_core::graph::Circuit;
 use ohmforge_core::units::Unit;
 use ohmforge_core::value::Value;
 
+use crate::canvas::{Canvas, CanvasEvent, Cell};
 use crate::current::{branch_currents, BranchCurrents};
 use crate::overlay::{NodeVoltages, Overlay};
 use crate::playback::Playback;
@@ -193,6 +194,12 @@ impl KeyEvent {
 pub enum MouseKind {
     /// A button went down at the cell.
     Down,
+    /// The pointer moved with the button held (a drag) — drives visual schematic
+    /// capture (`CP-UX-M9.1`).
+    Drag,
+    /// A button was released at the cell — the end of a drag/click
+    /// (`CP-UX-M9.1`).
+    Up,
     /// The scroll wheel moved up.
     ScrollUp,
     /// The scroll wheel moved down.
@@ -299,6 +306,7 @@ enum Action {
     ShrinkFocus,
     ToggleOverlay,
     ToggleEdit,
+    ToggleCapture,
     ClearLog,
     Quit,
 }
@@ -340,6 +348,10 @@ const COMMANDS: &[Command] = &[
         action: Action::ToggleEdit,
     },
     Command {
+        name: "capture mode",
+        action: Action::ToggleCapture,
+    },
+    Command {
         name: "clear log",
         action: Action::ClearLog,
     },
@@ -378,6 +390,12 @@ pub struct App<B: Backend> {
     overlay: bool,
     /// Interactive schematic-editing sub-state (`CP-UX-M5.1`).
     edit: Edit,
+    /// Visual schematic-capture state: the mouse-driven grid canvas
+    /// (`CP-UX-M9.1`). Active only while [`capture`](App::capture) is set.
+    canvas: Canvas,
+    /// Whether mouse events drive the capture canvas (place/move/wire on the
+    /// schematic pane) rather than focusing panels.
+    capture: bool,
     /// The last solved operating point, refreshed after every mutation so the
     /// overlay reflects edits and live tuning (`CP-UX-M6.1`).
     voltages: NodeVoltages,
@@ -413,6 +431,8 @@ impl<B: Backend> App<B> {
             input: String::new(),
             overlay: false,
             edit: Edit::default(),
+            canvas: Canvas::new(),
+            capture: false,
             voltages,
             currents,
             playback: Playback::new(),
@@ -544,6 +564,14 @@ impl<B: Backend> App<B> {
     }
 
     fn on_mouse(&mut self, m: MouseEvent) {
+        // In capture mode, pointer gestures on the schematic pane drive the visual
+        // canvas (place/move/wire) rather than focusing panels (`CP-UX-M9.1`).
+        if self.capture && !self.palette.open {
+            if let Some(ev) = self.canvas_event(m) {
+                self.capture_event(ev);
+                return;
+            }
+        }
         match m.kind {
             // While the palette is open a click interacts with it instead of
             // falling through to the pane behind: on a command row it selects and
@@ -675,6 +703,7 @@ impl<B: Backend> App<B> {
             Action::ShrinkFocus => self.shrink_focused(),
             Action::ToggleOverlay => self.overlay = !self.overlay,
             Action::ToggleEdit => self.toggle_edit_mode(),
+            Action::ToggleCapture => self.toggle_capture(),
             Action::ClearLog => self.log.clear(),
             Action::Quit => self.should_quit = true,
         }
@@ -853,6 +882,68 @@ impl<B: Backend> App<B> {
         let line = action.to_command();
         self.run_line(&line);
         self.clamp_selection();
+    }
+
+    // ── visual schematic capture (CP-UX-M9.1) ──────────────────────────────
+
+    /// Whether mouse-driven capture mode is active.
+    pub fn capture(&self) -> bool {
+        self.capture
+    }
+
+    /// Turn capture mode on/off. Capture focuses the schematic so the grid is
+    /// visible and takes the pointer.
+    pub fn set_capture(&mut self, on: bool) {
+        self.capture = on;
+        if on {
+            self.focus = PanelId::Schematic;
+        }
+    }
+
+    fn toggle_capture(&mut self) {
+        self.set_capture(!self.capture);
+    }
+
+    /// The visual-capture canvas (for tests and the schematic pane render).
+    pub fn canvas(&self) -> &Canvas {
+        &self.canvas
+    }
+
+    /// Choose the part kind the next capture click places.
+    pub fn select_canvas_kind(&mut self, kind: crate::canvas::PartKind) {
+        self.canvas.select_kind(kind);
+    }
+
+    /// Feed one canvas gesture through the state machine and apply whatever
+    /// [`EditAction`]s it produces via the shared mutation path — so a part drawn
+    /// with the mouse is placed/wired exactly as a typed `add`/`wire` would be,
+    /// and lands on the real [`Circuit`]. Pure: the backend does the mutation.
+    pub fn capture_event(&mut self, event: CanvasEvent) {
+        for action in self.canvas.handle(event) {
+            self.apply_edit(action);
+        }
+    }
+
+    /// Translate a terminal [`MouseEvent`] into a capture [`CanvasEvent`] in
+    /// grid-cell coordinates relative to the schematic pane interior, or `None`
+    /// for a scroll / an event outside the pane. The canvas's grid origin is the
+    /// schematic pane's interior top-left.
+    fn canvas_event(&self, m: MouseEvent) -> Option<CanvasEvent> {
+        let (w, h) = self.size;
+        let rect = self.geometry(w, h)[0].1; // schematic pane
+        if !rect.contains(m.col, m.row) {
+            return None;
+        }
+        // Grid origin at the pane interior (inside the one-cell border).
+        let col = m.col.saturating_sub(rect.x + 1);
+        let row = m.row.saturating_sub(rect.y + 1);
+        let cell = Cell::new(col, row);
+        match m.kind {
+            MouseKind::Down => Some(CanvasEvent::Down(cell)),
+            MouseKind::Drag => Some(CanvasEvent::Drag(cell)),
+            MouseKind::Up => Some(CanvasEvent::Up(cell)),
+            MouseKind::ScrollUp | MouseKind::ScrollDown => None,
+        }
     }
 
     /// Enter edit mode, focusing the schematic and clearing any stale prompt.
@@ -1083,6 +1174,15 @@ impl<B: Backend> App<B> {
     fn render_panel(&self, id: PanelId, rect: Rect) -> Vec<String> {
         let focused = id == self.focus;
         match id {
+            // Capture mode shows the visual grid: the parts the mouse has dropped
+            // and wired (`CP-UX-M9.1`).
+            PanelId::Schematic if self.capture => {
+                let title = focus_title("schematic [capture]", focused);
+                let body = self
+                    .canvas
+                    .render(rect.w.saturating_sub(2), rect.h.saturating_sub(2));
+                Pane::new(&title, &body).render(rect.w, rect.h)
+            }
             // Edit mode takes precedence over the overlay: the selection marker,
             // prompt, and hint must stay visible while editing even if the overlay
             // is toggled on (`CP-UX-M8.1`).
@@ -1695,6 +1795,9 @@ mod tests {
     struct EditBackend {
         circuit: Circuit,
         nets: std::collections::HashMap<String, NetId>,
+        /// Snapshot stack mirroring the real shell's auto-snapshot/undo, so a
+        /// placement made through the shared path is undoable (`CP-UX-M9.1`).
+        undo: Vec<(Circuit, std::collections::HashMap<String, NetId>)>,
     }
 
     impl EditBackend {
@@ -1702,7 +1805,12 @@ mod tests {
             Self {
                 circuit: Circuit::new("edit"),
                 nets: std::collections::HashMap::new(),
+                undo: Vec::new(),
             }
+        }
+
+        fn snapshot(&mut self) {
+            self.undo.push((self.circuit.clone(), self.nets.clone()));
         }
 
         fn is_ground(name: &str) -> bool {
@@ -1743,19 +1851,31 @@ mod tests {
                     let (kind, unit) = match r.chars().next().map(|c| c.to_ascii_uppercase()) {
                         Some('R') => (PartKind::Resistor, Unit::Ohm),
                         Some('C') => (PartKind::Capacitor, Unit::Farad),
+                        Some('L') => (PartKind::Inductor, Unit::Henry),
                         Some('V') => (PartKind::VoltageSource, Unit::Volt),
+                        Some('I') => (PartKind::CurrentSource, Unit::Ampere),
                         _ => return Err(format!("unknown part type for {r}")),
                     };
                     let value = Value::parse(v, unit).map_err(|_| format!("bad value {v:?}"))?;
+                    self.snapshot();
                     let (na, nb) = (self.net_for(a), self.net_for(b));
                     self.circuit.add_part(*r, kind, Some(value), vec![na, nb]);
                     Ok(format!("added {r}"))
                 }
                 ["wire", a, b] => {
                     let (na, nb) = (self.net_known(a)?, self.net_known(b)?);
+                    self.snapshot();
                     self.circuit.wire(na, nb);
                     Ok(format!("wired {a} {b}"))
                 }
+                ["undo"] => match self.undo.pop() {
+                    Some((circuit, nets)) => {
+                        self.circuit = circuit;
+                        self.nets = nets;
+                        Ok("undone".to_string())
+                    }
+                    None => Err("nothing to undo".to_string()),
+                },
                 ["set", target, v] => {
                     // `set <ref>.value <v>` — retarget a component value in place.
                     let reference = target.split('.').next().unwrap_or(*target).to_string();
@@ -1764,6 +1884,7 @@ mod tests {
                         None => return Err(format!("no part named {reference}")),
                     };
                     let value = Value::parse(v, unit).map_err(|_| format!("bad value {v:?}"))?;
+                    self.snapshot();
                     self.circuit.set_value(&reference, value);
                     Ok(format!("set {reference}"))
                 }
@@ -1771,6 +1892,7 @@ mod tests {
                     if self.circuit.part_by_ref(r).is_none() {
                         return Err(format!("no part named {r}"));
                     }
+                    self.snapshot();
                     // ohmforge-core has no part removal; rebuild without the target,
                     // preserving net ids and union-find topology via `resolve`.
                     let old = &self.circuit;
@@ -1862,6 +1984,78 @@ mod tests {
             "V1 removed"
         );
         assert!(a.backend().circuit().part_by_ref("R1").is_some(), "R1 kept");
+    }
+
+    fn mouse_at(a: &mut App<EditBackend>, kind: MouseKind, col: usize, row: usize) {
+        a.handle_event(AppEvent::Mouse(MouseEvent { kind, col, row }));
+    }
+
+    fn down_up(a: &mut App<EditBackend>, col: usize, row: usize) {
+        mouse_at(a, MouseKind::Down, col, row);
+        mouse_at(a, MouseKind::Up, col, row);
+    }
+
+    /// `CP-UX-M9.1` gate: mouse events in capture mode place two parts on the grid
+    /// canvas and wire them, all landing on the **real** `Circuit` through the
+    /// shared `EditAction` path. Asserted on the circuit; no tty.
+    #[test]
+    fn mouse_places_and_wires_parts_on_the_canvas() {
+        use crate::canvas::PartKind;
+        let mut a = edit_app();
+        a.set_size(120, 40);
+        a.set_capture(true);
+
+        // The schematic pane is at (0,0); its grid origin is one cell in (the
+        // border), so a click at screen (6,4) places a part at body cell (5,3).
+        a.select_canvas_kind(PartKind::Resistor);
+        down_up(&mut a, 6, 4); // R1, body (5,3), terminals (4,3)/(6,3)
+        down_up(&mut a, 6, 8); // R2, body (5,7), terminals (4,7)/(6,7)
+        assert_eq!(a.backend().circuit().parts().len(), 2, "two parts placed");
+
+        // R1's right terminal and R2's left terminal are distinct nets until wired.
+        let r1 = a.backend().circuit().part_by_ref("R1").unwrap();
+        let r2 = a.backend().circuit().part_by_ref("R2").unwrap();
+        let (t1, t2) = (r1.terminals[1], r2.terminals[0]);
+        assert_ne!(
+            a.backend().circuit().resolve(t1),
+            a.backend().circuit().resolve(t2),
+            "terminals start on separate nets"
+        );
+
+        // Click-drag from R1's right terminal (canvas 6,3 → screen 7,4) to R2's
+        // left terminal (canvas 4,7 → screen 5,8) draws a wire.
+        mouse_at(&mut a, MouseKind::Down, 7, 4);
+        mouse_at(&mut a, MouseKind::Drag, 5, 8);
+        mouse_at(&mut a, MouseKind::Up, 5, 8);
+        assert_eq!(
+            a.backend().circuit().resolve(t1),
+            a.backend().circuit().resolve(t2),
+            "the drawn wire merged the two terminals' nets"
+        );
+    }
+
+    /// A placement made with the mouse is undoable through the same path a typed
+    /// `add` is: capture emits an `add`, which the shell auto-snapshots, so a plain
+    /// `undo` reverts it (`CP-UX-M9.1`).
+    #[test]
+    fn capture_placement_is_undoable_through_the_shared_path() {
+        use crate::canvas::PartKind;
+        let mut a = edit_app();
+        a.set_size(120, 40);
+        a.set_capture(true);
+        a.select_canvas_kind(PartKind::Resistor);
+        down_up(&mut a, 6, 4);
+        assert!(a.backend().circuit().part_by_ref("R1").is_some(), "placed");
+
+        // Undo through the shell line, exactly as for any typed edit.
+        a.set_capture(false);
+        a.focus = PanelId::Shell;
+        typ(&mut a, "undo");
+        key(&mut a, KeyCode::Enter);
+        assert!(
+            a.backend().circuit().part_by_ref("R1").is_none(),
+            "the placement was undone through the shared path"
+        );
     }
 
     /// The keystroke path: enter edit mode, add through the prompt, select, delete.
