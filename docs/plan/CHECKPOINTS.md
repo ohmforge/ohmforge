@@ -191,8 +191,8 @@ _(Post-M8: rebranded ee-assist → **ohmforge**, published to github.com/ohmforg
 
 ## M9 — cool features: power, sensors, RF, visual capture  🚧 in progress → plan: [`M9-PLAN.md`](M9-PLAN.md)
 
-- [~] **CP-SIM-M9.1** (sim-core) Power electronics: a controlled switching element as a circuit-level relation (no new `PartKind`) + PWM stimulus (extend `Pulse`) so buck/boost converters simulate in transient. — *gate:* a buck steps 12 V → ~5 V at the set duty, a boost steps up, with sane switching-node + inductor-current waveforms; switch-free circuits unaffected, golden suite bit-for-bit.
-- [~] **CP-SIM-M9.2** (sim-core) 2-port S-parameters: `Engine::s_parameters(circuit, p1, p2, z0)` → S11/S21/S12/S22 (+ Z/Y) from the AC solve. — *gate:* a matched line / attenuator / L-match returns S-params matching closed-form theory (Z0-matched → S11≈0). Purely additive.
+- [x] **CP-SIM-M9.1** (sim-core) Power electronics: a controlled switching element added as a **circuit-level relation** `Circuit::add_switch(ctrl, a, b, ron, roff, threshold)` recorded in a `Vec<Switch>` (**no new `PartKind`**, and the existing `Waveform::Pulse` carries the PWM duty/period unchanged — **no `Waveform` variant touched**). The switch is a bare conductance stamped in the fixed-step transient hot loop (`Ron` when the previous step's `V(ctrl) ≥ threshold`, else `Roff`); it adds no branch row, so a switch-free circuit assembles byte-identically. — *gate (passing):* `buck_converter_steps_12v_down_to_its_duty_output` (12 V, 42 % duty → ~4.6 V with small LC ripple + a switching node that chops Vin↔diode-clamp), `boost_converter_steps_the_input_voltage_up` (5 V → >7 V), `switch_conducts_when_control_is_high_and_blocks_when_low`, core `add_switch_records_the_relation_and_validates`; `full_golden_suite_runs_twice_identically` stays bit-for-bit.
+- [x] **CP-SIM-M9.2** (sim-core) 2-port S-parameters: `Engine::s_parameters(circuit, port1, port2, z0, freq) -> SParams` (S11/S21/S12/S22 + the Z 2-port matrix) from the linearized AC solve, via the terminated-port method (each column one complex solve with a 1 V-behind-`z0` drive on the port and a `z0` termination on the other). Factors the AC assembly into a shared `AcNetwork` (additive ⇒ the AC golden path is unchanged). Purely additive API. — *gate (passing):* `matched_pi_attenuator_is_reflectionless_with_predicted_attenuation` (6 dB Π-pad → |S11|≈0, |S21|=0.5, symmetric + reciprocal, Z-matrix = open-circuit hand analysis), `series_impedance_two_port_matches_closed_form` (series R **and** jωL vs `Z/(Z+2Z0)` / `2Z0/(Z+2Z0)`), `s_parameters_reject_bad_arguments`.
 - [~] **CP-BRD-M9.1** (boards) Sensor & actuator models in `ohmforge-devices` over existing primitives (no `-core`/`-sim` edits): NTC thermistor, photoresistor, potentiometer, DC motor (back-EMF), servo (pulse→angle), stepper; ≥1 wired through MCU co-sim. — *gate:* a thermistor divider shifts with temperature (β-model); 1.5 ms servo pulse → ~90°; a DC motor spins up; a pot wiper divides linearly.
 - [~] **CP-UX-M9.1** (ui-shell) Visual schematic capture in the TUI: mouse place/move/wire on a grid canvas driving the real `Circuit` via the shared `EditAction` path; pure state machine, no tty. — *gate:* mouse events place parts + draw a wire (asserted on the `Circuit`), a drag moves a part.
 - [~] **CP-UX-M9.2** (ui-shell) RF instrument panels in `ohmforge-instruments`: a Smith chart (Γ/S11 on the Smith grid) + an eye diagram (fold a bitstream), rendering from provided S-param/signal data. — *gate:* a known Γ lands at the correct Smith coordinate (Γ=0 center, open/short at the rim); an eye diagram folds a known pattern into the expected eye.
@@ -205,13 +205,13 @@ _(Post-M8: rebranded ee-assist → **ohmforge**, published to github.com/ohmforg
 
 | Track | Done | In progress | Total |
 |---|---|---|---|
-| sim-core | 26 | 2 | 28 |
+| sim-core | 28 | 0 | 28 |
 | boards | 17 | 1 | 18 |
 | ui-shell | 21 | 2 | 23 |
 | ai-fmt | 19 | 0 | 19 |
 | platform | 10 | 0 | 11 |
 | web | 6 | 0 | 7 |
-| **Total** | **99** | **5** | **106** |
+| **Total** | **101** | **3** | **106** |
 
 _**67/67 — M0 through M4 all complete** (M0–M3 tagged v0.1.0; M4 adds the rest). M4 delivered the **plugin device-model API** + an **instrument/block plugin trait**, a **KLU-class ordered/reusable sparse solver** and **multithreaded analyses**, a **Cortex-M3/M4 (Thumb-2)** core with an STM32 board, **SPICE `.model` import** + a vendor model library, and **shareable circuit links** in the browser. Deferred by design: real-time collaboration, the QEMU full-SBC bridge, and full vendor-SPICE `.model` fidelity — the standing M-next horizon._
 

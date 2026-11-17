@@ -14,7 +14,8 @@ pub mod units;
 pub mod value;
 
 pub use graph::{
-    BjtModel, Circuit, DiodeModel, Line, LineKind, MosfetModel, NetId, PartId, Polarity, Waveform,
+    BjtModel, Circuit, DiodeModel, Line, LineKind, MosfetModel, NetId, PartId, Polarity, Switch,
+    Waveform,
 };
 pub use signal::{Complex, Domain, Signal, SignalData};
 pub use units::Unit;

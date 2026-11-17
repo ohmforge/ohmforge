@@ -27,7 +27,7 @@ use mna::{ReusableSolver, System};
 use mna_complex::ComplexSystem;
 use ohmforge_core::graph::{
     BjtModel, Circuit, DiodeModel, Line, LineKind, MosfetModel, NetId, Part, PartKind, Polarity,
-    Waveform, NOMINAL_TEMP_C,
+    Switch, Waveform, NOMINAL_TEMP_C,
 };
 use ohmforge_core::value::Value;
 use ohmforge_core::{Complex, Domain, Signal, SignalData, Unit};
@@ -1818,6 +1818,48 @@ fn stamp_lossy_line(sys: &mut System, ln: &TLine, h: f64, state: [f64; 3]) {
     sys.stamp_current(ln.b1, ln.b2, g_c * cb_prev);
 }
 
+/// A controlled switch resolved for the **transient** engine (`CP-SIM-M9.1`).
+///
+/// It is a plain conductance between nodes `a` and `b` whose value snaps between
+/// `1/ron` (closed) and `1/roff` (open) according to the control node's voltage.
+/// The control voltage is read from the *previous* committed step's solution — a
+/// one-timestep lag that is standard for a control-driven switch and negligible at
+/// a timestep fine against the PWM period; the switch adds **no** branch row, so a
+/// circuit with no switches assembles exactly as before.
+struct TSwitch {
+    ctrl: Option<usize>,
+    a: Option<usize>,
+    b: Option<usize>,
+    ron: f64,
+    roff: f64,
+    threshold: f64,
+}
+
+impl TSwitch {
+    fn resolve(circuit: &Circuit, layout: &Layout, sw: &Switch) -> Self {
+        let node = |t| layout.node_of(circuit, t);
+        Self {
+            ctrl: node(sw.ctrl),
+            a: node(sw.a),
+            b: node(sw.b),
+            ron: sw.ron,
+            roff: sw.roff,
+            threshold: sw.threshold,
+        }
+    }
+
+    /// The conductance to stamp given the control voltage read from `node_prev`:
+    /// `1/ron` when `V(ctrl) ≥ threshold`, else `1/roff`.
+    fn conductance(&self, node_prev: &[f64]) -> f64 {
+        let vctrl = across(node_prev, self.ctrl, None);
+        if vctrl >= self.threshold {
+            1.0 / self.ron
+        } else {
+            1.0 / self.roff
+        }
+    }
+}
+
 struct TransientModel<'a> {
     circuit: &'a Circuit,
     layout: &'a Layout,
@@ -1836,6 +1878,10 @@ struct TransientModel<'a> {
     lines: Vec<TLine>,
     /// Total branch rows the lossless lines add (`2 ×` their count).
     line_branches: usize,
+    /// Controlled switches (`CP-SIM-M9.1`), resolved to node indices. Empty ⇒ the
+    /// pre-M9 path, bit-for-bit. Each stamps a bare conductance (no branch row), so
+    /// they never change the system size.
+    switches: Vec<TSwitch>,
     /// Nonlinear devices, re-linearized inside each step's Newton loop.
     devices: Vec<Box<dyn NonlinearDevice>>,
     /// Node count and voltage-source branch count. The step system is
@@ -1922,6 +1968,12 @@ impl<'a> TransientModel<'a> {
             });
         }
 
+        let switches: Vec<TSwitch> = circuit
+            .switches()
+            .iter()
+            .map(|sw| TSwitch::resolve(circuit, layout, sw))
+            .collect();
+
         let devices = collect_nonlinear(circuit, registry)?;
         Ok(Self {
             circuit,
@@ -1931,6 +1983,7 @@ impl<'a> TransientModel<'a> {
             coupling,
             lines,
             line_branches,
+            switches,
             devices,
             n: layout.n_nodes(),
             m: layout.vsources.len(),
@@ -1975,6 +2028,14 @@ impl<'a> TransientModel<'a> {
             for (i, ln) in self.lines.iter().enumerate() {
                 let ka = init_line_base + 2 * i;
                 stamp_lossless_line(sys, ln, ka, ka + 1, 0.0, 0.0);
+            }
+            // Switches start **open** at the t = 0 initial condition (no previous
+            // step to read the control from). `roff` is finite, so the branch is a
+            // large resistor — never a true open that would float a node. The t = 0
+            // sample is only the initial condition; the steady state the converter
+            // settles to over many PWM cycles is independent of this choice.
+            for sw in &self.switches {
+                sys.stamp_conductance(sw.a, sw.b, 1.0 / sw.roff);
             }
             Ok(())
         };
@@ -2031,6 +2092,7 @@ impl<'a> TransientModel<'a> {
     /// One Backward-Euler step of size `h` landing at time `t_end`, from the
     /// capacitor voltages `cap_prev` and inductor currents `ind_prev`. Returns the
     /// node solution at `t_end` and the refreshed `(cap_prev, ind_prev)`.
+    #[allow(clippy::too_many_arguments)]
     fn step(
         &self,
         t_end: f64,
@@ -2038,6 +2100,7 @@ impl<'a> TransientModel<'a> {
         cap_prev: &[f64],
         ind_prev: &[f64],
         line_prev: &LineState,
+        node_prev: &[f64],
         solver: &mut ReusableSolver,
     ) -> Result<StepOut, SimError> {
         let (circuit, layout) = (self.circuit, self.layout);
@@ -2111,6 +2174,13 @@ impl<'a> TransientModel<'a> {
                         ly += 1;
                     }
                 }
+            }
+            // Controlled switches (`CP-SIM-M9.1`): a bare conductance whose value is
+            // chosen from the previous step's control-node voltage (`Ron` above the
+            // threshold, `Roff` below). No switches ⇒ this loop is empty and the step
+            // system is byte-identical to the pre-M9 assembly.
+            for sw in &self.switches {
+                sys.stamp_conductance(sw.a, sw.b, sw.conductance(node_prev));
             }
             Ok(())
         };
@@ -2221,6 +2291,14 @@ fn transient(
             "a transmission line needs a fixed transient timestep",
         ));
     }
+    // A controlled switch reads its control from the previous committed step, so it
+    // needs the uniform grid a fixed step gives (the adaptive driver's reject/retry
+    // would re-read a half-formed state); require an explicit timestep, as lines do.
+    if !model.switches.is_empty() && !matches!(step, Some(h) if h > 0.0) {
+        return Err(SimError::Unsupported(
+            "a controlled switch needs a fixed transient timestep",
+        ));
+    }
     // A lossless line reads its delayed port history by interpolating committed
     // samples one delay back. A timestep coarser than the line delay pushes that
     // lookback (`t − delay`) past the last committed sample, where `LineState::port_at`
@@ -2272,6 +2350,9 @@ fn fixed_transient(
     }
     let mut cap_prev = cap_v0;
     let mut ind_prev = vec![0.0; model.inds.len()];
+    // The previous step's full solution — a controlled switch reads its control-node
+    // voltage from here (`CP-SIM-M9.1`). It starts at the t = 0 initial solution.
+    let mut node_prev = x0;
     // One solver for the whole run: every step stamps the same structure, so a
     // large net analyzes the fill-reducing ordering once and refactors per step.
     let mut solver = ReusableSolver::new(
@@ -2279,13 +2360,22 @@ fn fixed_transient(
     );
     for k in 1..=steps {
         let t = k as f64 * h;
-        let out = model.step(t, h, &cap_prev, &ind_prev, &line_state, &mut solver)?;
+        let out = model.step(
+            t,
+            h,
+            &cap_prev,
+            &ind_prev,
+            &line_state,
+            &node_prev,
+            &mut solver,
+        )?;
         times.push(t);
         for (d, trace) in traces.iter_mut().enumerate() {
             trace.push(out.x[d]);
         }
         cap_prev = out.caps;
         ind_prev = out.inds;
+        node_prev = out.x;
         // Commit this step's transmission-line state: append the lossless history
         // sample (so later steps can read it one delay back) and advance the lossy
         // companion state.
@@ -2346,6 +2436,11 @@ fn adaptive_transient(
     let mut traces: Vec<Vec<f64>> = (0..n).map(|d| vec![x0[d]]).collect();
     let mut cap_prev = cap_v0;
     let mut ind_prev = vec![0.0; model.inds.len()];
+    // Previous-step solution for any controlled switch (`CP-SIM-M9.1`). The adaptive
+    // driver never runs with a switch (the dispatcher routes a switch-bearing circuit
+    // to the fixed step, as for lines), so this is never read here; it is threaded
+    // only to share the one [`step`] with the fixed driver.
+    let mut node_prev = x0;
     let mut t = 0.0;
     let mut h = (duration / 100.0).clamp(h_min, h_max);
     // Shared across every accept/reject attempt (coarse + two half steps): all stamp
@@ -2377,16 +2472,26 @@ fn adaptive_transient(
             &cap_prev,
             &ind_prev,
             &no_lines,
+            &node_prev,
             &mut solver,
         )?;
         let half = 0.5 * h_try;
-        let mid = model.step(t + half, half, &cap_prev, &ind_prev, &no_lines, &mut solver)?;
+        let mid = model.step(
+            t + half,
+            half,
+            &cap_prev,
+            &ind_prev,
+            &no_lines,
+            &node_prev,
+            &mut solver,
+        )?;
         let fine = model.step(
             t + h_try,
             half,
             &mid.caps,
             &mid.inds,
             &no_lines,
+            &mid.x,
             &mut solver,
         )?;
 
@@ -2400,6 +2505,7 @@ fn adaptive_transient(
             for (d, trace) in traces.iter_mut().enumerate() {
                 trace.push(fine.x[d]);
             }
+            node_prev = fine.x;
             h = (h_try * lte_step_factor(err)).clamp(h_min, h_max);
         } else {
             // Reject: shrink and retry from the same state.
@@ -2430,6 +2536,244 @@ fn log_frequencies(f_start: f64, f_stop: f64, ppd: u32) -> Vec<f64> {
     out
 }
 
+/// The frequency-independent assembly of a circuit's small-signal AC system,
+/// gathered once (`CP-SIM-M1.4`, shared with the S-parameter path `CP-SIM-M9.2`).
+///
+/// [`build`](AcNetwork::build) linearizes the circuit about its DC operating point
+/// and collects every stamp that does not depend on frequency — resistor
+/// conductances, capacitor/inductor reactances, the coupled-inductor and
+/// transmission-line companions, each nonlinear device's small-signal Jacobian, and
+/// the voltage-source branch rows. [`assemble`](AcNetwork::assemble) stamps them
+/// into a fresh [`ComplexSystem`] at a given angular frequency with **every
+/// independent source quiet** (voltage sources as 0 V shorts, current sources open).
+/// The caller then adds the excitation: [`ac`] a 1∠0 drive on each AC-marked source,
+/// [`Engine::s_parameters`] a `Z₀` port source/termination pair. Every stamp is
+/// additive, so both callers assemble a system byte-identical to the pre-refactor
+/// inline loop — the golden AC suite is unchanged.
+struct AcNetwork<'a> {
+    circuit: &'a Circuit,
+    layout: &'a Layout,
+    /// Node count (the signal rows).
+    n: usize,
+    /// Full MNA system size (nodes + branch rows).
+    size: usize,
+    /// First coupled-inductor branch row.
+    ac_base: usize,
+    conductances: Vec<(Option<usize>, Option<usize>, f64)>,
+    caps: Vec<(Option<usize>, Option<usize>, f64)>,
+    /// Isolated inductors (admittance companion).
+    inds: Vec<(Option<usize>, Option<usize>, f64)>,
+    /// All inductors in part order (for coupled-group stamping).
+    all_inds: Vec<(Option<usize>, Option<usize>, f64)>,
+    coupling: Couplings,
+    lines: Vec<AcLine>,
+    line_branch_of: Vec<usize>,
+    device_g: Vec<(Option<usize>, Option<usize>, f64)>,
+    /// Every voltage source as `(plus, minus, branch row k)`, stamped as a 0 V short
+    /// by [`assemble`]; the caller drives the AC ones through the branch RHS.
+    vsources: Vec<(Option<usize>, Option<usize>, usize)>,
+    /// Branch rows `k` of the AC-drive voltage sources (a 1∠0 phasor each).
+    ac_drive_branches: Vec<usize>,
+    /// AC-drive current sources as `(a, b)` — a 1∠0 injection a → b.
+    ac_drive_csources: Vec<(Option<usize>, Option<usize>)>,
+}
+
+impl<'a> AcNetwork<'a> {
+    fn build(
+        circuit: &'a Circuit,
+        layout: &'a Layout,
+        registry: &DeviceRegistry,
+    ) -> Result<Self, SimError> {
+        // Bias point for linearizing nonlinear devices. A linear circuit needs none,
+        // so this skips the DC gate that used to reject a DC-floating node (see
+        // [`small_signal_bias`]); the complex solve catches a true singularity.
+        let x_dc = small_signal_bias(circuit, layout, registry)?;
+
+        let n = layout.n_nodes();
+        let m = layout.vsources.len();
+        // Isolated inductors are admittances in AC — no branch rows; coupled
+        // inductors get a branch row each (after the controlled-source branches),
+        // because mutual coupling is singular to invert at the ideal k = 1.
+        let ac_base = n + m + layout.n_controlled_branches();
+
+        let mut conductances: Vec<(Option<usize>, Option<usize>, f64)> = Vec::new();
+        let mut caps: Vec<(Option<usize>, Option<usize>, f64)> = Vec::new();
+        let mut all_inds: Vec<(Option<usize>, Option<usize>, f64)> = Vec::new();
+        let mut ind_refs: Vec<String> = Vec::new();
+        let mut ind_l: Vec<f64> = Vec::new();
+        for part in circuit.parts() {
+            match part.kind {
+                PartKind::Resistor => {
+                    let r = resistor_value(circuit, part)?;
+                    let (a, b) = terminals2(part)?;
+                    conductances.push((
+                        layout.node_of(circuit, a),
+                        layout.node_of(circuit, b),
+                        1.0 / r,
+                    ));
+                }
+                PartKind::Capacitor => {
+                    let c = magnitude(part)?;
+                    if c <= 0.0 {
+                        return Err(SimError::BadValue(part.reference.clone()));
+                    }
+                    let (a, b) = terminals2(part)?;
+                    caps.push((layout.node_of(circuit, a), layout.node_of(circuit, b), c));
+                }
+                PartKind::Inductor => {
+                    let l = magnitude(part)?;
+                    if l <= 0.0 {
+                        return Err(SimError::BadValue(part.reference.clone()));
+                    }
+                    let (a, b) = terminals2(part)?;
+                    all_inds.push((layout.node_of(circuit, a), layout.node_of(circuit, b), l));
+                    ind_refs.push(part.reference.clone());
+                    ind_l.push(l);
+                }
+                _ => {}
+            }
+        }
+        // Magnetic coupling (`CP-SIM-M6.1`). Isolated inductors (`branch_of == None`)
+        // stay admittances in `inds`; coupled ones get a branch row. With no
+        // couplings this is the pre-M6 path, bit-for-bit.
+        let coupling = couplings_of(circuit, &ind_refs, &ind_l);
+        // Transmission lines (`CP-SIM-M7.2`): a lossless line adds two branch rows
+        // (its `e^{−jωT}` travelling-wave companion), after the coupled-inductor
+        // branches; a lossy line adds none. No lines ⇒ the pre-M7 layout stands.
+        let line_base = ac_base + coupling.count;
+        let lines: Vec<AcLine> = circuit
+            .lines()
+            .iter()
+            .map(|ln| AcLine::resolve(circuit, layout, ln))
+            .collect();
+        let mut n_line_branches = 0usize;
+        let mut line_branch_of: Vec<usize> = Vec::with_capacity(lines.len());
+        for ln in &lines {
+            line_branch_of.push(line_base + n_line_branches);
+            if ln.loss.is_none() {
+                n_line_branches += 2;
+            }
+        }
+        let size = line_base + n_line_branches;
+        let inds: Vec<(Option<usize>, Option<usize>, f64)> = all_inds
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| coupling.branch_of[*i].is_none())
+            .map(|(_, &t)| t)
+            .collect();
+
+        // Nonlinear devices → their small-signal Jacobian at the DC bias (a real
+        // admittance block), flattened to `(row, col, g)` matrix entries.
+        let devices = collect_nonlinear(circuit, registry)?;
+        let mut device_g: Vec<(Option<usize>, Option<usize>, f64)> = Vec::new();
+        for dev in &devices {
+            let nodes: Vec<Option<usize>> = dev
+                .terminals()
+                .iter()
+                .map(|&t| layout.node_of(circuit, t))
+                .collect();
+            let v: Vec<f64> = nodes
+                .iter()
+                .map(|&nd| nd.map_or(0.0, |i| x_dc[i]))
+                .collect();
+            let comp = dev.linearize(&v, &mut vec![0.0; dev.state_len()], false);
+            for (a, &na) in nodes.iter().enumerate() {
+                for (b, &nb) in nodes.iter().enumerate() {
+                    device_g.push((na, nb, comp.g[a][b]));
+                }
+            }
+        }
+
+        // Voltage sources → branch row k (stamped as a 0 V short in `assemble`);
+        // record which are AC drives so the caller adds their 1∠0 branch RHS.
+        let mut vsources: Vec<(Option<usize>, Option<usize>, usize)> = Vec::new();
+        let mut ac_drive_branches: Vec<usize> = Vec::new();
+        for (branch, &pi) in layout.vsources.iter().enumerate() {
+            let part = &circuit.parts()[pi];
+            let (plus, minus) = terminals2(part)?;
+            let k = n + branch;
+            vsources.push((
+                layout.node_of(circuit, plus),
+                layout.node_of(circuit, minus),
+                k,
+            ));
+            if is_ac_drive(part) {
+                ac_drive_branches.push(k);
+            }
+        }
+        let mut ac_drive_csources: Vec<(Option<usize>, Option<usize>)> = Vec::new();
+        for part in circuit.parts() {
+            if matches!(part.kind, PartKind::CurrentSource) && is_ac_drive(part) {
+                let (a, b) = terminals2(part)?;
+                ac_drive_csources.push((layout.node_of(circuit, a), layout.node_of(circuit, b)));
+            }
+        }
+
+        Ok(Self {
+            circuit,
+            layout,
+            n,
+            size,
+            ac_base,
+            conductances,
+            caps,
+            inds,
+            all_inds,
+            coupling,
+            lines,
+            line_branch_of,
+            device_g,
+            vsources,
+            ac_drive_branches,
+            ac_drive_csources,
+        })
+    }
+
+    /// Stamp the whole frequency-independent network into a fresh complex system at
+    /// angular frequency `w`, with every independent source quiet (voltage sources
+    /// as 0 V shorts, current sources open). The caller adds the excitation.
+    fn assemble(&self, w: f64) -> Result<ComplexSystem, SimError> {
+        let mut sys = ComplexSystem::new(self.size);
+        for &(a, b, g) in &self.conductances {
+            sys.stamp_admittance(a, b, Complex::new(g, 0.0));
+        }
+        for &(a, b, c) in &self.caps {
+            sys.stamp_admittance(a, b, Complex::new(0.0, w * c)); // jωC
+        }
+        for &(a, b, l) in &self.inds {
+            sys.stamp_admittance(a, b, Complex::new(0.0, -1.0 / (w * l))); // 1/(jωL)
+        }
+        // Coupled-inductor branch rows: `v = jω·L·i` with the mutual terms — valid
+        // at the ideal k = 1 where the admittance form is singular.
+        for group in &self.coupling.groups {
+            for (li_local, &li) in group.members.iter().enumerate() {
+                let (a, b, _) = self.all_inds[li];
+                let k_col = self.ac_base + self.coupling.branch_of[li].expect("coupled");
+                sys.stamp_vsource(a, b, k_col, Complex::ZERO);
+                for (lj_local, &lj) in group.members.iter().enumerate() {
+                    let l_kj = group.lmat[li_local][lj_local];
+                    if l_kj == 0.0 {
+                        continue;
+                    }
+                    let j_col = self.ac_base + self.coupling.branch_of[lj].expect("coupled");
+                    sys.stamp_matrix(Some(k_col), Some(j_col), Complex::new(0.0, -w * l_kj));
+                }
+            }
+        }
+        for &(a, b, g) in &self.device_g {
+            sys.stamp_matrix(a, b, Complex::new(g, 0.0));
+        }
+        for (li, ln) in self.lines.iter().enumerate() {
+            ln.stamp_ac(&mut sys, w, self.line_branch_of[li]);
+        }
+        for &(plus, minus, k) in &self.vsources {
+            sys.stamp_vsource(plus, minus, k, Complex::ZERO);
+        }
+        stamp_controlled_sources_complex(&mut sys, self.circuit, self.layout)?;
+        Ok(sys)
+    }
+}
+
 /// Small-signal AC analysis: linearize about the DC operating point, then solve a
 /// complex MNA system at each log-spaced frequency and return one complex
 /// [`Signal`] per node (the node-voltage phasor vs. frequency).
@@ -2458,192 +2802,22 @@ fn ac(
         return Err(SimError::BadValue("AC sweep range/points".into()));
     }
 
-    // Bias point for linearizing nonlinear devices. A linear circuit needs none, so
-    // this skips the DC gate that used to reject a DC-floating node (see
-    // [`small_signal_bias`]); the complex solve below still catches a true singularity.
-    let x_dc = small_signal_bias(circuit, layout, registry)?;
-
-    let n = layout.n_nodes();
-    let m = layout.vsources.len();
-    // Isolated inductors are admittances in AC — no branch rows; coupled inductors
-    // get a branch row each (after the controlled-source branches), because mutual
-    // coupling is singular to invert into an admittance at the ideal k = 1.
-    let ac_base = n + m + layout.n_controlled_branches();
-
-    // Precompute every frequency-independent stamp once.
-    // Resistors → real conductance G.
-    let mut conductances: Vec<(Option<usize>, Option<usize>, f64)> = Vec::new();
-    // Capacitors → jωC. Stored as (nodes, value) in farads.
-    let mut caps: Vec<(Option<usize>, Option<usize>, f64)> = Vec::new();
-    // Every inductor, in part order, with its nodes, value, and reference — then
-    // split into isolated (admittance) and coupled (branch-row) below.
-    let mut all_inds: Vec<(Option<usize>, Option<usize>, f64)> = Vec::new();
-    let mut ind_refs: Vec<String> = Vec::new();
-    let mut ind_l: Vec<f64> = Vec::new();
-    for part in circuit.parts() {
-        match part.kind {
-            PartKind::Resistor => {
-                let r = resistor_value(circuit, part)?;
-                let (a, b) = terminals2(part)?;
-                conductances.push((
-                    layout.node_of(circuit, a),
-                    layout.node_of(circuit, b),
-                    1.0 / r,
-                ));
-            }
-            PartKind::Capacitor => {
-                let c = magnitude(part)?;
-                if c <= 0.0 {
-                    return Err(SimError::BadValue(part.reference.clone()));
-                }
-                let (a, b) = terminals2(part)?;
-                caps.push((layout.node_of(circuit, a), layout.node_of(circuit, b), c));
-            }
-            PartKind::Inductor => {
-                let l = magnitude(part)?;
-                if l <= 0.0 {
-                    return Err(SimError::BadValue(part.reference.clone()));
-                }
-                let (a, b) = terminals2(part)?;
-                all_inds.push((layout.node_of(circuit, a), layout.node_of(circuit, b), l));
-                ind_refs.push(part.reference.clone());
-                ind_l.push(l);
-            }
-            _ => {}
-        }
-    }
-    // Magnetic coupling (`CP-SIM-M6.1`). Isolated inductors (`branch_of == None`)
-    // stay admittances in `inds`; coupled ones get a branch row and are stamped in
-    // their group below. With no couplings this is the pre-M6 path, bit-for-bit.
-    let coupling = couplings_of(circuit, &ind_refs, &ind_l);
-    // Transmission lines (`CP-SIM-M7.2`): a lossless line adds two branch rows
-    // (its travelling-wave companion in the `e^{−jωT}` form), placed right after
-    // the coupled-inductor branches; a lossy line adds none (it is pure lumped-LC
-    // admittances). No lines ⇒ `line_base == size` and the pre-M7 layout stands.
-    let line_base = ac_base + coupling.count;
-    let lines: Vec<AcLine> = circuit
-        .lines()
-        .iter()
-        .map(|ln| AcLine::resolve(circuit, layout, ln))
-        .collect();
-    let mut n_line_branches = 0usize;
-    let mut line_branch_of: Vec<usize> = Vec::with_capacity(lines.len());
-    for ln in &lines {
-        line_branch_of.push(line_base + n_line_branches);
-        if ln.loss.is_none() {
-            n_line_branches += 2;
-        }
-    }
-    let size = line_base + n_line_branches;
-    let inds: Vec<(Option<usize>, Option<usize>, f64)> = all_inds
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| coupling.branch_of[*i].is_none())
-        .map(|(_, &t)| t)
-        .collect();
-
-    // Nonlinear devices → their small-signal Jacobian at the DC bias (a real
-    // admittance block). A diode reduces to one conductance between its nodes; a
-    // BJT / MOSFET contributes its full multiport transadmittance matrix. Flatten
-    // every entry to `(row, col, g)` so each stamps as a raw complex matrix entry.
-    let devices = collect_nonlinear(circuit, registry)?;
-    let mut device_g: Vec<(Option<usize>, Option<usize>, f64)> = Vec::new();
-    for dev in &devices {
-        let nodes: Vec<Option<usize>> = dev
-            .terminals()
-            .iter()
-            .map(|&t| layout.node_of(circuit, t))
-            .collect();
-        let v: Vec<f64> = nodes
-            .iter()
-            .map(|&nd| nd.map_or(0.0, |i| x_dc[i]))
-            .collect();
-        // Linearize exactly at the bias (no limiting) and keep only the Jacobian.
-        let comp = dev.linearize(&v, &mut vec![0.0; dev.state_len()], false);
-        for (a, &na) in nodes.iter().enumerate() {
-            for (b, &nb) in nodes.iter().enumerate() {
-                device_g.push((na, nb, comp.g[a][b]));
-            }
-        }
-    }
-
-    // Voltage sources → branch row k with a 1∠0 drive (else a 0 V short).
-    let vsource_stamps: Vec<(Option<usize>, Option<usize>, usize, Complex)> = layout
-        .vsources
-        .iter()
-        .enumerate()
-        .map(|(branch, &pi)| {
-            let part = &circuit.parts()[pi];
-            let (plus, minus) = terminals2(part)?;
-            let drive = if is_ac_drive(part) {
-                Complex::ONE
-            } else {
-                Complex::ZERO
-            };
-            Ok::<_, SimError>((
-                layout.node_of(circuit, plus),
-                layout.node_of(circuit, minus),
-                n + branch,
-                drive,
-            ))
-        })
-        .collect::<Result<_, _>>()?;
-
-    // AC-drive current sources → a 1∠0 injection a → b (quiet ones are open).
-    let mut csource_drives: Vec<(Option<usize>, Option<usize>)> = Vec::new();
-    for part in circuit.parts() {
-        if matches!(part.kind, PartKind::CurrentSource) && is_ac_drive(part) {
-            let (a, b) = terminals2(part)?;
-            csource_drives.push((layout.node_of(circuit, a), layout.node_of(circuit, b)));
-        }
-    }
-
+    // Gather the frequency-independent assembly once, then re-stamp per frequency.
+    let net = AcNetwork::build(circuit, layout, registry)?;
     let freqs = log_frequencies(f_start, f_stop, points_per_decade);
-    let mut per_node: Vec<Vec<Complex>> = vec![Vec::with_capacity(freqs.len()); n];
+    let mut per_node: Vec<Vec<Complex>> = vec![Vec::with_capacity(freqs.len()); net.n];
 
     for &f in &freqs {
         let w = TAU * f;
-        let mut sys = ComplexSystem::new(size);
-        for &(a, b, g) in &conductances {
-            sys.stamp_admittance(a, b, Complex::new(g, 0.0));
+        let mut sys = net.assemble(w)?;
+        // AC excitation: a 1∠0 phasor on every AC-marked source. For a voltage
+        // source this is `volts = 1` added to its branch-row RHS (the 0 V short's
+        // ±1 couplings were already stamped by `assemble`); for a current source a
+        // 1∠0 injection a → b. The result is byte-identical to the pre-refactor loop.
+        for &k in &net.ac_drive_branches {
+            sys.stamp_current(Some(k), None, Complex::ONE);
         }
-        for &(a, b, c) in &caps {
-            sys.stamp_admittance(a, b, Complex::new(0.0, w * c)); // jωC
-        }
-        for &(a, b, l) in &inds {
-            sys.stamp_admittance(a, b, Complex::new(0.0, -1.0 / (w * l))); // 1/(jωL)
-        }
-        // Coupled-inductor branch rows: `(v_a − v_b) − Σⱼ jωLₖⱼ·iⱼ = 0`, i.e.
-        // `v = jω·L·i` with the mutual terms — the AC twin of the transient branch
-        // stamp, valid at the ideal k = 1 where the admittance form is singular.
-        for group in &coupling.groups {
-            for (li_local, &li) in group.members.iter().enumerate() {
-                let (a, b, _) = all_inds[li];
-                let k_col = ac_base + coupling.branch_of[li].expect("coupled");
-                sys.stamp_vsource(a, b, k_col, Complex::ZERO);
-                for (lj_local, &lj) in group.members.iter().enumerate() {
-                    let l_kj = group.lmat[li_local][lj_local];
-                    if l_kj == 0.0 {
-                        continue;
-                    }
-                    let j_col = ac_base + coupling.branch_of[lj].expect("coupled");
-                    sys.stamp_matrix(Some(k_col), Some(j_col), Complex::new(0.0, -w * l_kj));
-                }
-            }
-        }
-        for &(a, b, g) in &device_g {
-            sys.stamp_matrix(a, b, Complex::new(g, 0.0));
-        }
-        // Transmission lines (`CP-SIM-M7.2`).
-        for (li, ln) in lines.iter().enumerate() {
-            ln.stamp_ac(&mut sys, w, line_branch_of[li]);
-        }
-        for &(plus, minus, k, drive) in &vsource_stamps {
-            sys.stamp_vsource(plus, minus, k, drive);
-        }
-        stamp_controlled_sources_complex(&mut sys, circuit, layout)?;
-        for &(a, b) in &csource_drives {
-            // 1∠0 from a into b — same direction convention as the DC stamp.
+        for &(a, b) in &net.ac_drive_csources {
             sys.stamp_current(b, a, Complex::ONE);
         }
 
@@ -2936,6 +3110,142 @@ impl Engine {
             zeros,
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// 2-port S-parameters (CP-SIM-M9.2)
+// ---------------------------------------------------------------------------
+
+/// The scattering (S-) parameters of a 2-port, referenced to a real system
+/// impedance `z0`, at one frequency ([`Engine::s_parameters`], `CP-SIM-M9.2`).
+///
+/// Each `S_ij` is the ratio of the wave emerging from port `i` to the wave
+/// incident on port `j` with every other port matched-terminated. `s11`/`s22` are
+/// the input/output reflection coefficients; `s21`/`s12` the forward/reverse
+/// transmission. The [`z`](SParams::z) field carries the equivalent open-circuit
+/// impedance (Z-) matrix converted from the S-parameters; it can be non-finite for
+/// a network with no Z representation (a bare series element), which is a property
+/// of the Z form, not an error.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SParams {
+    /// Frequency the parameters were computed at (Hz).
+    pub freq: f64,
+    /// Reference (system) impedance `Z₀` (Ω), real.
+    pub z0: f64,
+    /// Input reflection coefficient `S₁₁`.
+    pub s11: Complex,
+    /// Reverse transmission `S₁₂`.
+    pub s12: Complex,
+    /// Forward transmission `S₂₁`.
+    pub s21: Complex,
+    /// Output reflection coefficient `S₂₂`.
+    pub s22: Complex,
+    /// The 2-port impedance (Z-) matrix `[[Z₁₁, Z₁₂], [Z₂₁, Z₂₁]]` (Ω), converted
+    /// from the S-parameters referenced to `z0`.
+    pub z: [[Complex; 2]; 2],
+}
+
+impl Engine {
+    /// Two-port scattering parameters referenced to a real impedance `z0`, computed
+    /// from the linearized AC solve at `freq` (`CP-SIM-M9.2`).
+    ///
+    /// Port 1 is the net `port1` (referenced to ground), port 2 the net `port2`.
+    /// The measurement is the textbook terminated setup: each S-column comes from
+    /// one complex solve in which the driven port is fed by a 1 V source behind
+    /// `z0` and the other port is terminated in `z0`, with the circuit's own
+    /// independent sources quiet (bias sources are AC shorts). Reading the port
+    /// node voltages `V₁`, `V₂` under a drive at port 1 gives `S₁₁ = 2·V₁ − 1` and
+    /// `S₂₁ = 2·V₂`; the symmetric drive at port 2 gives `S₂₂` and `S₁₂`. The
+    /// equivalent Z-matrix is then converted from the S-parameters.
+    ///
+    /// Reuses the shared `AcNetwork` assembly (so coupled inductors, transmission
+    /// lines, nonlinear small-signal models, and controlled sources are all honored
+    /// exactly as [`Analysis::Ac`] handles them), referenced about the DC operating
+    /// point. The API is purely additive — no existing analysis path is touched.
+    ///
+    /// Errors: [`SimError::BadValue`] for a non-finite/non-positive `z0` or `freq`,
+    /// or a port that resolves to ground (a port needs a non-ground node to drive);
+    /// [`SimError::Singular`] if the terminated system has no solution.
+    pub fn s_parameters(
+        &self,
+        circuit: &Circuit,
+        port1: NetId,
+        port2: NetId,
+        z0: f64,
+        freq: f64,
+    ) -> Result<SParams, SimError> {
+        let reg = &self.registry;
+        validate(circuit, reg)?;
+        if !(z0.is_finite() && z0 > 0.0 && freq.is_finite() && freq > 0.0) {
+            return Err(SimError::BadValue("S-parameter z0/frequency".into()));
+        }
+        let layout = Layout::build(circuit);
+        let p1 = layout
+            .node_of(circuit, port1)
+            .ok_or_else(|| SimError::BadValue("S-parameter port 1 is ground".into()))?;
+        let p2 = layout
+            .node_of(circuit, port2)
+            .ok_or_else(|| SimError::BadValue("S-parameter port 2 is ground".into()))?;
+
+        let net = AcNetwork::build(circuit, &layout, reg)?;
+        let w = TAU * freq;
+        let g0 = 1.0 / z0; // port source/termination conductance
+        let y0 = Complex::new(g0, 0.0);
+        let drive = Complex::new(g0, 0.0); // Norton current of a 1 V EMF behind z0
+
+        // Solve 1 — drive port 1 (1 V behind z0), terminate port 2 in z0.
+        let v_drive1 = {
+            let mut sys = net.assemble(w)?;
+            sys.stamp_admittance(Some(p1), None, y0);
+            sys.stamp_admittance(Some(p2), None, y0);
+            sys.stamp_current(Some(p1), None, drive);
+            sys.solve().ok_or(SimError::Singular)?
+        };
+        let (v1a, v2a) = (v_drive1[p1], v_drive1[p2]);
+
+        // Solve 2 — drive port 2, terminate port 1 in z0.
+        let v_drive2 = {
+            let mut sys = net.assemble(w)?;
+            sys.stamp_admittance(Some(p1), None, y0);
+            sys.stamp_admittance(Some(p2), None, y0);
+            sys.stamp_current(Some(p2), None, drive);
+            sys.solve().ok_or(SimError::Singular)?
+        };
+        let (v1b, v2b) = (v_drive2[p1], v_drive2[p2]);
+
+        let two = Complex::new(2.0, 0.0);
+        let s11 = two * v1a - Complex::ONE;
+        let s21 = two * v2a;
+        let s22 = two * v2b - Complex::ONE;
+        let s12 = two * v1b;
+        let z = s_to_z(s11, s12, s21, s22, z0);
+
+        Ok(SParams {
+            freq,
+            z0,
+            s11,
+            s12,
+            s21,
+            s22,
+            z,
+        })
+    }
+}
+
+/// Convert 2-port S-parameters (referenced to real `z0`) to the open-circuit
+/// impedance (Z-) matrix. The determinant `(1−S₁₁)(1−S₂₂) − S₁₂·S₂₁` vanishes for a
+/// network with no Z representation (e.g. a bare series impedance), where the
+/// entries go non-finite — a property of the Z form, surfaced rather than hidden.
+fn s_to_z(s11: Complex, s12: Complex, s21: Complex, s22: Complex, z0: f64) -> [[Complex; 2]; 2] {
+    let one = Complex::ONE;
+    let z0c = Complex::new(z0, 0.0);
+    let two = Complex::new(2.0, 0.0);
+    let denom = (one - s11) * (one - s22) - s12 * s21;
+    let z11 = z0c * ((one + s11) * (one - s22) + s12 * s21) / denom;
+    let z12 = z0c * (two * s12) / denom;
+    let z21 = z0c * (two * s21) / denom;
+    let z22 = z0c * ((one - s11) * (one + s22) + s12 * s21) / denom;
+    [[z11, z12], [z21, z22]]
 }
 
 /// How a chosen `.TF` input source enters the linearized system.
@@ -7943,5 +8253,374 @@ mod tests {
                 "floating mid should pin to ~0 V, got {vmid}"
             );
         }
+    }
+
+    // --- Power electronics: controlled switch + buck/boost — CP-SIM-M9.1 ----
+
+    /// The real transient trace of node `net` from a finished run.
+    fn node_trace(sigs: &[Signal], c: &Circuit, net: NetId) -> Vec<f64> {
+        let name = format!("v(n{})", c.resolve(net).0);
+        sigs.iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("node {name} present"))
+            .real()
+            .unwrap()
+            .to_vec()
+    }
+
+    /// Mean of a trace's steady-state tail (its last `frac` fraction of samples).
+    fn tail_mean(y: &[f64], frac: f64) -> f64 {
+        let start = ((1.0 - frac) * y.len() as f64) as usize;
+        let tail = &y[start..];
+        tail.iter().sum::<f64>() / tail.len() as f64
+    }
+
+    #[test]
+    fn switch_conducts_when_control_is_high_and_blocks_when_low() {
+        // A 10 V source feeds a 1 kΩ load through a controlled switch. A DC control
+        // net above the threshold closes it (Ron ⇒ load sees ~10 V); below it, the
+        // switch is Roff ⇒ the load node collapses to ~0 V. The control net is an
+        // independent source, so it is pinned at the t = 0 solve and read back on
+        // the first step.
+        let build = |vctrl: &str| {
+            let mut c = Circuit::new("sw");
+            let (vin, out, ctrl) = (c.new_net(), c.new_net(), c.new_net());
+            c.add_part(
+                "V1",
+                PartKind::VoltageSource,
+                v("10", Unit::Volt),
+                vec![vin, NetId::GROUND],
+            );
+            c.add_part(
+                "VC",
+                PartKind::VoltageSource,
+                v(vctrl, Unit::Volt),
+                vec![ctrl, NetId::GROUND],
+            );
+            c.add_part(
+                "RL",
+                PartKind::Resistor,
+                v("1k", Unit::Ohm),
+                vec![out, NetId::GROUND],
+            );
+            assert!(c.add_switch(ctrl, vin, out, 0.01, 1e6, 2.5));
+            let sigs = Engine::new()
+                .run(
+                    &c,
+                    &Analysis::Transient {
+                        duration: 1e-3,
+                        step: Some(5e-5),
+                    },
+                )
+                .expect("switch transient solves");
+            *node_trace(&sigs, &c, out).last().unwrap()
+        };
+
+        let closed = build("5"); // control high ⇒ switch closed
+        let open = build("0"); // control low ⇒ switch open
+        assert!(closed > 9.9, "closed switch passes the source: {closed}");
+        assert!(open < 0.05, "open switch blocks the source: {open}");
+    }
+
+    #[test]
+    fn buck_converter_steps_12v_down_to_its_duty_output() {
+        // Synchronous-style buck: 12 V in, a PWM-chopped switch into an LC filter
+        // with a freewheeling diode, at ~42 % duty. In continuous conduction the
+        // output averages to ≈ duty·Vin ≈ 5 V (a little under, from the diode drop).
+        let mut c = Circuit::new("buck");
+        let (vin, sw, out, ctrl) = (c.new_net(), c.new_net(), c.new_net(), c.new_net());
+        c.add_part(
+            "VIN",
+            PartKind::VoltageSource,
+            v("12", Unit::Volt),
+            vec![vin, NetId::GROUND],
+        );
+        // PWM clock on the control net: 200 kHz, 42 % duty, 0 → 5 V.
+        let (period, duty) = (5e-6, 0.42);
+        c.add_part(
+            "VPWM",
+            PartKind::VoltageSource,
+            v("0", Unit::Volt),
+            vec![ctrl, NetId::GROUND],
+        );
+        assert!(c.set_waveform(
+            "VPWM",
+            Waveform::Pulse {
+                v1: 0.0,
+                v2: 5.0,
+                delay: 0.0,
+                width: duty * period,
+                period,
+            },
+        ));
+        // High-side switch vin → sw, freewheel diode gnd → sw, LC filter, load.
+        assert!(c.add_switch(ctrl, vin, sw, 0.01, 1e6, 2.5));
+        c.add_part(
+            "D1",
+            PartKind::Diode(DiodeModel::default()),
+            None,
+            vec![NetId::GROUND, sw], // anode gnd, cathode sw: conducts when sw < 0
+        );
+        c.add_part(
+            "L1",
+            PartKind::Inductor,
+            v("100u", Unit::Henry),
+            vec![sw, out],
+        );
+        c.add_part(
+            "C1",
+            PartKind::Capacitor,
+            v("2u", Unit::Farad),
+            vec![out, NetId::GROUND],
+        );
+        c.add_part(
+            "RL",
+            PartKind::Resistor,
+            v("5", Unit::Ohm),
+            vec![out, NetId::GROUND],
+        );
+
+        let sigs = Engine::new()
+            .run(
+                &c,
+                &Analysis::Transient {
+                    duration: 400e-6,
+                    step: Some(period / 40.0),
+                },
+            )
+            .expect("buck transient solves");
+
+        let out_y = node_trace(&sigs, &c, out);
+        let sw_y = node_trace(&sigs, &c, sw);
+        let vout = tail_mean(&out_y, 0.25);
+        // Stepped down to ≈ 5 V (42 % of 12 V, minus the diode drop), well below Vin.
+        assert!(
+            (4.2..=5.2).contains(&vout),
+            "buck output should settle near 5 V, got {vout}"
+        );
+        // Steady-state ripple is a small fraction of the output (LC filtering works).
+        let tail_start = (0.75 * out_y.len() as f64) as usize;
+        let tail = &out_y[tail_start..];
+        let (mn, mx) = tail
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(a, b), &x| (a.min(x), b.max(x)));
+        assert!(
+            mx - mn < 0.4,
+            "buck output ripple should be small, got {:.3} V",
+            mx - mn
+        );
+        // The switching node actually chops: high toward Vin, low toward the diode clamp.
+        let sw_max = sw_y.iter().cloned().fold(f64::MIN, f64::max);
+        let sw_min = sw_y.iter().cloned().fold(f64::MAX, f64::min);
+        assert!(
+            sw_max > 10.0,
+            "switch node should swing up to Vin, got {sw_max}"
+        );
+        assert!(sw_min < 1.0, "switch node should swing low, got {sw_min}");
+    }
+
+    #[test]
+    fn boost_converter_steps_the_input_voltage_up() {
+        // Boost: 5 V in, inductor charged by a PWM switch to ground, diode to the
+        // output cap. In continuous conduction Vout = Vin/(1 − duty) > Vin.
+        let mut c = Circuit::new("boost");
+        let (vin, sw, out, ctrl) = (c.new_net(), c.new_net(), c.new_net(), c.new_net());
+        c.add_part(
+            "VIN",
+            PartKind::VoltageSource,
+            v("5", Unit::Volt),
+            vec![vin, NetId::GROUND],
+        );
+        let (period, duty) = (5e-6, 0.42);
+        c.add_part(
+            "VPWM",
+            PartKind::VoltageSource,
+            v("0", Unit::Volt),
+            vec![ctrl, NetId::GROUND],
+        );
+        assert!(c.set_waveform(
+            "VPWM",
+            Waveform::Pulse {
+                v1: 0.0,
+                v2: 5.0,
+                delay: 0.0,
+                width: duty * period,
+                period,
+            },
+        ));
+        c.add_part(
+            "L1",
+            PartKind::Inductor,
+            v("50u", Unit::Henry),
+            vec![vin, sw],
+        );
+        // Low-side switch sw → gnd, rectifier diode sw → out.
+        assert!(c.add_switch(ctrl, sw, NetId::GROUND, 0.01, 1e6, 2.5));
+        c.add_part(
+            "D1",
+            PartKind::Diode(DiodeModel::default()),
+            None,
+            vec![sw, out], // anode sw, cathode out
+        );
+        c.add_part(
+            "C1",
+            PartKind::Capacitor,
+            v("5u", Unit::Farad),
+            vec![out, NetId::GROUND],
+        );
+        c.add_part(
+            "RL",
+            PartKind::Resistor,
+            v("20", Unit::Ohm),
+            vec![out, NetId::GROUND],
+        );
+
+        let sigs = Engine::new()
+            .run(
+                &c,
+                &Analysis::Transient {
+                    duration: 1e-3,
+                    step: Some(period / 40.0),
+                },
+            )
+            .expect("boost transient solves");
+
+        let out_y = node_trace(&sigs, &c, out);
+        let vout = tail_mean(&out_y, 0.2);
+        // Clearly boosted above the 5 V input (ideal Vin/(1−D) ≈ 8.6 V).
+        assert!(
+            vout > 7.0,
+            "boost output should step up above the 5 V input, got {vout}"
+        );
+        assert!(
+            vout < 10.0,
+            "boost output should stay below the ideal ceiling, got {vout}"
+        );
+    }
+
+    // --- 2-port S-parameters — CP-SIM-M9.2 ----------------------------------
+
+    #[test]
+    fn matched_pi_attenuator_is_reflectionless_with_predicted_attenuation() {
+        // A 6 dB (N = 2) resistive Π-pad matched to Z0 = 50 Ω: shunt 150 Ω at each
+        // port, series 37.5 Ω. Matched ⇒ |S11| ≈ 0, and the attenuation sets
+        // |S21| = 1/N = 0.5. Symmetric + reciprocal ⇒ S11 = S22, S12 = S21. The
+        // Z-matrix exists (shunt paths) and matches the open-circuit hand analysis.
+        let mut c = Circuit::new("pi-pad");
+        let (p1, p2) = (c.new_net(), c.new_net());
+        c.add_part(
+            "R1",
+            PartKind::Resistor,
+            v("150", Unit::Ohm),
+            vec![p1, NetId::GROUND],
+        );
+        c.add_part("R2", PartKind::Resistor, v("37.5", Unit::Ohm), vec![p1, p2]);
+        c.add_part(
+            "R3",
+            PartKind::Resistor,
+            v("150", Unit::Ohm),
+            vec![p2, NetId::GROUND],
+        );
+
+        let sp = Engine::new()
+            .s_parameters(&c, p1, p2, 50.0, 1e6)
+            .expect("Π-pad S-parameters");
+
+        assert!(
+            sp.s11.magnitude() < 1e-9,
+            "matched ⇒ |S11|≈0, got {}",
+            sp.s11.magnitude()
+        );
+        assert!(
+            sp.s22.magnitude() < 1e-9,
+            "matched ⇒ |S22|≈0, got {}",
+            sp.s22.magnitude()
+        );
+        assert!(
+            (sp.s21.magnitude() - 0.5).abs() < 1e-9,
+            "|S21| should be 1/N = 0.5, got {}",
+            sp.s21.magnitude()
+        );
+        // Reciprocal + symmetric network.
+        assert!((sp.s21 - sp.s12).magnitude() < 1e-12);
+        // Z-matrix against the open-circuit hand analysis: Z11 = Z22 ≈ 83.33 Ω,
+        // Z12 = Z21 ≈ 66.67 Ω.
+        assert!((sp.z[0][0].re - 250.0 / 3.0).abs() < 1e-6 && sp.z[0][0].im.abs() < 1e-9);
+        assert!((sp.z[1][1].re - 250.0 / 3.0).abs() < 1e-6);
+        assert!((sp.z[0][1].re - 200.0 / 3.0).abs() < 1e-6);
+        assert!((sp.z[1][0].re - 200.0 / 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn series_impedance_two_port_matches_closed_form() {
+        // A bare series impedance Z between the two ports (both returned to ground)
+        // has the closed-form S-parameters S11 = S22 = Z/(Z + 2·Z0) and
+        // S21 = S12 = 2·Z0/(Z + 2·Z0). Checked for a resistor (real) and an
+        // inductor (jωL, exercising the complex solve).
+        let z0 = 50.0;
+
+        // Series 50 Ω resistor: S11 = 50/150 = 1/3, S21 = 100/150 = 2/3.
+        let mut cr = Circuit::new("series-r");
+        let (p1, p2) = (cr.new_net(), cr.new_net());
+        cr.add_part("R1", PartKind::Resistor, v("50", Unit::Ohm), vec![p1, p2]);
+        let spr = Engine::new()
+            .s_parameters(&cr, p1, p2, z0, 1e6)
+            .expect("series-R S");
+        assert!((spr.s11.re - 1.0 / 3.0).abs() < 1e-9 && spr.s11.im.abs() < 1e-9);
+        assert!((spr.s21.re - 2.0 / 3.0).abs() < 1e-9 && spr.s21.im.abs() < 1e-9);
+        assert!((spr.s22 - spr.s11).magnitude() < 1e-12);
+        assert!((spr.s12 - spr.s21).magnitude() < 1e-12);
+
+        // Series inductor: Z = jωL at f = 10 MHz, L = 1 µH.
+        let (f, l) = (1e7, 1e-6);
+        let mut cl = Circuit::new("series-l");
+        let (q1, q2) = (cl.new_net(), cl.new_net());
+        cl.add_part("L1", PartKind::Inductor, v("1u", Unit::Henry), vec![q1, q2]);
+        let spl = Engine::new()
+            .s_parameters(&cl, q1, q2, z0, f)
+            .expect("series-L S");
+        let z = Complex::new(0.0, TAU * f * l);
+        let two_z0 = Complex::new(2.0 * z0, 0.0);
+        let want_s11 = z / (z + two_z0);
+        let want_s21 = two_z0 / (z + two_z0);
+        assert!(
+            (spl.s11 - want_s11).magnitude() < 1e-9,
+            "S11 {:?} vs {:?}",
+            spl.s11,
+            want_s11
+        );
+        assert!(
+            (spl.s21 - want_s21).magnitude() < 1e-9,
+            "S21 {:?} vs {:?}",
+            spl.s21,
+            want_s21
+        );
+    }
+
+    #[test]
+    fn s_parameters_reject_bad_arguments() {
+        let mut c = Circuit::new("bad");
+        let (p1, p2) = (c.new_net(), c.new_net());
+        c.add_part("R1", PartKind::Resistor, v("50", Unit::Ohm), vec![p1, p2]);
+        c.add_part(
+            "R2",
+            PartKind::Resistor,
+            v("50", Unit::Ohm),
+            vec![p2, NetId::GROUND],
+        );
+        let eng = Engine::new();
+        assert!(matches!(
+            eng.s_parameters(&c, p1, p2, 0.0, 1e6),
+            Err(SimError::BadValue(_))
+        ));
+        assert!(matches!(
+            eng.s_parameters(&c, p1, p2, 50.0, 0.0),
+            Err(SimError::BadValue(_))
+        ));
+        // A ground port has no node to drive.
+        assert!(matches!(
+            eng.s_parameters(&c, NetId::GROUND, p2, 50.0, 1e6),
+            Err(SimError::BadValue(_))
+        ));
     }
 }
