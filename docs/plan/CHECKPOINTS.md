@@ -185,19 +185,33 @@ _Post-v0.5.0 refinement after hands-on use. A four-track read-only QA audit foun
 - [x] **CP-PLAT.6** (platform) Wire the copilot into the `ee` binary: `ee review`/`ee drc` run the **offline, no-key** design-rule review (circuit from an `.eesh` path or stdin); `ee ask <question>` is the live copilot behind an opt-in `http` feature (+`ANTHROPIC_API_KEY`), honoring `EE_BASE_URL`/`ANTHROPIC_BASE_URL`; `ee help` lists them; the new `run ac/dc/noise/mc/tf` analyses are reachable via the shell (CP-UX-M8.2). — *gate (passing):* `crates/ee/tests/cli.rs::{ee_review_runs_offline_on_a_piped_script, ee_drc_is_an_alias_for_review, ee_help_lists_the_ai_subcommands}` spawn the built binary with no key/network; `reqwest` stays absent from the default `ee` build (`cargo tree`). Guide updated with the CLI table.
 - [x] **CP-SHIP.4** (platform) Polish & tag **v0.6.0**: full CI-parity gate sweep (fmt + `clippy -D warnings` default **and** `--features http`/`relay` + `cargo test --workspace` + feature tests + `wasm32` core & `ee-web` + `-D warnings` docs) all green on fully-merged `main`; `reqwest`/relay deps confirmed absent from the default build; README refreshed to M0–M8; **v0.6.0** tagged.
 
+_(Post-M8: rebranded ee-assist → **ohmforge**, published to github.com/ohmforge/ohmforge, relicensed to Apache-2.0; tagged v0.7.0.)_
+
+---
+
+## M9 — cool features: power, sensors, RF, visual capture  🚧 in progress → plan: [`M9-PLAN.md`](M9-PLAN.md)
+
+- [~] **CP-SIM-M9.1** (sim-core) Power electronics: a controlled switching element as a circuit-level relation (no new `PartKind`) + PWM stimulus (extend `Pulse`) so buck/boost converters simulate in transient. — *gate:* a buck steps 12 V → ~5 V at the set duty, a boost steps up, with sane switching-node + inductor-current waveforms; switch-free circuits unaffected, golden suite bit-for-bit.
+- [~] **CP-SIM-M9.2** (sim-core) 2-port S-parameters: `Engine::s_parameters(circuit, p1, p2, z0)` → S11/S21/S12/S22 (+ Z/Y) from the AC solve. — *gate:* a matched line / attenuator / L-match returns S-params matching closed-form theory (Z0-matched → S11≈0). Purely additive.
+- [~] **CP-BRD-M9.1** (boards) Sensor & actuator models in `ohmforge-devices` over existing primitives (no `-core`/`-sim` edits): NTC thermistor, photoresistor, potentiometer, DC motor (back-EMF), servo (pulse→angle), stepper; ≥1 wired through MCU co-sim. — *gate:* a thermistor divider shifts with temperature (β-model); 1.5 ms servo pulse → ~90°; a DC motor spins up; a pot wiper divides linearly.
+- [~] **CP-UX-M9.1** (ui-shell) Visual schematic capture in the TUI: mouse place/move/wire on a grid canvas driving the real `Circuit` via the shared `EditAction` path; pure state machine, no tty. — *gate:* mouse events place parts + draw a wire (asserted on the `Circuit`), a drag moves a part.
+- [~] **CP-UX-M9.2** (ui-shell) RF instrument panels in `ohmforge-instruments`: a Smith chart (Γ/S11 on the Smith grid) + an eye diagram (fold a bitstream), rendering from provided S-param/signal data. — *gate:* a known Γ lands at the correct Smith coordinate (Γ=0 center, open/short at the rim); an eye diagram folds a known pattern into the expected eye.
+- [ ] **CP-WEB.8** (web) Drag-and-drop schematic canvas in the browser: place/wire parts visually, round-trip to netlist + re-simulate. — *gate:* host-testable canvas-edit → netlist round-trip; the page builds + simulates a drawn circuit. _(Starts after the home example-gallery work is committed — both touch `ohmforge-web`.)_
+- [ ] **CP-SHIP.5** (platform) Polish & tag **v0.8.0**: full CI-parity gate sweep (incl. `http`/`relay`), README refreshed to M0–M9, tag.
+
 ---
 
 ### Progress summary
 
 | Track | Done | In progress | Total |
 |---|---|---|---|
-| sim-core | 26 | 0 | 26 |
-| boards | 17 | 0 | 17 |
-| ui-shell | 21 | 0 | 21 |
+| sim-core | 26 | 2 | 28 |
+| boards | 17 | 1 | 18 |
+| ui-shell | 21 | 2 | 23 |
 | ai-fmt | 19 | 0 | 19 |
-| platform | 10 | 0 | 10 |
-| web | 6 | 0 | 6 |
-| **Total** | **99** | **0** | **99** |
+| platform | 10 | 0 | 11 |
+| web | 6 | 0 | 7 |
+| **Total** | **99** | **5** | **106** |
 
 _**67/67 — M0 through M4 all complete** (M0–M3 tagged v0.1.0; M4 adds the rest). M4 delivered the **plugin device-model API** + an **instrument/block plugin trait**, a **KLU-class ordered/reusable sparse solver** and **multithreaded analyses**, a **Cortex-M3/M4 (Thumb-2)** core with an STM32 board, **SPICE `.model` import** + a vendor model library, and **shareable circuit links** in the browser. Deferred by design: real-time collaboration, the QEMU full-SBC bridge, and full vendor-SPICE `.model` fidelity — the standing M-next horizon._
 
