@@ -1570,6 +1570,423 @@ pub mod server {
     }
 }
 
+// --- Visual schematic canvas (CP-WEB.8) ------------------------------------
+//
+// CP-WEB.3 gave the page a *parts form* (type a `REF A B VALUE` line); this is
+// the *visual* editor: drop parts on a grid, drag endpoints to wire them, and
+// the whole thing serializes to the very same R/C/L/V netlist the engine
+// already runs. Like every other layer in this crate, the real logic is pure,
+// host-tested Rust — a [`Schematic`] of grid-placed [`CanvasPart`]s plus
+// [`Wire`]s and ground markers — and the `#[wasm_bindgen]` shell only moves
+// text across the boundary (a line-oriented canvas blob in, netlist/JSON out).
+//
+// ## How the canvas becomes a netlist (the node rule)
+//
+// A terminal is a grid [`Point`]. Two terminals sharing a point are the same
+// electrical node; a [`Wire`] unions the two points it spans; a ground marker
+// pins a point to the ground reference. [`Schematic::to_netlist`] runs a
+// union-find over every referenced point, names each resulting group (the
+// grounded group → `gnd`, the rest → `n1`, `n2`, … in first-seen part order so
+// the output is deterministic), and emits one `REF A B VALUE` line per part —
+// exactly the grammar `ohmforge_fmt::netlist::parse` (and thus [`run`]) accepts.
+//
+// The palette is **R / C / L / V + ground**, because that is the whole of what
+// the web `simulate` path can parse (`classify()` accepts only those kinds); a
+// canvas part the engine could not simulate would be a lie, so the model
+// rejects any other reference prefix up front, just like [`CircuitModel`].
+
+/// A point on the canvas grid. Two terminals (or a terminal and a wire end)
+/// that share a point are one electrical node; [`Wire`]s union points together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Point {
+    /// Grid column.
+    pub x: i32,
+    /// Grid row.
+    pub y: i32,
+}
+
+impl Point {
+    /// A point at `(x, y)`.
+    pub fn new(x: i32, y: i32) -> Point {
+        Point { x, y }
+    }
+}
+
+/// A part dropped on the canvas: its `REF`/`VALUE` plus the two grid points its
+/// terminals sit on. The reference's first letter fixes the kind (`R`/`C`/`L`/`V`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanvasPart {
+    /// Reference designator (`R1`, `C2`, …).
+    pub reference: String,
+    /// Raw value field, verbatim (`"1k"`, `"100n"`, `"5"`).
+    pub value: String,
+    /// First terminal's grid point.
+    pub a: Point,
+    /// Second terminal's grid point.
+    pub b: Point,
+}
+
+/// A wire segment that merges the two grid points it spans into one node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Wire {
+    /// One end of the wire.
+    pub from: Point,
+    /// The other end.
+    pub to: Point,
+}
+
+/// A circuit as drawn on the canvas: a title, grid-placed [`CanvasPart`]s, the
+/// [`Wire`]s joining their terminals, and the points pinned to ground.
+/// Serializes to the R/C/L/V netlist [`run`] accepts via [`to_netlist`](Schematic::to_netlist).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Schematic {
+    /// The `.title` directive's text, if any.
+    pub title: Option<String>,
+    /// The placed parts, in the order they should be emitted.
+    pub parts: Vec<CanvasPart>,
+    /// Wires, each merging the two grid points it connects.
+    pub wires: Vec<Wire>,
+    /// Grid points pinned to the ground reference (`gnd`).
+    pub grounds: Vec<Point>,
+}
+
+/// `gnd` / `ground` / `0` all name the ground reference (matching
+/// `ohmforge_fmt::netlist`), so a netlist lifted onto the canvas grounds those nodes.
+fn is_ground_name(name: &str) -> bool {
+    matches!(name.to_ascii_lowercase().as_str(), "gnd" | "ground" | "0")
+}
+
+impl Schematic {
+    /// An empty canvas.
+    pub fn new() -> Schematic {
+        Schematic::default()
+    }
+
+    /// Place a part with its two terminals at `a` and `b`. Validates like
+    /// [`CircuitModel::add_part`] (known R/C/L/V kind, non-empty whitespace-free
+    /// reference and value, reference not already used), leaving the schematic
+    /// unchanged on any failure.
+    pub fn place_part(
+        &mut self,
+        reference: &str,
+        value: &str,
+        a: Point,
+        b: Point,
+    ) -> Result<(), String> {
+        let reference = reference.trim();
+        let value = value.trim();
+        kind_label(reference)?;
+        check_token("reference", reference)?;
+        check_token("value", value)?;
+        if self.parts.iter().any(|p| p.reference == reference) {
+            return Err(format!("duplicate part reference {reference:?}"));
+        }
+        self.parts.push(CanvasPart {
+            reference: reference.to_string(),
+            value: value.to_string(),
+            a,
+            b,
+        });
+        Ok(())
+    }
+
+    /// Draw a wire joining `from` and `to` (merging their nodes).
+    pub fn add_wire(&mut self, from: Point, to: Point) {
+        self.wires.push(Wire { from, to });
+    }
+
+    /// Pin a grid point to ground (idempotent).
+    pub fn add_ground(&mut self, at: Point) {
+        if !self.grounds.contains(&at) {
+            self.grounds.push(at);
+        }
+    }
+
+    /// Remove every part with this reference. Returns whether anything was removed.
+    pub fn remove_part(&mut self, reference: &str) -> bool {
+        let before = self.parts.len();
+        self.parts.retain(|p| p.reference != reference);
+        self.parts.len() != before
+    }
+
+    /// Move a part's two terminals to new grid points (re-wiring it). Returns
+    /// whether a part with that reference was found.
+    pub fn move_part(&mut self, reference: &str, a: Point, b: Point) -> bool {
+        if let Some(p) = self.parts.iter_mut().find(|p| p.reference == reference) {
+            p.a = a;
+            p.b = b;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Map every referenced grid point to its electrical node name by running a
+    /// union-find over the points (wires union; ground markers name their group
+    /// `gnd`; every other group gets `n1`, `n2`, … in first-seen part order).
+    fn node_name_map(&self) -> std::collections::HashMap<Point, String> {
+        use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+        // Intern every point in first-seen order so names are deterministic.
+        fn intern(p: Point, order: &mut Vec<Point>, idx: &mut BTreeMap<Point, usize>) {
+            if let std::collections::btree_map::Entry::Vacant(e) = idx.entry(p) {
+                e.insert(order.len());
+                order.push(p);
+            }
+        }
+        let mut order: Vec<Point> = Vec::new();
+        let mut idx: BTreeMap<Point, usize> = BTreeMap::new();
+        for part in &self.parts {
+            intern(part.a, &mut order, &mut idx);
+            intern(part.b, &mut order, &mut idx);
+        }
+        for w in &self.wires {
+            intern(w.from, &mut order, &mut idx);
+            intern(w.to, &mut order, &mut idx);
+        }
+        for g in &self.grounds {
+            intern(*g, &mut order, &mut idx);
+        }
+
+        // Union-find with path compression over the interned points.
+        fn find(parent: &mut [usize], mut x: usize) -> usize {
+            while parent[x] != x {
+                parent[x] = parent[parent[x]];
+                x = parent[x];
+            }
+            x
+        }
+        let mut parent: Vec<usize> = (0..order.len()).collect();
+        for w in &self.wires {
+            let a = find(&mut parent, idx[&w.from]);
+            let b = find(&mut parent, idx[&w.to]);
+            if a != b {
+                parent[a] = b;
+            }
+        }
+        let mut ground_roots: BTreeSet<usize> = BTreeSet::new();
+        for g in &self.grounds {
+            let r = find(&mut parent, idx[g]);
+            ground_roots.insert(r);
+        }
+
+        let mut root_name: BTreeMap<usize, String> = BTreeMap::new();
+        let mut counter = 0usize;
+        let mut map: HashMap<Point, String> = HashMap::new();
+        for &p in &order {
+            let r = find(&mut parent, idx[&p]);
+            let name = if let Some(n) = root_name.get(&r) {
+                n.clone()
+            } else {
+                let n = if ground_roots.contains(&r) {
+                    "gnd".to_string()
+                } else {
+                    counter += 1;
+                    format!("n{counter}")
+                };
+                root_name.insert(r, n.clone());
+                n
+            };
+            map.insert(p, name);
+        }
+        map
+    }
+
+    /// Emit the R/C/L/V netlist for the drawn circuit: a `.title` line (if set)
+    /// then one `REF A B VALUE` line per part, with node names derived from the
+    /// grid topology. The result parses and simulates via [`run`].
+    pub fn to_netlist(&self) -> String {
+        let names = self.node_name_map();
+        let mut out = String::new();
+        if let Some(title) = &self.title {
+            out.push_str(".title ");
+            out.push_str(title);
+            out.push('\n');
+        }
+        for p in &self.parts {
+            let a = names.get(&p.a).map(String::as_str).unwrap_or("gnd");
+            let b = names.get(&p.b).map(String::as_str).unwrap_or("gnd");
+            out.push_str(&format!("{} {a} {b} {}\n", p.reference, p.value));
+        }
+        out
+    }
+
+    /// Lift a netlist onto the canvas: each part becomes a row of two terminals,
+    /// and parts sharing a node name are joined by a wire (ground nodes pinned to
+    /// ground) so the drawn topology matches the text. A malformed netlist is a
+    /// clean `Err` (via [`CircuitModel::from_netlist`]) — never a panic.
+    ///
+    /// Round trip: `to_netlist(from_netlist(n))` is a fixed point of `to_netlist`
+    /// — the same topology, re-emitted with the same deterministic node names.
+    pub fn from_netlist(src: &str) -> Result<Schematic, String> {
+        let model = CircuitModel::from_netlist(src)?;
+        let mut s = Schematic {
+            title: model.title.clone(),
+            ..Schematic::default()
+        };
+        // The first terminal seen for each node name; later terminals wire to it.
+        let mut anchor: std::collections::BTreeMap<String, Point> =
+            std::collections::BTreeMap::new();
+        for (i, part) in model.parts.iter().enumerate() {
+            let y = i as i32 * 2;
+            let a = Point::new(0, y);
+            let b = Point::new(6, y);
+            s.parts.push(CanvasPart {
+                reference: part.reference.clone(),
+                value: part.value.clone(),
+                a,
+                b,
+            });
+            for (name, pt) in [(&part.node_a, a), (&part.node_b, b)] {
+                if is_ground_name(name) {
+                    s.grounds.push(pt);
+                } else if let Some(&first) = anchor.get(name) {
+                    s.wires.push(Wire {
+                        from: first,
+                        to: pt,
+                    });
+                } else {
+                    anchor.insert(name.clone(), pt);
+                }
+            }
+        }
+        Ok(s)
+    }
+
+    /// Parse a line-oriented canvas blob into a [`Schematic`]. The blob is the
+    /// house-style text the page serializes its visual state to:
+    ///
+    /// ```text
+    /// .title <text>                 optional
+    /// P <ref> <value> <ax> <ay> <bx> <by>
+    /// W <x1> <y1> <x2> <y2>
+    /// G <x> <y>
+    /// ```
+    ///
+    /// Blank lines are skipped; an unknown tag, a bad field count, a non-integer
+    /// coordinate, or an invalid part is a clean `Err` carrying the 1-based line
+    /// — never a panic.
+    pub fn from_blob(src: &str) -> Result<Schematic, String> {
+        fn coord(f: &[&str], i: usize, line: usize) -> Result<i32, String> {
+            let tok = f
+                .get(i)
+                .ok_or_else(|| format!("line {line}: missing coordinate"))?;
+            tok.parse::<i32>()
+                .map_err(|_| format!("line {line}: bad integer coordinate {tok:?}"))
+        }
+
+        let mut s = Schematic::default();
+        for (i, raw) in src.lines().enumerate() {
+            let line = i + 1;
+            let text = raw.trim();
+            if text.is_empty() {
+                continue;
+            }
+            let f: Vec<&str> = text.split_whitespace().collect();
+            match f[0] {
+                ".title" => s.title = Some(f[1..].join(" ")),
+                "P" => {
+                    if f.len() != 7 {
+                        return Err(format!("line {line}: P needs REF VALUE AX AY BX BY"));
+                    }
+                    let a = Point::new(coord(&f, 3, line)?, coord(&f, 4, line)?);
+                    let b = Point::new(coord(&f, 5, line)?, coord(&f, 6, line)?);
+                    s.place_part(f[1], f[2], a, b)
+                        .map_err(|e| format!("line {line}: {e}"))?;
+                }
+                "W" => {
+                    if f.len() != 5 {
+                        return Err(format!("line {line}: W needs X1 Y1 X2 Y2"));
+                    }
+                    s.add_wire(
+                        Point::new(coord(&f, 1, line)?, coord(&f, 2, line)?),
+                        Point::new(coord(&f, 3, line)?, coord(&f, 4, line)?),
+                    );
+                }
+                "G" => {
+                    if f.len() != 3 {
+                        return Err(format!("line {line}: G needs X Y"));
+                    }
+                    s.add_ground(Point::new(coord(&f, 1, line)?, coord(&f, 2, line)?));
+                }
+                other => return Err(format!("line {line}: unknown canvas tag {other:?}")),
+            }
+        }
+        Ok(s)
+    }
+
+    /// Serialize the schematic back to the canvas blob [`from_blob`](Schematic::from_blob)
+    /// reads, byte-for-byte reversible through it.
+    pub fn to_blob(&self) -> String {
+        let mut out = String::new();
+        if let Some(t) = &self.title {
+            out.push_str(&format!(".title {t}\n"));
+        }
+        for p in &self.parts {
+            out.push_str(&format!(
+                "P {} {} {} {} {} {}\n",
+                p.reference, p.value, p.a.x, p.a.y, p.b.x, p.b.y
+            ));
+        }
+        for w in &self.wires {
+            out.push_str(&format!(
+                "W {} {} {} {}\n",
+                w.from.x, w.from.y, w.to.x, w.to.y
+            ));
+        }
+        for g in &self.grounds {
+            out.push_str(&format!("G {} {}\n", g.x, g.y));
+        }
+        out
+    }
+
+    /// Serialize the layout to JSON for the page to render:
+    /// `{title, parts:[{reference,kind,value,ax,ay,bx,by}], wires:[{x1,y1,x2,y2}],
+    /// grounds:[{x,y}]}`. Hand-rolled (no `serde`), like the rest of this crate.
+    pub fn to_json(&self) -> String {
+        let mut s = String::from("{\"title\":");
+        match &self.title {
+            Some(t) => push_json_str(&mut s, t),
+            None => s.push_str("null"),
+        }
+        s.push_str(",\"parts\":[");
+        for (i, p) in self.parts.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str("{\"reference\":");
+            push_json_str(&mut s, &p.reference);
+            s.push_str(",\"kind\":");
+            push_json_str(&mut s, kind_label(&p.reference).unwrap_or("?"));
+            s.push_str(",\"value\":");
+            push_json_str(&mut s, &p.value);
+            s.push_str(&format!(
+                ",\"ax\":{},\"ay\":{},\"bx\":{},\"by\":{}}}",
+                p.a.x, p.a.y, p.b.x, p.b.y
+            ));
+        }
+        s.push_str("],\"wires\":[");
+        for (i, w) in self.wires.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!(
+                "{{\"x1\":{},\"y1\":{},\"x2\":{},\"y2\":{}}}",
+                w.from.x, w.from.y, w.to.x, w.to.y
+            ));
+        }
+        s.push_str("],\"grounds\":[");
+        for (i, g) in self.grounds.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!("{{\"x\":{},\"y\":{}}}", g.x, g.y));
+        }
+        s.push_str("]}");
+        s
+    }
+}
+
 /// The browser-facing API — a thin `#[wasm_bindgen]` shell over [`run`]. Compiled
 /// only for `wasm32`, so `wasm-bindgen` never enters the host build.
 #[cfg(target_arch = "wasm32")]
@@ -1650,6 +2067,29 @@ mod wasm {
             super::CircuitModel::from_netlist(netlist).map_err(|e| JsValue::from_str(&e))?;
         model.remove_part(reference);
         Ok(model.to_netlist())
+    }
+
+    // --- Visual schematic canvas (CP-WEB.8) --------------------------------
+
+    /// Turn a canvas blob (the page's serialized visual state — see
+    /// [`Schematic::from_blob`](super::Schematic::from_blob)) into the R/C/L/V
+    /// netlist the engine runs. Feed the result straight into [`simulate`].
+    /// Throws on a malformed blob or an invalid part.
+    #[wasm_bindgen]
+    pub fn canvas_netlist(blob: &str) -> Result<String, JsValue> {
+        super::Schematic::from_blob(blob)
+            .map(|s| s.to_netlist())
+            .map_err(|e| JsValue::from_str(&e))
+    }
+
+    /// Lift an existing netlist onto the canvas, returning the layout as JSON
+    /// (`{title, parts, wires, grounds}`) for the page to draw. Throws on a
+    /// malformed netlist.
+    #[wasm_bindgen]
+    pub fn canvas_layout(netlist: &str) -> Result<String, JsValue> {
+        super::Schematic::from_netlist(netlist)
+            .map(|s| s.to_json())
+            .map_err(|e| JsValue::from_str(&e))
     }
 
     // --- Full-session shareable links (CP-WEB.4) ---------------------------
@@ -2535,5 +2975,138 @@ C1 out gnd 1u
         // An explicit LEAVE is tracked too; a left client is in no room.
         relay.handle(1, "LEAVE").unwrap();
         assert_eq!(relay.room_of(1), None);
+    }
+
+    // --- visual schematic canvas (CP-WEB.8) --------------------------------
+
+    #[test]
+    fn canvas_schematic_serializes_to_a_simulatable_netlist() {
+        // Place V + R + C on the grid, connecting them by *sharing* grid points
+        // (two terminals on one point are one node) and pinning a ground marker.
+        let n_in = Point::new(0, 0);
+        let n_out = Point::new(2, 0);
+        let n_gnd = Point::new(4, 0);
+
+        let mut s = Schematic::new();
+        s.title = Some("rc-lowpass".to_string());
+        s.place_part("V1", "5", n_in, n_gnd).unwrap();
+        s.place_part("R1", "1k", n_in, n_out).unwrap();
+        s.place_part("C1", "1u", n_out, n_gnd).unwrap();
+        s.add_ground(n_gnd);
+
+        // The drawn circuit emits a clean R/C/L/V netlist the real engine runs.
+        let netlist = s.to_netlist();
+        assert!(netlist.contains(".title rc-lowpass"));
+        let r = run(&netlist, 5e-3, Some(5e-6)).expect("the drawn circuit simulates");
+        assert_eq!(r.title, "rc-lowpass");
+        assert_eq!(r.nodes.len(), 2, "two non-ground nodes: in and out");
+
+        // `to_json` exposes the layout (kinds resolved) to the page.
+        let json = s.to_json();
+        assert!(json.contains("\"kind\":\"voltage source\""));
+        assert!(json.contains("\"kind\":\"capacitor\""));
+    }
+
+    #[test]
+    fn canvas_place_wire_remove_round_trips() {
+        // Three parts on distinct grid points, joined by *wires* (drag-to-wire),
+        // with ground pinned — the full canvas vocabulary.
+        let v_pos = Point::new(0, 0);
+        let v_neg = Point::new(0, 4);
+        let r_a = Point::new(2, 0);
+        let r_b = Point::new(4, 0);
+        let c_a = Point::new(4, 2);
+        let c_b = Point::new(4, 6);
+
+        let mut s = Schematic::new();
+        s.place_part("V1", "5", v_pos, v_neg).unwrap();
+        s.place_part("R1", "1k", r_a, r_b).unwrap();
+        s.place_part("C1", "1u", c_a, c_b).unwrap();
+        s.add_wire(v_pos, r_a); // the input node
+        s.add_wire(r_b, c_a); // the output node
+        s.add_ground(v_neg);
+        s.add_wire(v_neg, c_b); // tie C1's low side to ground
+
+        let nl1 = s.to_netlist();
+        let r = run(&nl1, 5e-3, Some(5e-6)).expect("the wired circuit simulates");
+        assert_eq!(r.nodes.len(), 2);
+
+        // The canvas blob round-trips byte-exact through from_blob/to_blob.
+        assert_eq!(Schematic::from_blob(&s.to_blob()).unwrap(), s);
+
+        // Lifting the netlist back onto the canvas and re-emitting is a fixed
+        // point: same topology, same deterministic node names.
+        let s2 = Schematic::from_netlist(&nl1).unwrap();
+        let nl2 = s2.to_netlist();
+        assert_eq!(
+            nl1, nl2,
+            "netlist is a to_netlist fixed point:\n{nl1}\n---\n{nl2}"
+        );
+        run(&nl2, 5e-3, Some(5e-6)).expect("the round-tripped netlist still simulates");
+
+        // Moving a part's terminals re-wires it — the netlist changes.
+        let mut moved = s.clone();
+        assert!(moved.move_part("R1", Point::new(90, 90), Point::new(91, 91)));
+        assert_ne!(moved.to_netlist(), nl1, "a moved part changes the netlist");
+
+        // Removing a part drops it from the netlist; what remains still simulates.
+        assert!(s.remove_part("C1"));
+        assert!(!s.remove_part("C1"), "removing again is a no-op");
+        let nl3 = s.to_netlist();
+        assert!(!nl3.contains("C1"), "C1 is gone: {nl3}");
+        assert_ne!(nl3, nl1);
+        run(&nl3, 5e-3, Some(5e-6)).expect("the reduced circuit still simulates");
+    }
+
+    #[test]
+    fn canvas_blob_parses_and_rejects_garbage_cleanly() {
+        // A well-formed blob builds the expected schematic and simulates.
+        let blob = "\
+.title divider
+P V1 5 0 0 0 4
+P R1 1k 0 0 4 0
+P R2 2k 4 0 0 4
+G 0 4
+";
+        let s = Schematic::from_blob(blob).expect("a good blob parses");
+        assert_eq!(s.parts.len(), 2 + 1);
+        run(&s.to_netlist(), 1e-3, Some(1e-5)).expect("the parsed blob simulates");
+
+        // Every malformed blob is a clean Err carrying its line — never a panic.
+        for bad in [
+            "Z 1 2 3",                          // unknown tag
+            "P R1 1k 0 0",                      // too few fields
+            "P R1 1k a b c d",                  // non-integer coordinates
+            "P X1 1k 0 0 1 0",                  // unknown part kind
+            "P R1 1k 0 0 1 0\nP R1 2k 0 0 1 0", // duplicate reference
+            "W 0 0",                            // wire needs four coordinates
+            "G 0",                              // ground needs two coordinates
+        ] {
+            assert!(
+                Schematic::from_blob(bad).is_err(),
+                "malformed blob {bad:?} must be a clean Err"
+            );
+        }
+    }
+
+    #[test]
+    fn canvas_empty_and_invalid_parts_are_clean() {
+        // An empty canvas yields an empty netlist and never panics when run.
+        let empty = Schematic::new();
+        assert_eq!(empty.to_netlist(), "");
+        let _ = run(&empty.to_netlist(), 1e-3, None); // Ok or Err, but no panic
+
+        // Invalid placements are rejected, leaving the schematic untouched.
+        let mut s = Schematic::new();
+        assert!(s
+            .place_part("X1", "1k", Point::new(0, 0), Point::new(1, 0))
+            .is_err());
+        assert!(s
+            .place_part("R1", "", Point::new(0, 0), Point::new(1, 0))
+            .is_err());
+        assert!(s
+            .place_part("R1", "a b", Point::new(0, 0), Point::new(1, 0))
+            .is_err());
+        assert!(s.parts.is_empty(), "no invalid part leaked onto the canvas");
     }
 }
