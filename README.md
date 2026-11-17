@@ -14,7 +14,7 @@
   <img src="https://img.shields.io/badge/built%20with-Rust-dea584.svg" alt="Built with Rust">
   <img src="https://img.shields.io/badge/runs-terminal%20%2B%20WASM-ff9f1c.svg" alt="Terminal + WASM">
   <img src="https://img.shields.io/badge/no%20cloud-required-brightgreen.svg" alt="No cloud required">
-  <a href="docs/plan/CHECKPOINTS.md"><img src="https://img.shields.io/badge/milestones-M0–M8%20✓-success.svg" alt="M0–M8 complete"></a>
+  <a href="docs/plan/CHECKPOINTS.md"><img src="https://img.shields.io/badge/milestones-M0–M9%20✓-success.svg" alt="M0–M9 complete"></a>
 </p>
 
 ---
@@ -71,14 +71,14 @@ Scripts are plain `.eesh` files — see [`examples/`](examples/README.md). Pipe 
 
 ## What works today
 
-- **Analog** — linear + nonlinear (diode `IS/N/RS`, BJT, MOSFET) with Newton–Raphson + gmin/source-stepping convergence aids; AC/Bode, noise, Monte-Carlo, adaptive-timestep transient; mutual inductance / transformers; transmission lines; **pole-zero + transfer-function (`.TF`)**; a KLU-class sparse solver in the hot loop + multithreaded analyses.
-- **Digital & MCU** — an event-driven kernel + HDL-lite; instruction-accurate **AVR (328P/2560/ATtiny)**, **RP2040 (Cortex-M0+)**, **STM32 (Cortex-M3/M4)**, **ESP32 (Xtensa LX6)** cores with GPIO/timers/PWM/ADC/USART/SPI/I²C/interrupts and **lockstep analog↔firmware co-simulation**.
-- **Instruments & UI** — oscilloscope, DMM, function generator, PSU; logic analyzer with UART/SPI/I²C decode; Bode/FFT; breadboard view; a dockable TUI with live overlay, component tuning, current-flow animation, and transient playback/scrub.
+- **Analog** — linear + nonlinear (diode `IS/N/RS`, BJT, MOSFET) with Newton–Raphson + gmin/source-stepping convergence aids; AC/Bode, noise, Monte-Carlo, adaptive-timestep transient; mutual inductance / transformers; transmission lines; **pole-zero + transfer-function (`.TF`)**; **2-port S-parameters**; **switch-mode power electronics** (PWM-switched buck/boost); a KLU-class sparse solver in the hot loop + multithreaded analyses.
+- **Digital & MCU** — an event-driven kernel + HDL-lite; instruction-accurate **AVR (328P/2560/ATtiny)**, **RP2040 (Cortex-M0+)**, **STM32 (Cortex-M3/M4)**, **ESP32 (Xtensa LX6)** cores with GPIO/timers/PWM/ADC/USART/SPI/I²C/interrupts and **lockstep analog↔firmware co-simulation**; **sensor & actuator models** (thermistor, photoresistor, pot, DC motor, servo, stepper).
+- **Instruments & UI** — oscilloscope, DMM, function generator, PSU; logic analyzer with UART/SPI/I²C decode; Bode/FFT; **Smith chart + eye diagram**; breadboard view; a dockable TUI with live overlay, component tuning, current-flow animation, transient playback, and **mouse-driven schematic capture**.
 - **Interop** — SPICE (incl. `.model` devices), KiCad, VCD/CSV, Fritzing, BOM, and a lossless native project format.
 - **AI copilot** — Ask / Design / Debug / Firmware, grounded in the real engine via a verify loop, with spec-driven auto-tune and a tutor — plus a fully **offline, no-key** mode (DRC, value calculators, parts index, grader).
-- **Browser** — a WASM build with an in-page editor, shareable-session links, and real-time co-editing.
+- **Browser** — a WASM build with an in-page editor, a **drag-and-drop schematic canvas**, a runnable example gallery with live component tuning, shareable-session links, and real-time co-editing.
 
-Full status and the 99-checkpoint ledger: [`docs/plan/CHECKPOINTS.md`](docs/plan/CHECKPOINTS.md). Current release: **v0.6.0** (M0–M8 complete). The whole workspace stays green — `clippy -D warnings`, `wasm32` core + `ohmforge-web`, `-D warnings` docs.
+Full status and the 106-checkpoint ledger: [`docs/plan/CHECKPOINTS.md`](docs/plan/CHECKPOINTS.md). Current release: **v0.8.0** (M0–M9 complete). The whole workspace stays green — `clippy -D warnings`, `wasm32` core + `ohmforge-web`, `-D warnings` docs.
 
 ## The AI copilot
 
