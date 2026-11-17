@@ -19,7 +19,7 @@ Thanks for helping build a fast, friendly, AI-assisted EE playground for the ter
 
 ## Licensing
 
-By contributing you agree that your contributions are dual-licensed under **MIT OR Apache-2.0** (see [`LICENSE-MIT`](LICENSE-MIT) and [`LICENSE-APACHE`](LICENSE-APACHE)), matching the rest of the project.
+By contributing you agree that your contributions are licensed under the **Apache License 2.0** (see [`LICENSE-APACHE`](LICENSE-APACHE)), matching the rest of the project.
 
 ## Developer Certificate of Origin (DCO)
 

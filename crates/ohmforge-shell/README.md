@@ -34,4 +34,4 @@ assert!(frame.contains('\u{2524}'));
 Part of [**ohmforge**](https://github.com/ohmforge/ohmforge) — the AI-native
 circuit & firmware workbench.
 
-License: **MIT OR Apache-2.0**.
+License: **Apache-2.0**.

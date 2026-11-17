@@ -25,7 +25,7 @@ This is breadth, not risky-core, so there's no single keystone to retire first �
 - **CP-WEB.1** (web) — a new `ohmforge-web` crate: `wasm-bindgen` bindings exposing the engine (build a circuit / parse a netlist → run op/transient → get a `Signal`), plus a minimal `index.html` + JS shell that runs a sim in the browser and renders the result (canvas or DOM). *Gate:* `wasm-pack`/`cargo build --target wasm32-unknown-unknown -p ohmforge-web` produces a module; a headless-or-documented check runs a sim through the bindings; **host `cargo build/clippy/test --workspace` stays green** (wasm-only deps gated).
 
 ### Polish & ship
-- **CP-SHIP.1** (platform) — close documented follow-ups where cheap (SPICE diode/transistor export, waveform-source round-trip), expand `examples/` + README/demo, run the full CI-parity sweep, and tag a release (MIT OR Apache-2.0). *Gate:* a clean release checklist; everything green.
+- **CP-SHIP.1** (platform) — close documented follow-ups where cheap (SPICE diode/transistor export, waveform-source round-trip), expand `examples/` + README/demo, run the full CI-parity sweep, and tag a release (Apache-2.0). *Gate:* a clean release checklist; everything green.
 
 ---
 

@@ -1,12 +1,12 @@
 # Trademark Policy
 
-The ohmforge **source code** is open source, dual-licensed under MIT OR Apache-2.0. You are free to use, modify, fork, redistribute, and build products on the code under those terms.
+The ohmforge **source code** is open source, licensed under the Apache License 2.0. You are free to use, modify, fork, redistribute, and build products on the code under those terms.
 
 The ohmforge **name and logo are trademarks** of the ohmforge maintainers. Permissive code, protected brand: the software licenses grant rights to the *code*, not to the *name or logo*. This is the same model used by projects such as Rust, Python, and Kubernetes.
 
 ## What you may do without asking
 
-- Use the software freely under MIT OR Apache-2.0.
+- Use the software freely under the Apache License 2.0.
 - State truthfully that your project **uses**, is **built on**, is **compatible with**, or is **based on** ohmforge.
 - Use the name in prose to refer to the project, and link to it.
 - Redistribute unmodified copies that keep the name and logo as shipped.
@@ -25,4 +25,4 @@ For uses that need permission, or if you are unsure, open an issue or contact th
 
 ---
 
-*This document is a plain-language summary of our intent, not legal advice. It does not restrict any right granted by the MIT or Apache-2.0 licenses on the code. If anything here appears to conflict with those licenses as applied to the code, the licenses govern the code.*
+*This document is a plain-language summary of our intent, not legal advice. It does not restrict any right granted by the Apache-2.0 license on the code. If anything here appears to conflict with that license as applied to the code, the license governs the code.*

@@ -43,4 +43,4 @@ key through the environment (`api_key_from_env`); it is never committed.
 Part of [**ohmforge**](https://github.com/ohmforge/ohmforge) — the AI-native
 circuit & firmware workbench.
 
-License: **MIT OR Apache-2.0**.
+License: **Apache-2.0**.

@@ -63,7 +63,7 @@ seconds) before publishing the next one that depends on it.
 Run for each crate before it goes out:
 
 - [ ] `description` is present and truthful (crates.io **requires** it).
-- [ ] `license = "MIT OR Apache-2.0"` (inherited from the workspace).
+- [ ] `license = "Apache-2.0"` (inherited from the workspace).
 - [ ] `readme = "README.md"` points at the crate's **own** README, and that file exists.
 - [ ] `repository` / `homepage` set (inherited from the workspace).
 - [ ] `keywords` / `categories` present (inherited) — crates.io caps keywords at 5.
