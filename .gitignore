@@ -11,3 +11,8 @@
 # local AI config / secrets — never commit API keys
 .env
 
+
+# Local, private — commercial/market strategy, never published to the open-core repo
+strategy/
+# wasm-pack build output (regenerated via wasm-pack)
+crates/ohmforge-web/www/pkg/
