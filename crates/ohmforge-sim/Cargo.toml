@@ -8,7 +8,7 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
-readme = "../../README.md"
+readme = "README.md"
 description = "Analog / mixed-signal engine: MNA, Newton-Raphson, transient/DC/AC/noise analyses."
 
 [lints]

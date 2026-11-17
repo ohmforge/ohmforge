@@ -8,7 +8,7 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
-readme = "../../README.md"
+readme = "README.md"
 description = "Microcontroller cores + peripherals and the co-simulation bridge to the circuit engines."
 
 [lints]

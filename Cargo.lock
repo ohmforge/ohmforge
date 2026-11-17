@@ -741,7 +741,7 @@ dependencies = [
 
 [[package]]
 name = "ohmforge"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ohmforge-ai",
  "ohmforge-core",
@@ -758,7 +758,7 @@ dependencies = [
 
 [[package]]
 name = "ohmforge-ai"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ohmforge-core",
  "ohmforge-shell",
@@ -769,14 +769,14 @@ dependencies = [
 
 [[package]]
 name = "ohmforge-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "criterion",
 ]
 
 [[package]]
 name = "ohmforge-devices"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ohmforge-core",
  "ohmforge-sim",
@@ -784,11 +784,11 @@ dependencies = [
 
 [[package]]
 name = "ohmforge-digital"
-version = "0.6.0"
+version = "0.7.0"
 
 [[package]]
 name = "ohmforge-fmt"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ohmforge-core",
  "ohmforge-sim",
@@ -796,7 +796,7 @@ dependencies = [
 
 [[package]]
 name = "ohmforge-instruments"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ohmforge-core",
  "ohmforge-sim",
@@ -804,7 +804,7 @@ dependencies = [
 
 [[package]]
 name = "ohmforge-mcu"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ohmforge-core",
  "ohmforge-digital",
@@ -812,7 +812,7 @@ dependencies = [
 
 [[package]]
 name = "ohmforge-shell"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ohmforge-core",
  "ohmforge-fmt",
@@ -823,7 +823,7 @@ dependencies = [
 
 [[package]]
 name = "ohmforge-sim"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "criterion",
  "ohmforge-core",
@@ -831,7 +831,7 @@ dependencies = [
 
 [[package]]
 name = "ohmforge-tui"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "crossterm",
  "ohmforge-core",
@@ -840,7 +840,7 @@ dependencies = [
 
 [[package]]
 name = "ohmforge-web"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ohmforge-core",
  "ohmforge-fmt",

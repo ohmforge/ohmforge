@@ -8,7 +8,7 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
-readme = "../../README.md"
+readme = "README.md"
 description = "Device models (R/L/C, diode, BJT, MOSFET, op-amp, ICs), board definitions, and the parts library."
 
 [lints]

@@ -8,7 +8,7 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
-readme = "../../README.md"
+readme = "README.md"
 description = "AI copilot: Claude client, tool definitions over the circuit API, RAG over parts, verification loop, offline heuristics."
 
 [lints]

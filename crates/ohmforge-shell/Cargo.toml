@@ -8,7 +8,7 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
-readme = "../../README.md"
+readme = "README.md"
 description = "eesh: the command language, parser, completion, history, and embedded scripting for automation."
 
 [lints]

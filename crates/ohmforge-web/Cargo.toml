@@ -8,7 +8,7 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
-readme = "../../README.md"
+readme = "README.md"
 description = "WASM browser front end: wasm-bindgen glue that parses a netlist, runs ohmforge-sim, and returns JSON + a braille scope string (CP-WEB.1)."
 
 [lints]

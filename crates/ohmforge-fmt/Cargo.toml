@@ -8,7 +8,7 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
-readme = "../../README.md"
+readme = "README.md"
 description = "File formats & interop: native project I/O, SPICE/KiCad import/export, CSV/VCD waveform export."
 
 [lints]

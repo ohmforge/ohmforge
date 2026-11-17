@@ -8,7 +8,7 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
-readme = "../../README.md"
+readme = "README.md"
 description = "Core data model for ohmforge: circuit graph, units, values, time. No I/O, no UI; deterministic and WASM-clean."
 
 [lints]

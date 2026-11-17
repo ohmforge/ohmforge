@@ -1,96 +1,138 @@
 <p align="center">
-  <img src="assets/ohmforge-logo.svg" alt="ohmforge" width="360">
+  <img src="assets/ohmforge-logo.svg" alt="ohmforge" width="380">
 </p>
 
-# ohmforge
+<p align="center">
+  <b>The AI-native circuit &amp; firmware workbench.</b><br>
+  One small Rust binary that simulates your analog, digital, and MCU firmware together — in your terminal or your browser.
+</p>
 
-**A fast, friendly, AI-assisted electrical-engineering playground that lives in your terminal.**
-
-`ohmforge` is a terminal-native EE workbench for tinkerers, students, and makers. It combines:
-
-- a **circuit simulator** (analog SPICE-style + digital logic + mixed-signal),
-- **microcontroller & board emulation** (Arduino/AVR, Raspberry Pi Pico/RP2040, Cortex-M, RISC-V, plus specialized boards),
-- **virtual instruments** in the spirit of LabVIEW (oscilloscope, multimeter, logic analyzer, function generator, power supply),
-- a **dedicated shell** (`eesh`) — a scriptable REPL for building, wiring, probing, and running circuits,
-- and an **AI copilot** that can design circuits, generate firmware, explain what's happening, and debug alongside you.
-
-It's written in **Rust**, runs as a **TUI** (works great over SSH and inside emulators), and is built to be **small, portable, and extremely fast** — including a **WebAssembly** build that runs in a browser.
-
-> Think: a breadboard + oscilloscope + a patient EE tutor, that boots in a terminal anywhere.
+<p align="center">
+  <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="License: MIT OR Apache-2.0"></a>
+  <img src="https://img.shields.io/badge/built%20with-Rust-dea584.svg" alt="Built with Rust">
+  <img src="https://img.shields.io/badge/runs-terminal%20%2B%20WASM-ff9f1c.svg" alt="Terminal + WASM">
+  <img src="https://img.shields.io/badge/no%20cloud-required-brightgreen.svg" alt="No cloud required">
+  <a href="docs/plan/CHECKPOINTS.md"><img src="https://img.shields.io/badge/milestones-M0–M8%20✓-success.svg" alt="M0–M8 complete"></a>
+</p>
 
 ---
 
-## Why
+ohmforge is a **SPICE-class analog + mixed-signal simulator**, an **instruction-accurate MCU emulator** (AVR · RP2040 · STM32 · ESP32), a bench of **virtual instruments**, and an **AI copilot that runs the real solver and checks its own work** — all in a single fast, dependency-light Rust binary that runs in your terminal, over SSH, or in the browser. Nothing goes to any cloud.
 
-Real EE tools are powerful but heavy, GUI-bound, and often expensive. Tinkerers want something they can:
+> A breadboard + an oscilloscope + a patient EE tutor, that boots in a terminal anywhere.
 
-- launch instantly, anywhere (laptop, Raspberry Pi, remote box, container, browser),
-- drive from the keyboard and script,
-- learn from — *see* current flow, voltages, and waveforms, and ask "why?",
-- use to run **real Arduino sketches** against a **simulated circuit** before touching hardware.
+## ⚡ Try it in 30 seconds
 
-## Try it now
+```sh
+git clone https://github.com/ohmforge/ohmforge && cd ohmforge
 
-What runs today: a real analog/mixed-signal simulator, AVR + RP2040 emulation with co-simulation, instruments, an AI copilot, and a browser build — ~500 tests, all green.
+cargo run -p ohmforge -- demo    # RC low-pass → transient → braille scope
+cargo run -p ohmforge -- bode    # AC sweep → Bode plot, −3 dB at 1 kHz
+cargo run -p ohmforge -- amp     # common-emitter BJT, op-point + color overlay
+cargo run -p ohmforge -- cosim   # real AVR firmware drives D13 → a simulated LED (19.4 mA)
+cargo run -p ohmforge -- tui     # the live, dockable terminal UI
+```
+
+In the browser (WebAssembly):
+
+```sh
+wasm-pack build crates/ohmforge-web --target web --out-dir www/pkg
+# then serve crates/ohmforge-web/www/  — e.g.  python3 -m http.server -d crates/ohmforge-web/www
+```
+
+ohmforge installs two commands: **`of`** (the workbench CLI — the subcommands above) and **`eesh`** (drops straight into the scriptable shell REPL).
+
+New here? → **[getting-started tutorial](docs/tutorials/getting-started.md)**.
+
+## Who it's for
+
+| | |
+|---|---|
+| **Students & educators** | A deterministic, bit-for-bit engine you can trust for autograding, plus an offline no-key tutor that runs in a browser tab. |
+| **Makers & hobbyists** | Flash your firmware *in simulation first* — the MCU reads a real solved analog node through its ADC and drives a pin back. |
+| **Embedded & EE pros** | Scriptable, deterministic analog+firmware co-sim you can gate in CI. No cloud, no license server, runs over SSH. |
+| **AI / dev-tool folks** | A copilot that *acts through the same tools you do* and verifies its claims by running the simulator — plus a no-key offline mode. |
+
+## Your first circuit (`eesh`)
 
 ```text
-cargo run -p ohmforge -- demo     # build an RC low-pass, run a transient, see the braille scope
-cargo run -p ohmforge -- bode     # AC sweep → Bode plot, −3 dB at 1 kHz
-cargo run -p ohmforge -- amp      # common-emitter BJT amplifier, op-point with a color overlay
-cargo run -p ohmforge -- cosim    # real AVR firmware drives D13 → a simulated LED lights (19.4 mA)
-cargo run -p ohmforge -- view     # a static snapshot of the composed TUI (overlay · scope · shell)
-cargo run -p ohmforge -- tui      # the live interactive dockable panels
-cargo run -p ohmforge             # the eesh REPL;  or:  cat examples/tutorial/rc_lowpass.eesh | cargo run -p ohmforge
-
-# in the browser (WebAssembly):
-wasm-pack build crates/ohmforge-web --target web --out-dir www/pkg   # then serve crates/ohmforge-web/www/
+add V1 in gnd 5          # a 5 V source from node `in` to ground
+add R1 in out 1k
+add C1 out gnd 1u
+probe out
+run tran 5m              # transient; also: run op · ac · dc · noise · mc · tf
+show                     # render the braille scope
+set R1.value 2k          # retune a component and re-solve
 ```
 
-ohmforge ships two binaries: **`of`** (the primary CLI — subcommands above) and **`eesh`**, which launches straight into the shell REPL.
+Scripts are plain `.eesh` files — see [`examples/`](examples/README.md). Pipe one in: `cat examples/tutorial/rc_lowpass.eesh | cargo run -p ohmforge`.
 
-New here? Start with the **[getting-started tutorial](docs/tutorials/getting-started.md)**.
+## What works today
 
-## What it feels like (design target)
+- **Analog** — linear + nonlinear (diode `IS/N/RS`, BJT, MOSFET) with Newton–Raphson + gmin/source-stepping convergence aids; AC/Bode, noise, Monte-Carlo, adaptive-timestep transient; mutual inductance / transformers; transmission lines; **pole-zero + transfer-function (`.TF`)**; a KLU-class sparse solver in the hot loop + multithreaded analyses.
+- **Digital & MCU** — an event-driven kernel + HDL-lite; instruction-accurate **AVR (328P/2560/ATtiny)**, **RP2040 (Cortex-M0+)**, **STM32 (Cortex-M3/M4)**, **ESP32 (Xtensa LX6)** cores with GPIO/timers/PWM/ADC/USART/SPI/I²C/interrupts and **lockstep analog↔firmware co-simulation**.
+- **Instruments & UI** — oscilloscope, DMM, function generator, PSU; logic analyzer with UART/SPI/I²C decode; Bode/FFT; breadboard view; a dockable TUI with live overlay, component tuning, current-flow animation, and transient playback/scrub.
+- **Interop** — SPICE (incl. `.model` devices), KiCad, VCD/CSV, Fritzing, BOM, and a lossless native project format.
+- **AI copilot** — Ask / Design / Debug / Firmware, grounded in the real engine via a verify loop, with spec-driven auto-tune and a tutor — plus a fully **offline, no-key** mode (DRC, value calculators, parts index, grader).
+- **Browser** — a WASM build with an in-page editor, shareable-session links, and real-time co-editing.
 
-The vision the shell is growing toward — not all of this grammar is wired yet (see [`docs/SHELL.md`](docs/SHELL.md) § "Implemented today"):
+Full status and the 99-checkpoint ledger: [`docs/plan/CHECKPOINTS.md`](docs/plan/CHECKPOINTS.md). Current release: **v0.6.0** (M0–M8 complete). The whole workspace stays green — `clippy -D warnings`, `wasm32` core + `ohmforge-web`, `-D warnings` docs.
 
-```text
-eesh> new project blinky
-eesh> board add uno                      # Arduino Uno (ATmega328P)
-eesh> add led D1 anode=uno.D13 cathode=n1
-eesh> add resistor R1 220 n1 gnd
-eesh> flash uno examples/blink.ino       # compile + load firmware
-eesh> run 3s                             # co-simulate MCU + circuit
-eesh> scope uno.D13 D1.current           # live waveforms in the terminal
-eesh> ask "why is the LED dimmer than I expected?"
+## The AI copilot
+
+```sh
+# Offline — no key, no network. Design-rule review of a circuit:
+printf 'add V1 in gnd 5\nadd R1 in out 1k\nadd D1 out gnd\n' | cargo run -p ohmforge -- review
+
+# Live — the model drives the real shell + engine and verifies itself:
+export ANTHROPIC_API_KEY=sk-...          # optional: EE_BASE_URL / ANTHROPIC_BASE_URL for a proxy
+cargo run -p ohmforge --features http -- ask "design a 5 V to 3.3 V divider and check it"
 ```
 
+The live transport is behind the opt-in `http` feature, so the default build (and the WASM core) pull **no network or TLS stack**. See [`docs/guide/ai-copilot.md`](docs/guide/ai-copilot.md).
+
+## Install
+
+Today, from source (stable Rust; see [`rust-toolchain.toml`](rust-toolchain.toml)):
+
+```sh
+cargo install --path crates/ohmforge          # installs `of` and `eesh`
 ```
- ┌─ Schematic ───────────────┐ ┌─ Scope ───────────────────────┐
- │  UNO.D13 ──[R1 220Ω]──┐    │ │ D13 ┌─┐   ┌─┐   ┌─┐   ┌─┐      │
- │                      (D1)  │ │ ────┘ └───┘ └───┘ └───┘ └──    │
- │                       │    │ │ I    ▁▇█▇▁   ▁▇█▇▁   ▁▇█▇▁     │
- │                      GND   │ │                                │
- └───────────────────────────┘ └────────────────────────────────┘
- ┌─ eesh ────────────────────────────────────────────────────────┐
- │ ▸ ask "why is the LED dimmer than I expected?"                 │
- │ AI: Your series resistor limits current to ~14 mA. The Uno's   │
- │     pin sources through an internal ~25Ω; try R1=150Ω for ...  │
- └────────────────────────────────────────────────────────────────┘
-```
+
+Published crates (`cargo install ohmforge`) land with the first crates.io release — see [`crates/PUBLISHING.md`](crates/PUBLISHING.md).
+
+## Workspace
+
+A Cargo workspace of focused crates — the compute core (`ohmforge-core`, `ohmforge-sim`) is **dependency-free, `wasm32`-clean, and deterministic**:
+
+| Crate | What it is |
+|---|---|
+| [`ohmforge-core`](crates/ohmforge-core) | circuit graph + core types (dep-free, wasm-clean) |
+| [`ohmforge-sim`](crates/ohmforge-sim) | SPICE-class analog / mixed-signal engine (dep-free, wasm-clean) |
+| [`ohmforge-digital`](crates/ohmforge-digital) | event-driven digital kernel + HDL-lite |
+| [`ohmforge-mcu`](crates/ohmforge-mcu) | instruction-accurate MCU cores + co-sim |
+| [`ohmforge-devices`](crates/ohmforge-devices) | composite device subcircuits |
+| [`ohmforge-instruments`](crates/ohmforge-instruments) | scope / DMM / funcgen / PSU / logic analyzer / Bode-FFT |
+| [`ohmforge-fmt`](crates/ohmforge-fmt) | SPICE / KiCad / VCD / CSV / Fritzing / BOM / project I/O |
+| [`ohmforge-tui`](crates/ohmforge-tui) | the terminal UI |
+| [`ohmforge-shell`](crates/ohmforge-shell) | the `eesh` command language + REPL |
+| [`ohmforge-ai`](crates/ohmforge-ai) | the copilot (offline + opt-in live) |
+| [`ohmforge`](crates/ohmforge) | the `of` / `eesh` binary |
+| [`ohmforge-web`](crates/ohmforge-web) | WASM bindings + browser app |
 
 ## Documentation
 
-**[`docs/README.md`](docs/README.md) is the documentation hub.** Highlights:
+**[`docs/README.md`](docs/README.md) is the hub.**
+- **Tutorial:** [getting started](docs/tutorials/getting-started.md) · runnable [`examples/`](examples/README.md)
+- **Guides:** [simulation](docs/guide/simulation.md) · [emulation & co-sim](docs/guide/emulation.md) · [view & instruments](docs/guide/view.md) · [AI copilot](docs/guide/ai-copilot.md) · [formats](docs/guide/formats.md)
+- **Design:** [`ARCHITECTURE.md`](docs/ARCHITECTURE.md) · [`FEATURES.md`](docs/FEATURES.md) · [`SHELL.md`](docs/SHELL.md) · [`ROADMAP.md`](docs/ROADMAP.md) · [`CHECKPOINTS.md`](docs/plan/CHECKPOINTS.md)
 
-- **Tutorial:** [getting started in `eesh`](docs/tutorials/getting-started.md) · runnable [`examples/`](examples/README.md) (analog circuits, MCU/co-sim, formats)
-- **Guides:** [simulation engine](docs/guide/simulation.md) · [emulation & co-sim](docs/guide/emulation.md) · [the view & instruments](docs/guide/view.md) · [AI copilot](docs/guide/ai-copilot.md) · [file formats](docs/guide/formats.md)
-- **Design:** [`ARCHITECTURE.md`](docs/ARCHITECTURE.md) · [`FEATURES.md`](docs/FEATURES.md) · [`SHELL.md`](docs/SHELL.md) · [`AI.md`](docs/AI.md) · [`ROADMAP.md`](docs/ROADMAP.md) · progress ledger [`docs/plan/CHECKPOINTS.md`](docs/plan/CHECKPOINTS.md)
+## Contributing
 
-## Status
-
-**M0–M8 complete** (99/99 checkpoints, **v0.6.0**; see [`docs/plan/CHECKPOINTS.md`](docs/plan/CHECKPOINTS.md)). M8 was a hardening pass from a four-track QA audit — killed TUI flicker, unblocked AC/noise/`.TF` on DC-floating nodes (capacitive dividers), fixed an O(N²) shell hang, corrected AI design-rule checks + added an HTTP timeout, and closed the reachability gaps: the shell now drives every analysis (`run ac/dc/noise/mc/tf`) and places multi-terminal parts, and the copilot is reachable from the CLI (`of review`/`of drc` offline, `of ask` live). Working today: linear + nonlinear analog (diode with `IS/N/RS`, BJT/MOSFET, Newton–Raphson with **gmin/source-stepping convergence aids**), **mutual inductance / transformers**, **transmission lines** (lossless + lossy), AC/Bode, noise, Monte-Carlo, transient with adaptive timestep, **pole-zero + small-signal transfer-function (`.TF`) analysis** (hand-rolled eigensolver), a **KLU-class ordered/reusable sparse solver wired into the engine's hot loop** (+ multithreaded analyses), expression/behavioral sources + temperature; an event-driven digital kernel + **HDL-lite** (truth-table/ROM/RAM/tri-state); instruction-accurate **AVR (328P/2560/ATtiny)**, **RP2040 (Cortex-M0+)**, **STM32 (Cortex-M3/M4, Thumb-2)** and **ESP32 (Xtensa LX6)** cores with peripherals (GPIO/timers/PWM/ADC/USART/**SPI/I²C**/**external + pin-change interrupts**) and **lockstep co-simulation** — including a **closed loop** where firmware reads a real analog node through the ADC and drives a pin back — plus manifest boards, drop-in modules (7-seg/servo/WS2812), and composite device subcircuits (op-amp/switch/relay); oscilloscope/DMM/funcgen/PSU, a logic analyzer with UART/SPI/I²C decode, a Bode/FFT panel, a breadboard view, a **dataflow patcher**, **live schematic editing + component tuning with current-flow animation**, and **transient playback/scrub**; a dockable TUI; SPICE (incl. `.model` devices)/KiCad/VCD/CSV/Fritzing/BOM and a lossless native project format; an AI copilot (Ask/Design/Debug/Firmware + offline mode) whose tools drive a real sim with a verification loop and **spec-driven auto-tune**, a **live HTTP transport** to the Claude API (opt-in `http` feature), and a tutor with graded challenges; and a **WebAssembly browser build** with an editor, shareable-session links, and **real-time co-editing** backed by a **hosted signaling relay**. Whole workspace stays green — `clippy -D warnings`, `wasm32` core + `ohmforge-web`, `-D warnings` docs.
+Contributions welcome! Please read [`CONTRIBUTING.md`](CONTRIBUTING.md) (we use **DCO** sign-off — `git commit -s`) and our [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md). Security reports: [`SECURITY.md`](SECURITY.md).
 
 ## License
 
-Dual-licensed under **MIT OR Apache-2.0**.
+Dual-licensed under **[MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE)** — your choice. Contributions are accepted under the same terms.
+
+The **ohmforge** name and logo are trademarks of the project maintainers — see [`TRADEMARK.md`](TRADEMARK.md). The code is free; the brand is protected.

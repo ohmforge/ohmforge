@@ -18,7 +18,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.79"
 license = "MIT OR Apache-2.0"
@@ -31,17 +31,19 @@ categories = ["simulation", "science", "command-line-utilities"]
 
 # Shared dependency versions live here; crates opt in with `dep = { workspace = true }`.
 # Kept commented until first use so the scaffold builds with zero network deps.
+# Path + version so `cargo publish` resolves a crates.io dependency while local
+# builds use the in-tree path. Versions track the workspace version.
 [workspace.dependencies]
-ohmforge-core        = { path = "crates/ohmforge-core" }
-ohmforge-sim         = { path = "crates/ohmforge-sim" }
-ohmforge-digital     = { path = "crates/ohmforge-digital" }
-ohmforge-mcu         = { path = "crates/ohmforge-mcu" }
-ohmforge-devices     = { path = "crates/ohmforge-devices" }
-ohmforge-instruments = { path = "crates/ohmforge-instruments" }
-ohmforge-fmt         = { path = "crates/ohmforge-fmt" }
-ohmforge-tui         = { path = "crates/ohmforge-tui" }
-ohmforge-shell       = { path = "crates/ohmforge-shell" }
-ohmforge-ai          = { path = "crates/ohmforge-ai" }
+ohmforge-core        = { path = "crates/ohmforge-core", version = "0.7.0" }
+ohmforge-sim         = { path = "crates/ohmforge-sim", version = "0.7.0" }
+ohmforge-digital     = { path = "crates/ohmforge-digital", version = "0.7.0" }
+ohmforge-mcu         = { path = "crates/ohmforge-mcu", version = "0.7.0" }
+ohmforge-devices     = { path = "crates/ohmforge-devices", version = "0.7.0" }
+ohmforge-instruments = { path = "crates/ohmforge-instruments", version = "0.7.0" }
+ohmforge-fmt         = { path = "crates/ohmforge-fmt", version = "0.7.0" }
+ohmforge-tui         = { path = "crates/ohmforge-tui", version = "0.7.0" }
+ohmforge-shell       = { path = "crates/ohmforge-shell", version = "0.7.0" }
+ohmforge-ai          = { path = "crates/ohmforge-ai", version = "0.7.0" }
 # Third-party (uncomment as milestones need them):
 # ratatui   = "0.28"
 # crossterm = "0.28"
