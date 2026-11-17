@@ -194,8 +194,8 @@ _(Post-M8: rebranded ee-assist → **ohmforge**, published to github.com/ohmforg
 - [~] **CP-SIM-M9.1** (sim-core) Power electronics: a controlled switching element as a circuit-level relation (no new `PartKind`) + PWM stimulus (extend `Pulse`) so buck/boost converters simulate in transient. — *gate:* a buck steps 12 V → ~5 V at the set duty, a boost steps up, with sane switching-node + inductor-current waveforms; switch-free circuits unaffected, golden suite bit-for-bit.
 - [~] **CP-SIM-M9.2** (sim-core) 2-port S-parameters: `Engine::s_parameters(circuit, p1, p2, z0)` → S11/S21/S12/S22 (+ Z/Y) from the AC solve. — *gate:* a matched line / attenuator / L-match returns S-params matching closed-form theory (Z0-matched → S11≈0). Purely additive.
 - [~] **CP-BRD-M9.1** (boards) Sensor & actuator models in `ohmforge-devices` over existing primitives (no `-core`/`-sim` edits): NTC thermistor, photoresistor, potentiometer, DC motor (back-EMF), servo (pulse→angle), stepper; ≥1 wired through MCU co-sim. — *gate:* a thermistor divider shifts with temperature (β-model); 1.5 ms servo pulse → ~90°; a DC motor spins up; a pot wiper divides linearly.
-- [~] **CP-UX-M9.1** (ui-shell) Visual schematic capture in the TUI: mouse place/move/wire on a grid canvas driving the real `Circuit` via the shared `EditAction` path; pure state machine, no tty. — *gate:* mouse events place parts + draw a wire (asserted on the `Circuit`), a drag moves a part.
-- [~] **CP-UX-M9.2** (ui-shell) RF instrument panels in `ohmforge-instruments`: a Smith chart (Γ/S11 on the Smith grid) + an eye diagram (fold a bitstream), rendering from provided S-param/signal data. — *gate:* a known Γ lands at the correct Smith coordinate (Γ=0 center, open/short at the rim); an eye diagram folds a known pattern into the expected eye.
+- [x] **CP-UX-M9.1** (ui-shell) Visual schematic capture in the TUI: mouse place/move/wire on a grid canvas driving the real `Circuit` via the shared `EditAction` path; pure state machine, no tty. — *gate:* a pure `Canvas` state machine lowers every topology edit to the `EditAction` grammar (never a parallel model); `ohmforge-tui` tests `app::tests::mouse_places_and_wires_parts_on_the_canvas` (mouse events place two parts + draw a wire, asserted on the real `Circuit`'s parts + merged net), `canvas::tests::drag_moves_a_placed_part` (a drag relocates a part, no circuit edit), `capture_placement_is_undoable_through_the_shared_path` (a mouse `add` is `undo`-able), `canvas::tests::{a_click_places_the_selected_kind_through_the_add_path, dragging_between_terminals_emits_a_wire, a_dangling_or_self_wire_does_nothing}`, `run::tests::left_drag_and_release_map_for_capture`. New `canvas` module + `App` capture mode (`MouseKind::{Drag,Up}`, palette "capture mode").
+- [x] **CP-UX-M9.2** (ui-shell) RF instrument panels in `ohmforge-instruments`: a Smith chart (Γ/S11 on the Smith grid) + an eye diagram (fold a bitstream), rendering from provided S-param/signal data (no `ohmforge-sim` S-param call; no `ohmforge-tui` dep). — *gate:* `smith::tests::smith_chart_places_known_reflection_coefficients` (Γ=0 / matched load at centre, short Γ=−1 left rim, open Γ=+1 right rim, all on the real axis; markers land in the rendered grid) + `reactive_loads_land_on_the_rim` + `gamma_and_impedance_round_trip`; `eye::tests::eye_diagram_folds_a_known_pattern` (alternating NRZ → full-swing opening, crossing at mid-level, the rendered braille grid is open at the eye centre) + `a_constant_signal_has_no_open_eye` + `short_or_zero_period_input_is_clean`.
 - [ ] **CP-WEB.8** (web) Drag-and-drop schematic canvas in the browser: place/wire parts visually, round-trip to netlist + re-simulate. — *gate:* host-testable canvas-edit → netlist round-trip; the page builds + simulates a drawn circuit. _(Starts after the home example-gallery work is committed — both touch `ohmforge-web`.)_
 - [ ] **CP-SHIP.5** (platform) Polish & tag **v0.8.0**: full CI-parity gate sweep (incl. `http`/`relay`), README refreshed to M0–M9, tag.
 
@@ -207,11 +207,11 @@ _(Post-M8: rebranded ee-assist → **ohmforge**, published to github.com/ohmforg
 |---|---|---|---|
 | sim-core | 26 | 2 | 28 |
 | boards | 17 | 1 | 18 |
-| ui-shell | 21 | 2 | 23 |
+| ui-shell | 23 | 0 | 23 |
 | ai-fmt | 19 | 0 | 19 |
 | platform | 10 | 0 | 11 |
 | web | 6 | 0 | 7 |
-| **Total** | **99** | **5** | **106** |
+| **Total** | **101** | **3** | **106** |
 
 _**67/67 — M0 through M4 all complete** (M0–M3 tagged v0.1.0; M4 adds the rest). M4 delivered the **plugin device-model API** + an **instrument/block plugin trait**, a **KLU-class ordered/reusable sparse solver** and **multithreaded analyses**, a **Cortex-M3/M4 (Thumb-2)** core with an STM32 board, **SPICE `.model` import** + a vendor model library, and **shareable circuit links** in the browser. Deferred by design: real-time collaboration, the QEMU full-SBC bridge, and full vendor-SPICE `.model` fidelity — the standing M-next horizon._
 

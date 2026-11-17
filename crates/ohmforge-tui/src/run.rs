@@ -154,6 +154,8 @@ pub(crate) fn map_key(k: CtKey) -> Option<KeyEvent> {
 pub(crate) fn map_mouse(m: CtMouse) -> Option<MouseEvent> {
     let kind = match m.kind {
         MouseEventKind::Down(MouseButton::Left) => MouseKind::Down,
+        MouseEventKind::Drag(MouseButton::Left) => MouseKind::Drag,
+        MouseEventKind::Up(MouseButton::Left) => MouseKind::Up,
         MouseEventKind::ScrollUp => MouseKind::ScrollUp,
         MouseEventKind::ScrollDown => MouseKind::ScrollDown,
         _ => return None,
@@ -214,6 +216,26 @@ mod tests {
         let mapped = map_mouse(m).unwrap();
         assert_eq!(mapped.kind, MouseKind::Down);
         assert_eq!((mapped.col, mapped.row), (12, 3));
+    }
+
+    #[test]
+    fn left_drag_and_release_map_for_capture() {
+        let drag = map_mouse(CtMouse {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 4,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+        assert_eq!(drag.kind, MouseKind::Drag);
+        let up = map_mouse(CtMouse {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 4,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+        assert_eq!(up.kind, MouseKind::Up);
     }
 
     #[test]

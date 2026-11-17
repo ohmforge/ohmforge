@@ -10,6 +10,7 @@
 
 pub mod app;
 pub mod breadboard;
+pub mod canvas;
 pub mod current;
 pub mod overlay;
 pub mod playback;
@@ -22,6 +23,7 @@ pub use app::{
     App, AppEvent, Backend, EditAction, KeyCode, KeyEvent, MouseEvent, MouseKind, PanelId,
 };
 pub use breadboard::Breadboard;
+pub use canvas::{Canvas, CanvasEvent, Cell, PartKind as CanvasPartKind, Placement};
 pub use current::{branch_currents, flow_glyph, BranchCurrent, BranchCurrents};
 pub use overlay::{NodeVoltages, Overlay};
 pub use playback::Playback;
