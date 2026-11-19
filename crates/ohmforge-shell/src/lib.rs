@@ -14,7 +14,7 @@
 //! add <ref> <nodeA> <nodeB> <value>   place a part (R/C/L/V from the ref letter)
 //! wire <nodeA> <nodeB>                merge two named nodes into one net
 //! probe <node>                        mark a node to plot on the next `run`
-//! run [tran [<dur>]]                  transient (default 1 ms); plots the probes
+//! run [tran [<dur> [<step>]]]         transient (default 1 ms); fixed <step> samples sine/PWM
 //! run op                              DC operating-point node-voltage table
 //! show                                list the placed parts
 //! help                                show the command list
@@ -47,7 +47,7 @@ use ohmforge_core::graph::{
 use ohmforge_core::signal::Complex;
 use ohmforge_core::units::Unit;
 use ohmforge_core::value::{ParseError, Value};
-use ohmforge_instruments::Bode;
+use ohmforge_instruments::{Bode, SmithChart};
 use ohmforge_sim::{Analysis, Engine, SimError};
 use ohmforge_tui::Plot;
 
@@ -59,6 +59,11 @@ const DEFAULT_PPD: u32 = 20;
 
 /// Default Monte-Carlo seed when none is given (deterministic across runs).
 const DEFAULT_MC_SEED: u64 = 0xEE_A5_51_57;
+
+/// Default reference impedance for `run sparams` (the RF convention).
+const DEFAULT_Z0: f64 = 50.0;
+/// Default frequency for `run sparams` when none is given (1 GHz).
+const DEFAULT_SPARAM_FREQ: f64 = 1e9;
 
 /// A transient longer than this (seconds) draws an "absurd duration?" warning —
 /// `run tran 1k` is 1000 s, almost always a slipped unit (`CP-UX-M8.2`).
@@ -1045,10 +1050,15 @@ impl Shell {
     /// `tran`, `op`, `ac`, `dc`, `noise`, `mc`, and `tf` (`CP-UX-M8.2`).
     fn cmd_run(&mut self, args: &[&str]) -> Result<String, ShellError> {
         match args {
-            [] | ["tran"] => self.run_transient(DEFAULT_DURATION),
+            [] | ["tran"] => self.run_transient(DEFAULT_DURATION, None),
             ["tran", dur] => {
                 let d = self.parse_duration(dur)?;
-                self.run_transient(d)
+                self.run_transient(d, None)
+            }
+            ["tran", dur, step] => {
+                let d = self.parse_duration(dur)?;
+                let s = self.parse_step(step, d)?;
+                self.run_transient(d, Some(s))
             }
             ["op"] => self.run_op(),
             ["ac", f0, f1] => self.run_ac(f0, f1, DEFAULT_PPD),
@@ -1071,9 +1081,19 @@ impl Shell {
                 self.run_mc(out, runs, seed)
             }
             ["tf", out, source] => self.run_tf(out, source),
+            ["sparams", p1, p2] => self.run_sparams(p1, p2, DEFAULT_Z0, DEFAULT_SPARAM_FREQ),
+            ["sparams", p1, p2, z0] => {
+                let z = self.parse_value(z0, Unit::Ohm)?.magnitude;
+                self.run_sparams(p1, p2, z, DEFAULT_SPARAM_FREQ)
+            }
+            ["sparams", p1, p2, z0, f] => {
+                let z = self.parse_value(z0, Unit::Ohm)?.magnitude;
+                let fr = self.parse_value(f, Unit::Hertz)?.magnitude;
+                self.run_sparams(p1, p2, z, fr)
+            }
             _ => Err(ShellError::Usage {
                 command: "run",
-                usage: "run tran [<dur>] | op | ac <f0> <f1> [ppd] | dc <src> <start> <stop> <step> | noise <node> <f0> <f1> [ppd] | mc <node> <runs> [seed] | tf <node> <src>",
+                usage: "run tran [<dur> [<step>]] | op | ac <f0> <f1> [ppd] | dc <src> <start> <stop> <step> | noise <node> <f0> <f1> [ppd] | mc <node> <runs> [seed] | tf <node> <src> | sparams <p1> <p2> [z0] [freq]",
             }),
         }
     }
@@ -1086,6 +1106,18 @@ impl Shell {
             return Err(ShellError::BadDuration(dur.to_string()));
         }
         Ok(d)
+    }
+
+    /// Parse and validate a fixed transient timestep: positive, finite, and no
+    /// larger than the run duration. A fixed step (vs. the adaptive default) is
+    /// what lets a time-varying source be sampled densely enough to render — e.g.
+    /// a sine/PWM circuit, which the adaptive controller can otherwise stride past.
+    fn parse_step(&self, token: &str, duration: f64) -> Result<f64, ShellError> {
+        let s = self.parse_value(token, Unit::Second)?.magnitude;
+        if !s.is_finite() || s <= 0.0 || s > duration {
+            return Err(ShellError::BadDuration(format!("step {token}")));
+        }
+        Ok(s)
     }
 
     /// Parse a non-negative integer count field (points-per-decade, runs).
@@ -1106,7 +1138,7 @@ impl Shell {
     /// Simulate a transient and render each probed node as a braille scope. The
     /// solved signals are also cached in `last_transient` so the live TUI can scrub
     /// them as a playback (`CP-UX-M7.1`).
-    fn run_transient(&mut self, duration: f64) -> Result<String, ShellError> {
+    fn run_transient(&mut self, duration: f64, step: Option<f64>) -> Result<String, ShellError> {
         if self.probes.is_empty() {
             self.last_transient.clear();
             return Ok("nothing probed — add `probe <node>` to see a waveform.".to_string());
@@ -1114,10 +1146,10 @@ impl Shell {
         let signals = Engine::new()
             .run(
                 &self.circuit,
-                &Analysis::Transient {
-                    duration,
-                    step: None, // None = engine-chosen adaptive timestep (LTE control)
-                },
+                // `step: None` lets the engine choose an adaptive timestep (LTE
+                // control); `Some(step)` pins a fixed grid so time-varying sources
+                // (sine/PWM) are sampled uniformly.
+                &Analysis::Transient { duration, step },
             )
             .map_err(ShellError::Sim)?;
 
@@ -1327,6 +1359,33 @@ impl Shell {
         Ok(out)
     }
 
+    /// `run sparams <p1> <p2> [z0] [freq]` — two-port scattering parameters
+    /// (`CP-SIM-M9.2`) referenced to `z0` at `freq`, with the port-1 reflection
+    /// coefficient (`S11`) drawn on a Smith chart (`CP-UX-M9.2`). Ports are nets
+    /// referenced to ground.
+    fn run_sparams(&self, p1: &str, p2: &str, z0: f64, freq: f64) -> Result<String, ShellError> {
+        let n1 = self.net_known(p1)?;
+        let n2 = self.net_known(p2)?;
+        let sp = Engine::new()
+            .s_parameters(&self.circuit, n1, n2, z0, freq)
+            .map_err(ShellError::Sim)?;
+        let mut out = format!(
+            "S-parameters  (Z0 = {z0:.0} Ω, f = {freq:.4e} Hz)\n  \
+             S11 {:+.2} dB ∠{:+.1}°    S21 {:+.2} dB ∠{:+.1}°\n  \
+             S12 {:+.2} dB ∠{:+.1}°    S22 {:+.2} dB ∠{:+.1}°\n",
+            sp.s11.magnitude_db(),
+            sp.s11.phase_deg(),
+            sp.s21.magnitude_db(),
+            sp.s21.phase_deg(),
+            sp.s12.magnitude_db(),
+            sp.s12.phase_deg(),
+            sp.s22.magnitude_db(),
+            sp.s22.phase_deg(),
+        );
+        out.push_str(&SmithChart::new(&format!("S11 (Γ at {p1})")).render(&[sp.s11]));
+        Ok(out)
+    }
+
     /// Solve the DC operating point and tabulate every named node's voltage.
     fn run_op(&self) -> Result<String, ShellError> {
         let signals = Engine::new()
@@ -1396,13 +1455,14 @@ impl Shell {
             "  set <ref> pulse <v1> <v2> <d> <w> <per>      attach a pulse drive",
             "  set tol|tempco <ref> <n>    tolerance (Monte-Carlo) / temperature coefficient",
             "  set temp <celsius>          circuit operating temperature",
-            "  run tran [<dur>]            transient (default 1 ms), plotting each probe",
+            "  run tran [<dur> [<step>]]   transient (default 1 ms); a fixed <step> samples sine/PWM sources",
             "  run op                      DC operating-point node-voltage table",
             "  run ac <f0> <f1> [ppd]      small-signal AC sweep (Bode per probe)",
             "  run dc <src> <start> <stop> <step>   DC sweep of a source's level",
             "  run noise <node> <f0> <f1> [ppd]     output-referred noise PSD",
             "  run mc <node> <runs> [seed]  Monte-Carlo tolerance spread",
             "  run tf <node> <src>         transfer function / pole-zero report",
+            "  run sparams <p1> <p2> [z0] [f]   2-port S-parameters + Smith chart",
             "  show                        list the placed parts",
             "  undo                        revert the last add/wire/probe/set",
             "  checkpoint <name>           save the session under a name",
@@ -2498,6 +2558,51 @@ mod tests {
         ));
     }
 
+    /// Regression (M10): `run tran <dur> <step>` pins a uniform timestep so a
+    /// time-varying source is sampled densely — the adaptive default can stride
+    /// past a fast sine and render it flat.
+    #[test]
+    fn run_tran_fixed_step_samples_a_sine() {
+        let mut sh = Shell::new();
+        sh.execute("add V1 in gnd 1").unwrap();
+        sh.execute("set V1 sine 1 1k").unwrap(); // 1 V, 1 kHz
+        sh.execute("add R1 in gnd 1k").unwrap();
+        sh.execute("probe in").unwrap();
+        // 2 ms at 10 µs → ~200 uniform samples across two full periods.
+        sh.execute("run tran 2m 10u").unwrap();
+        let name = sh.signal_name("in");
+        let sig = sh
+            .last_transient
+            .iter()
+            .find(|s| s.name == name)
+            .expect("the probed node is cached after a transient");
+        let y = sig.real().expect("a real transient signal");
+        assert!(
+            y.len() >= 150,
+            "fixed step → dense uniform grid, got {}",
+            y.len()
+        );
+        let (lo, hi) = y
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
+                (lo.min(v), hi.max(v))
+            });
+        assert!(
+            hi - lo > 1.5,
+            "the 1 V sine swings ~2 Vpp, got {:.3}",
+            hi - lo
+        );
+        // A non-positive or too-large step is a clean error, not a panic.
+        assert!(matches!(
+            sh.execute("run tran 2m 0").unwrap_err(),
+            ShellError::BadDuration(_)
+        ));
+        assert!(matches!(
+            sh.execute("run tran 2m 5m").unwrap_err(),
+            ShellError::BadDuration(_)
+        ));
+    }
+
     // ── CP-UX-M8.2: shell reach + correctness ──────────────────────────────
 
     /// Regression: `run ac` reaches the AC engine and renders a Bode plot per
@@ -2541,6 +2646,24 @@ mod tests {
         assert!(out.contains("poles"), "{out}");
         // A first-order RC low-pass has exactly one real pole at −1/RC ≈ −1000 rad/s.
         assert!(out.contains("poles (1)"), "one pole expected:\n{out}");
+    }
+
+    /// Regression (M10): `run sparams` reaches the S-parameter engine and renders
+    /// the port-1 reflection coefficient on a Smith chart. A series 50 Ω between
+    /// two 50 Ω-referenced ports is a known 2-port (S11 = Z/(Z+2·Z0) = 1/3).
+    #[test]
+    fn run_sparams_reports_s_params_and_a_smith_chart() {
+        let mut sh = Shell::new();
+        sh.execute("add R1 in out 50").unwrap();
+        let out = sh.execute("run sparams in out").unwrap(); // defaults: Z0=50 Ω, 1 GHz
+        assert!(out.contains("S-parameters"), "{out}");
+        assert!(
+            out.contains("S11") && out.contains("S21"),
+            "names the params:\n{out}"
+        );
+        assert!(out.contains("S11 (Γ"), "renders a Smith chart:\n{out}");
+        // An unknown port node is a clean error, not a panic.
+        assert!(sh.execute("run sparams in nope").is_err());
     }
 
     /// Regression: `run noise` reaches the noise engine and reports a PSD readout.
