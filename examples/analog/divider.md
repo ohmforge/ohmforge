@@ -11,7 +11,7 @@
 Run it:
 
 ```sh
-cat examples/analog/divider.eesh | cargo run -p ohmforge
+cat examples/analog/divider.eesh | cargo run -p ohmforge --bin eesh
 ```
 
 ## The circuit

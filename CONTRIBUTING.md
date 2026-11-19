@@ -41,8 +41,16 @@ By signing off you agree to the DCO (reproduced below):
 
 > **Developer Certificate of Origin 1.1** — By making a contribution to this project, I certify that: (a) the contribution was created in whole or in part by me and I have the right to submit it under the open source license indicated in the file; or (b) the contribution is based upon previous work that, to the best of my knowledge, is covered under an appropriate open source license and I have the right under that license to submit that work with modifications; or (c) the contribution was provided directly to me by some other person who certified (a), (b) or (c) and I have not modified it. (d) I understand and agree that this project and the contribution are public and that a record of the contribution (including all personal information I submit with it, including my sign-off) is maintained indefinitely and may be redistributed consistent with this project and the open source license(s) involved.
 
-The DCO is our bar today. A **Contributor License Agreement (CLA)** may be introduced before accepting large external contributions as the project's governance matures; if that happens it will be announced here with clear instructions. For now, a DCO sign-off is all that is required.
+The DCO is our bar today. A **Contributor License Agreement (CLA)** may be introduced before accepting large external contributions as the project's governance matures (see [`GOVERNANCE.md`](GOVERNANCE.md)); if that happens it will be announced here with clear instructions. For now, a DCO sign-off is all that is required.
 
 ## Code of conduct
 
-Be kind and constructive. Assume good faith. This is a learning-first project — questions are welcome.
+Be kind and constructive. Assume good faith. This is a learning-first project — questions are welcome. All participation is governed by our [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md).
+
+## More
+
+- **Questions / where to get help:** [`SUPPORT.md`](SUPPORT.md)
+- **How the project is run and how to become a maintainer:** [`GOVERNANCE.md`](GOVERNANCE.md)
+- **Reporting a security issue:** [`SECURITY.md`](SECURITY.md)
+- **Name and logo usage:** [`TRADEMARK.md`](TRADEMARK.md)
+- **Release history:** [`CHANGELOG.md`](CHANGELOG.md)

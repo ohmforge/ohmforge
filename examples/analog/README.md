@@ -31,18 +31,20 @@ nonlinear and multi-terminal ones — runs directly as a script:
 | [`common_emitter_bjt`](common_emitter_bjt.md) | `run op` | NPN voltage-divider bias in the forward-active region (`Q1`) |
 | [`opamp_noninverting`](opamp_noninverting.md) | `run op` | ideal op-amp (VCVS `EOP`) closing a ×10 non-inverting loop |
 
-## Engine-API examples (an AC stimulus the shell transient can't resolve yet)
+## Engine-API example
 
 | Example | Needs | Verified by |
 |---------|-------|-------------|
-| [`half_wave_rectifier`](half_wave_rectifier.md) | a sine *transient* | engine-API snippet |
+| [`half_wave_rectifier`](half_wave_rectifier.md) | a sine *transient* | `ohmforge-sim` regression test |
 
-The shell can *attach* a sine with `set <ref> sine <amp> <freq>`, but `run tran`
-drives the engine with an adaptive timestep and no fixed-step override, so a
-purely-resistive sine circuit is sampled at its zero-crossings and reads flat.
-Rendering a clean rectified waveform therefore needs the fixed-step transient of
-the engine API (or the browser demo's `simulate(netlist, duration, step)`), so this
-one stays an engine-API writeup, backed by an `ohmforge-sim` regression test.
+The shell now *attaches* a sine with `set <ref> sine <amp> <freq>` and samples it
+with a **fixed-step** transient (`run tran <dur> <step>`), so a time-varying
+stimulus renders instead of reading flat. The half-wave rectifier's clean,
+numerically-verified waveform (peak ≈ 4.37 V, troughs blocked to ≈ 0 V) is still
+presented as an **engine-API** writeup, backed by an `ohmforge-sim` regression
+test and the browser demo's `simulate(netlist, duration, step)` — the canonical
+reference values come from there.
 
-> `.eesh` files are pure command lines — the shell has no comment syntax yet, so
-> the prose for each lives in the paired `.md`.
+> `.eesh` files here are kept as pure command lines so they are easy to read as
+> transcripts; when piped, the shell *does* accept `#` comments, `set`/`$vars`,
+> and `repeat` loops (the prose for each example lives in the paired `.md`).

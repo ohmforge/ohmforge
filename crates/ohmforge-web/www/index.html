@@ -53,6 +53,7 @@
           <a class="nav-link" href="#features">Features</a>
           <a class="nav-link" href="#gallery-sec">Examples</a>
           <a class="nav-link" href="#terminal">Terminal</a>
+          <a class="nav-link" href="https://github.com/ohmforge/ohmforge/tree/main/docs">Docs</a>
           <a class="nav-gh" href="https://github.com/ohmforge/ohmforge">
             <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
             GitHub
@@ -230,7 +231,7 @@
           <div class="section-head">
             <p class="eyebrow">Visual capture</p>
             <h2 class="section-title" id="canvas-h">Or draw it — place parts, wire them, simulate</h2>
-            <p class="section-lede">A schematic editor that serializes to the exact same netlist the engine runs — so what you draw is always what it simulates.</p>
+            <p class="section-lede">The same visual schematic capture you get in the terminal UI, running right in your browser — it serializes to the exact netlist the engine runs, so what you draw is always what it simulates.</p>
           </div>
           <section class="panel canvas-panel">
             <div class="cv-tools" id="cv-tools" role="toolbar" aria-label="Canvas tools">
@@ -279,27 +280,32 @@
             <div class="feature">
               <span class="ficon-wrap"><svg class="ficon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12h3l2 7 4-14 2 7h7"/></svg></span>
               <h3>SPICE-class analog</h3>
-              <p>A nodal solver for R, L, C, diodes, and sources — DC operating point plus transient, drawn as a braille scope.</p>
+              <p>A nodal solver for R, L, C, diodes, BJTs, op-amps and sources — DC operating point plus transient, drawn live as a braille scope.</p>
+            </div>
+            <div class="feature">
+              <span class="ficon-wrap"><svg class="ficon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 2 4 14h6l-1 8 9-12h-6z"/></svg></span>
+              <h3>Switch-mode power &amp; RF</h3>
+              <p>Buck and boost converters with PWM control, plus 2-port S-parameter analysis for RF and matching networks.</p>
             </div>
             <div class="feature">
               <span class="ficon-wrap"><svg class="ficon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1.5"/><path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3"/></svg></span>
               <h3>MCU co-simulation</h3>
-              <p>Co-simulate AVR, RP2040, STM32, and ESP32 firmware against the same nodes, so your code and your circuit share one clock.</p>
+              <p>Co-simulate AVR, RP2040, STM32 and ESP32 firmware against the same nodes, so your code and your circuit share one clock.</p>
+            </div>
+            <div class="feature">
+              <span class="ficon-wrap"><svg class="ficon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="2.2"/><path d="M7.8 7.8a6 6 0 0 0 0 8.4M16.2 7.8a6 6 0 0 1 0 8.4M4.9 4.9a10 10 0 0 0 0 14.2M19.1 4.9a10 10 0 0 1 0 14.2"/></svg></span>
+              <h3>Sensors &amp; actuators</h3>
+              <p>Drop-in sensor front-ends and actuator models wire straight into the circuit, so firmware reads and drives real signals.</p>
+            </div>
+            <div class="feature">
+              <span class="ficon-wrap"><svg class="ficon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M3 12h4l2-4 3 7 2-4h5"/><path d="M9 21h6M12 17v4"/></svg></span>
+              <h3>Instruments</h3>
+              <p>Read results as a braille oscilloscope, a Smith chart for impedance, or an eye diagram for signal integrity.</p>
             </div>
             <div class="feature">
               <span class="ficon-wrap"><svg class="ficon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l1.8 4.2L18 9l-4.2 1.8L12 15l-1.8-4.2L6 9l4.2-1.8z"/><path d="M5 17l.9 2.1L8 20l-2.1.9L5 23l-.9-2.1L2 20l2.1-.9z"/></svg></span>
               <h3>AI copilot</h3>
-              <p>Describe a change in plain English; the copilot edits the netlist, explains the operating point, and reviews your design.</p>
-            </div>
-            <div class="feature">
-              <span class="ficon-wrap"><svg class="ficon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 2 4 14h6l-1 8 9-12h-6z"/></svg></span>
-              <h3>Power, sensors &amp; RF</h3>
-              <p>Switching converters with PWM, sensor front-ends, and 2-port S-parameters with Smith-chart and eye-diagram views.</p>
-            </div>
-            <div class="feature">
-              <span class="ficon-wrap"><svg class="ficon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M13 15h4"/></svg></span>
-              <h3>Terminal + browser</h3>
-              <p>The whole workbench is a single Rust binary — run it as a TUI, a CLI, or compiled to WebAssembly in this very page.</p>
+              <p>Describe a change in plain English: the copilot edits the netlist, explains the operating point and reviews your design — offline with no API key, or against a live model.</p>
             </div>
           </div>
         </div>
@@ -326,7 +332,9 @@
 <span class="pr">$</span> cargo run -p ohmforge --bin of -- demo
 <span class="cm"># open the full terminal UI</span>
 <span class="pr">$</span> of tui
-<span class="cm"># let the AI copilot review your design</span>
+<span class="cm"># drop into the eesh shell — an interactive circuit REPL</span>
+<span class="pr">$</span> eesh
+<span class="cm"># offline AI copilot: review your design — no API key needed</span>
 <span class="pr">$</span> of review</pre>
           </div>
         </div>
@@ -351,16 +359,21 @@
     <!-- ---- Footer ----------------------------------------------- -->
     <footer class="site-footer">
       <div class="container foot-inner">
+        <div class="foot-top">
         <a class="brand" href="./" aria-label="ohmforge home">
           <svg class="mark" viewBox="0 0 64 64" aria-hidden="true"><use href="#of-mark" /></svg>
           <span class="name">ohm<b>forge</b></span>
         </a>
         <nav class="foot-links" aria-label="Footer">
           <a href="https://github.com/ohmforge/ohmforge">GitHub</a>
-          <a href="https://github.com/ohmforge/ohmforge#readme">Docs</a>
-          <a href="https://github.com/ohmforge/ohmforge/blob/main/LICENSE">License · MIT OR Apache-2.0</a>
+          <a href="https://github.com/ohmforge/ohmforge/tree/main/docs">Docs</a>
+          <a href="https://github.com/ohmforge/ohmforge/blob/main/CHANGELOG.md">Changelog</a>
+          <a href="https://github.com/ohmforge/ohmforge/blob/main/LICENSE-APACHE">License · Apache-2.0</a>
+          <a href="https://github.com/ohmforge/ohmforge/blob/main/CODE_OF_CONDUCT.md">Code of Conduct</a>
+          <a href="https://github.com/ohmforge/ohmforge/blob/main/SECURITY.md">Security</a>
         </nav>
-        <p class="tm">ohmforge is a trademark of its maintainers.</p>
+        </div>
+        <p class="tm">ohmforge is a trademark of its maintainers. Licensed under Apache-2.0.</p>
       </div>
     </footer>
 

@@ -26,7 +26,7 @@ The copilot is reachable from the binary:
 printf 'add V1 in gnd 5\nadd R1 in out 1k\nadd D1 out gnd\n' | of review
 
 # Live copilot (opt-in network transport):
-cargo run -p ohmforge --features http -- ask "design a 5 V to 3.3 V divider and check it"
+cargo run -p ohmforge --bin of --features http -- ask "design a 5 V to 3.3 V divider and check it"
 ```
 
 The live path reads the endpoint from `EE_BASE_URL`/`ANTHROPIC_BASE_URL` (below),

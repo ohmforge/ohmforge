@@ -18,7 +18,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.8.1"
 edition = "2021"
 rust-version = "1.79"
 license = "Apache-2.0"
@@ -34,16 +34,16 @@ categories = ["simulation", "science", "command-line-utilities"]
 # Path + version so `cargo publish` resolves a crates.io dependency while local
 # builds use the in-tree path. Versions track the workspace version.
 [workspace.dependencies]
-ohmforge-core        = { path = "crates/ohmforge-core", version = "0.7.0" }
-ohmforge-sim         = { path = "crates/ohmforge-sim", version = "0.7.0" }
-ohmforge-digital     = { path = "crates/ohmforge-digital", version = "0.7.0" }
-ohmforge-mcu         = { path = "crates/ohmforge-mcu", version = "0.7.0" }
-ohmforge-devices     = { path = "crates/ohmforge-devices", version = "0.7.0" }
-ohmforge-instruments = { path = "crates/ohmforge-instruments", version = "0.7.0" }
-ohmforge-fmt         = { path = "crates/ohmforge-fmt", version = "0.7.0" }
-ohmforge-tui         = { path = "crates/ohmforge-tui", version = "0.7.0" }
-ohmforge-shell       = { path = "crates/ohmforge-shell", version = "0.7.0" }
-ohmforge-ai          = { path = "crates/ohmforge-ai", version = "0.7.0" }
+ohmforge-core        = { path = "crates/ohmforge-core", version = "0.8.1" }
+ohmforge-sim         = { path = "crates/ohmforge-sim", version = "0.8.1" }
+ohmforge-digital     = { path = "crates/ohmforge-digital", version = "0.8.1" }
+ohmforge-mcu         = { path = "crates/ohmforge-mcu", version = "0.8.1" }
+ohmforge-devices     = { path = "crates/ohmforge-devices", version = "0.8.1" }
+ohmforge-instruments = { path = "crates/ohmforge-instruments", version = "0.8.1" }
+ohmforge-fmt         = { path = "crates/ohmforge-fmt", version = "0.8.1" }
+ohmforge-tui         = { path = "crates/ohmforge-tui", version = "0.8.1" }
+ohmforge-shell       = { path = "crates/ohmforge-shell", version = "0.8.1" }
+ohmforge-ai          = { path = "crates/ohmforge-ai", version = "0.8.1" }
 # Third-party (uncomment as milestones need them):
 # ratatui   = "0.28"
 # crossterm = "0.28"

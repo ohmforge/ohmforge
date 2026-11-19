@@ -4,17 +4,20 @@ Worked, **run-verified** examples. Each `.eesh` is a script the shell accepts on
 
 ## Running them
 
+The `ohmforge` crate builds two binaries — `eesh` (the shell) and `of` (the CLI)
+— so name the one you want with `--bin`.
+
 ```sh
 # analog circuits + tutorials: pipe the script into the shell
-cat examples/analog/rc_step.eesh | cargo run -p ohmforge
-cat examples/tutorial/sweep.eesh | cargo run -p ohmforge      # loops/$vars via the script engine
+cat examples/analog/rc_step.eesh | cargo run -p ohmforge --bin eesh
+cat examples/tutorial/sweep.eesh | cargo run -p ohmforge --bin eesh   # loops/$vars via the script engine
 
 # MCU / co-simulation: run as ohmforge-mcu examples
 cargo run -p ohmforge-mcu --example uno_blink
 cargo run -p ohmforge-mcu --example cosim_led
 
-# or use the built-in showcases
-cargo run -p ohmforge -- demo | bode | amp | cosim | tui
+# built-in showcases (one subcommand at a time)
+cargo run -p ohmforge --bin of -- demo    # also: bode | amp | cosim | view | tui
 ```
 
 ## Catalog

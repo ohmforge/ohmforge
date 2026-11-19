@@ -2,6 +2,8 @@
 
 We take the security of ohmforge seriously and appreciate responsible disclosure.
 
+> For non-security questions or general help, please use [`SUPPORT.md`](SUPPORT.md) instead — this file is only for reporting vulnerabilities.
+
 ## Reporting a vulnerability
 
 **Please do not report security vulnerabilities through public GitHub issues, pull requests, or discussions.**

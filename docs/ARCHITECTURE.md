@@ -9,7 +9,7 @@
 
 ```
                        ┌───────────────────────────────────────────┐
-                       │                  ee (bin)                   │
+                       │              of / eesh (bins)               │
                        │   app orchestration, config, session state  │
                        └───────┬───────────────┬───────────────┬─────┘
                                │               │               │
@@ -55,11 +55,11 @@ Everything below `ohmforge-instruments` is **pure compute, I/O-free, and WASM-ta
 | Crate | Responsibility |
 |---|---|
 | `ohmforge-core` | The shared data model: the circuit graph (nodes/branches/nets), physical **units & quantities** (typed volts/amps/ohms/farads…), simulation time, the event queue, engineering-notation value parsing (`4k7`, `1u`, `2n2`). No solver, no I/O. |
-| `ohmforge-sim` | Analog / mixed-signal engine: **Modified Nodal Analysis**, sparse linear solve, Newton–Raphson for nonlinear devices, numerical integration (Backward Euler, Trapezoidal, Gear) for **transient**, plus **DC op-point, DC sweep, AC small-signal, noise, Monte-Carlo, parametric sweep**. |
+| `ohmforge-sim` | Analog / mixed-signal engine: **Modified Nodal Analysis**, dense + **KLU-class sparse** linear solve, Newton–Raphson for nonlinear devices, Backward-Euler transient (adaptive + fixed step), plus **DC op-point, DC sweep, AC small-signal, noise, Monte-Carlo, parametric sweep, transfer-function/pole-zero, and 2-port S-parameters**; transformers (mutual inductance), transmission lines, and switch-mode power. |
 | `ohmforge-digital` | Event-driven digital logic (gates, flip-flops, counters, memories, buses) with propagation delays and multi-valued logic (`0/1/X/Z`). Optional **HDL-lite** for defining custom logic blocks. |
-| `ohmforge-mcu` | Instruction-accurate microcontroller cores and their peripherals; the **co-simulation bridge** that maps MCU pins onto sim nodes. Internal modules: `avr` (ATmega/ATtiny), `cortexm` (RP2040/STM32-class), `riscv` — one crate so the cores share the peripheral/bus and co-sim scaffolding; split into sub-crates only if compile time demands it. |
+| `ohmforge-mcu` | Instruction-accurate microcontroller cores and their peripherals; the **co-simulation bridge** that maps MCU pins onto sim nodes. Internal modules: `avr` (ATmega328P/2560), `cortexm` (RP2040 + STM32-class), `xtensa` (ESP32 LX6) — one crate so the cores share the peripheral/bus and co-sim scaffolding; split into sub-crates only if compile time demands it. |
 | `ohmforge-devices` | Concrete device models (R, L, C, sources, diode, BJT, MOSFET, op-amp, common ICs) and **board definitions** (Arduino Uno/Nano/Mega, RPi Pico, ESP32-class, custom boards) + a searchable **parts library**. |
-| `ohmforge-instruments` | Virtual instruments layered over the engines: oscilloscope, multimeter, function generator, logic analyzer, bench power supply, spectrum/Bode view. LabVIEW-style **virtual front panels**. |
+| `ohmforge-instruments` | Virtual instruments layered over the engines: oscilloscope, multimeter, function generator, logic analyzer, bench power supply, spectrum/Bode view, **Smith chart** and **eye diagram**, plus a dataflow patcher. LabVIEW-style **virtual front panels**. |
 | `ohmforge-fmt` | File formats & interop: native project format, **SPICE netlist** import/export, **KiCad** netlist read, Fritzing/CSV BOM export, waveform export (CSV/VCD). |
 | `ohmforge-tui` | The terminal UI (`ratatui` + `crossterm`): schematic renderer, high-res **braille** waveform plots, dockable panels, mouse placement, themes, help overlay. |
 | `ohmforge-shell` | `eesh`: the command language, parser, tab-completion, history, and an embedded scripting engine for automation. |
@@ -86,8 +86,9 @@ We build a system `A·x = z` where `x` holds unknown node voltages (and some bra
 
 ### Solver
 
-- Sparse matrix representation; **LU factorization** with partial pivoting. Start with a dependable dense/`faer`-backed path, then move hot circuits to a true sparse solver (KLU-style) as size grows.
-- Adaptive timestep (LTE-controlled) for transient; step limiting and `gmin`/source stepping to aid convergence — the classic SPICE robustness tricks.
+- **LU factorization** with partial pivoting. Small systems use a dependable dense path; above a size threshold the engine switches automatically to a **KLU-class sparse** solver (fill-reducing ordering + a reusable symbolic factorization), with results bit-identical to the dense path.
+- Adaptive timestep (LTE-controlled) for transient, or a fixed step; step limiting and `gmin`/source stepping to aid convergence — the classic SPICE robustness tricks.
+- An opt-in native `parallel` feature fans **independent analyses** (Monte-Carlo samples, DC/parametric sweep points) across OS threads via `std::thread`, with output identical to the single-threaded path.
 
 ### Analyses
 
@@ -100,6 +101,8 @@ We build a system `A·x = z` where `x` holds unknown node voltages (and some bra
 | **Noise** | Output noise spectral density. |
 | **Monte-Carlo / worst-case** | Vary component tolerances, characterize spread. |
 | **Parametric sweep** | Re-run any analysis across a parameter grid. |
+| **Transfer function / pole-zero** | `.TF`-style gain + the circuit's poles and (where tractable) transmission zeros. |
+| **S-parameters** | 2-port scattering parameters at a frequency, with a Smith-chart readout. |
 
 Results stream out as typed **signals** (time/frequency series) that instruments and the TUI consume without knowing solver internals.
 
@@ -115,9 +118,9 @@ The "run real firmware against a simulated circuit" capability — the thing tha
 
 ### Cores
 
-- **AVR** (`avr` module): instruction-accurate ATmega328P (Uno/Nano), ATmega2560 (Mega), ATtiny — decoder, register file, SRAM/flash/EEPROM, interrupt controller.
-- **Cortex-M** (`cortexm` module): the **RP2040 (Raspberry Pi Pico)** is a **Cortex-M0+ (ARMv6-M, Thumb subset)** — start there; STM32-class parts (Cortex-M3/M4, ARMv7-M/Thumb-2) extend the decoder later.
-- **RISC-V** (`riscv` module): RV32I(MC) for ESP32-C / modern boards.
+- **AVR** (`avr` module): instruction-accurate ATmega328P (Uno/Nano) and ATmega2560 (Mega) — decoder, register file, SRAM/flash, interrupt controller.
+- **Cortex-M** (`cortexm` module): the **RP2040 (Raspberry Pi Pico)**, a **Cortex-M0+ (ARMv6-M, Thumb)** core, plus an **STM32-class** part (**Cortex-M3/M4, Thumb-2** — MOVW/MOVT, UBFX/BFI, IT blocks, `.W` forms) on a disjoint GPIO pin block.
+- **Xtensa** (`xtensa` module): an **ESP32 (Xtensa LX6)** core over the flat CALL0 ABI subset (the windowed register machinery decodes to `Unknown`, documented). GPIO (`W1TS`/`W1TC`) crosses the same `PinIo` bridge.
 
 ### Peripherals
 
@@ -162,7 +165,7 @@ Instruments are consumers of signals + controllers of sources, presented as **fr
 - **Bench power supply** — programmable voltage/current-limited sources.
 - **Bode/spectrum analyzer** — from AC/noise analyses.
 
-Longer-term, a **dataflow patcher** (LabVIEW-style "wire instruments and processing blocks together") composes these into custom virtual benches — see [`FEATURES.md`](FEATURES.md).
+A **dataflow patcher** (LabVIEW-style "wire instruments and processing blocks together") composes these into custom virtual instruments with pass/fail test sequences, and the RF panels (Smith chart, eye diagram) render reflection/eye data — see [`FEATURES.md`](FEATURES.md).
 
 ---
 

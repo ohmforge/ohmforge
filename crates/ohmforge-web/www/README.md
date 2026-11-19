@@ -58,4 +58,4 @@ the parts editor, session-link sharing, and tab co-editing.
 
 ## License
 
-MIT OR Apache-2.0. ohmforge is a trademark of its maintainers.
+Apache-2.0. ohmforge is a trademark of its maintainers.

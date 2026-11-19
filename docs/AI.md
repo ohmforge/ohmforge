@@ -9,7 +9,7 @@ The copilot's job is to make EE *approachable* without being a black box. Its gu
 | **Ask** | "why is Q1 saturated?" | Explanation grounded in the *current* sim results (real node voltages/currents, not guesses). |
 | **Design** | "5V→3.3V, 500 mA, low ripple" | A netlist patch (parts + wiring + values) you can inspect, simulate, and apply/reject. |
 | **Debug** | "the LED won't light" | Reads sim output, localizes the fault, proposes a fix, re-simulates to confirm. |
-| **Firmware** | "fade the LED with PWM on the Uno" | An Arduino sketch, compiled into the emulator and co-simulated against your circuit. |
+| **Firmware** | "fade the LED with PWM on the Uno" | An Arduino sketch emitted as a validated **Intel HEX** image, staged for the co-sim bridge (`ohmforge-mcu`'s `load_firmware`); flashing it into a live emulator is a thin follow-up. |
 | **Explain / tutor** | "teach me how this filter works" | Step-through lesson over the live circuit, with suggested experiments. |
 
 ## How it works — tool-using and verified

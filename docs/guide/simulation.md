@@ -96,8 +96,12 @@ AC analysis uses a complex twin, `mna_complex::ComplexSystem` — the same
 elimination over `ohmforge_core::Complex`, pivoting on complex magnitude. `Complex` is
 hand-rolled (no `num-complex` dependency) so the compute core stays dependency-free.
 
-A dense solve is `O(n³)`; it is correct and clear for the circuit sizes here. A
-sparse (KLU-style) path is future work.
+A dense solve is `O(n³)`; it is correct and clear at small sizes. Above a size
+threshold the engine switches automatically to a **KLU-class sparse** path — a
+fill-reducing ordering plus a *reusable symbolic factorization*, so a transient
+or sweep that re-solves the same topology every step pays the ordering cost once.
+The sparse path is a bit-for-bit match to the dense one below the threshold, so
+nothing about the answer changes with size — only the speed.
 
 ---
 
@@ -233,7 +237,7 @@ conductance at the bias. The stimulus is a `1∠0` phasor on every source marked
 an AC drive (a source carrying a sine waveform); all other sources are quiet (a
 voltage source is a short, a current source an open). Returns one complex signal
 per node — the node-voltage phasor versus frequency, from which magnitude (dB) and
-phase follow. (Try `cargo run -p ohmforge bode`.)
+phase follow. (Try `cargo run -p ohmforge --bin of -- bode`.)
 
 ### Noise — [`Analysis::Noise { output, f_start, f_stop, points_per_decade }`]
 
@@ -275,9 +279,39 @@ are fixed by the circuit, so the same seed replays the identical samples bit for
 bit on every platform; a different seed gives a different-but-reproducible draw.
 Because each run perturbs from the original nominal values, draws never compound.
 
+### Transfer function / pole-zero and S-parameters
+
+Two further entry points are **methods on `Engine`** rather than `Analysis`
+variants, because they return structured reports rather than per-node signals:
+
+- **`Engine::transfer_function(circuit, output, source)`** linearizes about the
+  operating point and returns a SPICE-`.TF`-style report: the DC gain from the
+  named source to the output node, the circuit's **poles** (the roots of
+  `det(G + sC) = 0`, intrinsic to the circuit), and — where tractable — the
+  **transmission zeros** of the input→output path. In the shell: `run tf <node> <src>`.
+- **`Engine::s_parameters(circuit, port1, port2, z0, freq)`** computes the 2-port
+  **scattering parameters** at a reference impedance `z0` and frequency, and the
+  equivalent open-circuit `z` matrix. S11 feeds the Smith-chart panel. In the
+  shell: `run sparams <p1> <p2> [z0] [freq]`.
+
+## 8. Transformers and transmission lines
+
+Two structural relations extend the linear core without new data-carrying part
+kinds:
+
+- **Mutual inductance / transformers** — `Circuit::couple(l1, l2, k)` couples two
+  existing inductors with `M = k·√(L1·L2)`. It is stamped with a branch-current
+  row (robust even at the ideal `k = 1`, where an admittance companion's
+  inverse-`L` is singular) in **transient and AC**; isolated inductors keep their
+  exact companion, so the golden suite stays bit-for-bit.
+- **Transmission lines** — `Circuit::add_line(a, b, z0, delay)` adds a lossless
+  (Branin) or lossy line. These resolve in the **fixed-step** transient (a
+  transmission line needs a fixed timestep; the adaptive driver is never used
+  with lines) and in AC.
+
 ---
 
-## 8. Determinism and portability
+## 9. Determinism and portability
 
 The engine takes no wall-clock, no filesystem, and no OS entropy; its only
 randomness is the seeded Monte-Carlo PRNG. Node ordering is derived from a sorted

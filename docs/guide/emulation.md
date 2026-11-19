@@ -1,9 +1,14 @@
 # Microcontroller emulation & co-simulation
 
 This guide explains how ohmforge runs **real microcontroller firmware against a
-simulated circuit**: the two emulated cores (AVR and RP2040), their peripherals,
-how firmware is loaded, how an MCU pin is bridged to a circuit net, the
-mixed-signal boundary, and the lockstep co-simulation loop (`of cosim`).
+simulated circuit**: the emulated cores (AVR, RP2040, an STM32-class Cortex-M3/M4,
+and an ESP32 Xtensa LX6), their peripherals, how firmware is loaded, how an MCU
+pin is bridged to a circuit net, the mixed-signal boundary, and the lockstep
+co-simulation loop (`of cosim`).
+
+The worked examples in §8 cover the two most-used cores (AVR Uno and RP2040 Pico);
+the STM32 and ESP32 cores are exercised by hand-assembled blink programs in the
+crate's test suite.
 
 It is the user-facing companion to the architecture notes in
 [`../ARCHITECTURE.md`](../ARCHITECTURE.md) § "Board & MCU emulation" and the
@@ -95,6 +100,29 @@ An ARMv6-M (Thumb) core (`ohmforge_mcu::cortexm`):
 
 The [`Pico`](../../crates/ohmforge-mcu/src/cortexm/board.rs) board wraps the core at
 the RP2040's 125 MHz default with the Pico pin map.
+
+### Cortex-M3/M4 — STM32-class (Thumb-2)
+
+The same `cortexm` module extends the ARMv6-M decoder to a **Thumb-2** subset for
+an STM32-class part: the 32-bit instruction forms (`MOVW`/`MOVT`, `MUL`/`MLA`,
+`UBFX`/`BFI`, `IT` blocks, `LDM`/`STM.W`, `B.W`, `MRS`/`MSR`), with the 16-vs-32-bit
+split decided by the top bits of the first halfword. The
+[`Stm32`](../../crates/ohmforge-mcu/src/cortexm/board.rs) board exposes GPIO on a
+disjoint co-sim pin block; a hand-assembled blink toggles **PC13** (the common
+"blue pill" LED). Covered by the crate's decode and board tests rather than a
+runnable `--example`.
+
+### Xtensa LX6 — ESP32
+
+The [`xtensa`](../../crates/ohmforge-mcu/src/xtensa/) module models an **ESP32
+(Xtensa LX6)** core over the flat **CALL0** ABI: the RRR ALU/`MOV`/`RET`/`JX`
+group, `MOVI`/`ADDI`, the `L8`/`L16`/`L32` loads and stores, `L32R`, `J`, and the
+narrow (`.N`) forms; the windowed register-window machinery (`CALL4`/`ENTRY`, …)
+decodes to `Unknown`, documented as such. The
+[`Esp32`](../../crates/ohmforge-mcu/src/xtensa/board.rs) board's GPIO block
+(`OUT`/`ENABLE` + the `W1TS`/`W1TC` set/clear aliases) crosses the same `PinIo`
+bridge; a hand-assembled blink toggles **GPIO2**. Covered by the crate's decode
+and board tests.
 
 ---
 

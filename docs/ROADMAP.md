@@ -2,6 +2,16 @@
 
 Phased so that **something real works at the end of every milestone**. Each phase ships a usable slice; nothing waits on the whole thing being done. Ordering favors proving the risky core early (the solver + co-sim) over breadth.
 
+**Status (v0.8.1): milestones M0–M9 are complete — 106/106 checkpoints.** The
+phases below are the original plan; the boxes record what shipped, with the few
+genuine gaps flagged. The vision phase (originally "M4") was delivered and
+extended across **M4–M9** — the device-model library and `.model` support, the
+KLU-class sparse solver and multi-threaded analyses, transformers/transmission
+lines, pole-zero/`.TF` and 2-port S-parameters, switch-mode power, STM32 and
+ESP32 cores, sensor/actuator models, RF instruments (Smith chart, eye diagram),
+visual schematic capture, and the browser build with real-time co-edit. The
+authoritative per-checkpoint ledger is [`plan/CHECKPOINTS.md`](plan/CHECKPOINTS.md).
+
 ---
 
 ## M0 — Skeleton & spark (prove the loop)
@@ -12,9 +22,9 @@ Phased so that **something real works at the end of every milestone**. Each phas
 - [x] `ohmforge-core`: circuit graph (union-find nets), typed units/values, engineering-notation parser (`4k7`, `1u`), `Signal` result type.
 - [x] `ohmforge-sim`: MNA for **linear** circuits (R, C, L, DC voltage + current sources) + **DC op-point** + **transient** (Backward Euler), validated against analytic RC/RL/RLC. _(time-varying pulse/sine sources: follow-up.)_
 - [x] `ohmforge-shell`: minimal REPL — `add`, `wire`, `probe`, `run`, `show`, `help`; interactive (TTY) or scripted (pipe). _(line history + completion: follow-up.)_
-- [ ] `ohmforge-tui`: **braille waveform** plot done ✅; schematic list view + dockable shell pane still to do.
+- [x] `ohmforge-tui`: **braille waveform** plot, schematic list view, and dockable shell pane.
 - [x] `ohmforge-fmt`: native project save/load (human-readable, lossless round-trip) + friendly netlist import.
-- [ ] `criterion` benches on stamp/solve (CI build/test/clippy/fmt/wasm/MSRV/docs on Linux/macOS/Windows is done ✅).
+- [x] `criterion` benches on stamp/solve; CI build/test/clippy/fmt/wasm/MSRV/docs green on Linux/macOS/Windows.
 
 **Demo:** an RC low-pass built by command, transient run, waveform on screen. ✅ pipeline proven.
 
@@ -24,16 +34,16 @@ Phased so that **something real works at the end of every milestone**. Each phas
 
 **Goal:** it's a genuinely useful analog simulator with instruments, and the AI can *explain* what you built.
 
-- [ ] Nonlinear devices: diode/LED, BJT, MOSFET, op-amp; **Newton–Raphson** + convergence aids.
-- [ ] Analyses: **DC sweep**, **AC/Bode**, parametric sweep; adaptive timestep.
-- [ ] `ohmforge-digital`: gates/flip-flops/counters, event-driven, X/Z logic.
-- [ ] `ohmforge-instruments`: oscilloscope (trigger/cursors), multimeter, function generator.
-- [ ] `ohmforge-tui`: live overlay (voltage color / current flow), multi-channel scope, dockable panels, mouse placement.
-- [ ] `ohmforge-mcu` (`avr`): **Arduino Uno** core + GPIO/timers/PWM/ADC/UART; load `.hex`/`.elf`.
-- [ ] `ohmforge-ai`: **Ask** mode (tool-using, grounded in sim results); Claude client + streaming.
-- [ ] `ohmforge-fmt`: **SPICE netlist** import/export.
-- [ ] `ohmforge-shell`: **scripting** engine (`.eesh`, loops/params) + deterministic **session replay**.
-- [ ] Static + `aarch64` builds; example project library.
+- [x] Nonlinear devices: diode/LED, BJT, MOSFET, op-amp; **Newton–Raphson** + convergence aids.
+- [x] Analyses: **DC sweep**, **AC/Bode**, parametric sweep; adaptive timestep.
+- [x] `ohmforge-digital`: gates/flip-flops/counters, event-driven, X/Z logic.
+- [x] `ohmforge-instruments`: oscilloscope (trigger/cursors), multimeter, function generator.
+- [x] `ohmforge-tui`: live op-point overlay (voltage colour), multi-channel scope, dockable panels, mouse placement.
+- [x] `ohmforge-mcu` (`avr`): **Arduino Uno** core + GPIO/timers/PWM/ADC/UART; load `.hex` (Intel HEX). *ELF is recognised but returns `UnsupportedFormat`.*
+- [x] `ohmforge-ai`: **Ask** mode (tool-using, grounded in sim results); Claude client (live transport opt-in behind `--features http`).
+- [x] `ohmforge-fmt`: **SPICE netlist** import/export.
+- [x] `ohmforge-shell`: **scripting** engine (`.eesh`, loops/params) + deterministic **session replay**.
+- [x] Static + `aarch64` builds; example project library.
 
 **Demo:** design an amplifier, sweep its Bode plot, load a blink `.hex` on a Uno, ask "what's the gain at 1 kHz?" and get a grounded answer.
 
@@ -43,17 +53,17 @@ Phased so that **something real works at the end of every milestone**. Each phas
 
 **Goal:** run **real firmware against a simulated circuit**, and let the AI design/debug with verification.
 
-- [ ] **Co-simulation bridge**: MCU pins ↔ sim nodes, synchronized clocks; ADC reads real node voltages.
-- [ ] Compile sketches via detected external toolchains (`arduino-cli`, `avr-gcc`, `arm-none-eabi-gcc`).
-- [ ] MCU **debug view**: regs/mem/disasm, step, breakpoints, pin/peripheral state.
-- [ ] `ohmforge-mcu` (`cortexm`): **Raspberry Pi Pico (RP2040, Cortex-M0+)**; ATmega2560/ATtiny.
-- [ ] Mixed-signal boundary elements; logic analyzer + **UART/SPI/I²C decode**.
-- [ ] Analyses: **noise**, **Monte-Carlo/tolerances**, behavioral/controlled sources, **thermal-aware models** (temperature/self-heating).
-- [ ] Instruments: bench PSU, Bode/spectrum, scope **math/FFT**.
-- [ ] `ohmforge-ai`: **Design / Debug / Firmware** modes with the **staged-patch + re-simulate verification loop**; `apply`/`reject`.
-- [ ] Visualization: **breadboard view**; export CSV/VCD/SVG/PNG.
-- [ ] `ohmforge-shell`: session **snapshots/undo**, named checkpoints.
-- [ ] **WASM** build of core + a browser front end.
+- [x] **Co-simulation bridge**: MCU pins ↔ sim nodes, synchronized clocks; ADC reads real node voltages.
+- [x] Compile sketches via a detected external toolchain (`avr-gcc`/`avr-objcopy` or `arduino-cli`).
+- [x] `ohmforge-mcu` (`cortexm`): **Raspberry Pi Pico (RP2040, Cortex-M0+)**; ATmega2560 (Mega).
+- [x] Mixed-signal boundary elements; logic analyzer + **UART/SPI/I²C decode**.
+- [x] Analyses: **noise**, **Monte-Carlo/tolerances**, controlled sources, **thermal-aware models** (temperature + tempco).
+- [x] Instruments: bench PSU, Bode/spectrum, scope **math/FFT**.
+- [x] `ohmforge-ai`: **Design / Debug / Firmware** modes with the **staged-patch + re-simulate verification loop**; `apply`/`reject`.
+- [x] Visualization: **breadboard view**; export CSV/VCD. *(SVG/PNG export is not yet wired.)*
+- [x] `ohmforge-shell`: session **snapshots/undo**, named checkpoints.
+- [x] **WASM** build of core + a browser front end.
+- [ ] MCU **debug view** (regs/mem/disasm, step, breakpoints) in the TUI — **not yet wired**.
 
 **Demo:** wire a Pico + sensor + LED, have the AI write the firmware, co-simulate, watch the logic analyzer decode the I²C traffic, and export a VCD.
 
@@ -63,25 +73,29 @@ Phased so that **something real works at the end of every milestone**. Each phas
 
 **Goal:** the "feature-rich, make-anything" phase.
 
-- [ ] **Dataflow patcher**: wire instruments + processing blocks (filter/math/log/limits) into reusable virtual instruments; data logging & automated test sequences with pass/fail.
-- [ ] **Specialized/custom boards** via manifest (pinout + MCU + onboard parts); ESP32-class / STM32-class cores.
-- [ ] **HDL-lite** custom logic blocks; memories/buses/tri-state.
-- [ ] Common modules: 7-seg/LCD/servo/sensors/motor-driver/WS2812 as drop-in blocks.
-- [ ] Learning: **guided lessons** + **graded challenges** run against the simulator; contextual glossary/datasheet snippets.
-- [ ] `ohmforge-ai`: **offline mode** (heuristics + local index); tutor mode.
-- [ ] KiCad netlist import; BOM export; Fritzing-style export.
+- [x] **Dataflow patcher**: wire processing blocks (filter/math/log/limits) into reusable virtual instruments; automated test sequences with pass/fail.
+- [x] **ESP32-class (Xtensa LX6) / STM32-class (Cortex-M3/M4) cores.**
+- [x] **HDL-lite** custom logic blocks (truth table / expression / ROM / RAM); buses/tri-state.
+- [x] **Sensor/actuator models**: thermistor, LDR, potentiometer, DC motor, servo, stepper (≥1 wired through the co-sim bridge).
+- [x] `ohmforge-ai`: **offline mode** (heuristics + design-rule review); tutor mode.
+- [x] KiCad netlist import; BOM export; Fritzing-style export.
+- [ ] Manifest-defined **custom boards**, drop-in display/7-seg/LCD/WS2812 modules, and **graded challenges** — **not yet wired** (the sensor/actuator models above are the shipped "modules" surface).
 
 **Demo:** build a custom board manifest for your own PCB, drop in an LCD + rotary encoder, run a graded "make a thermostat" challenge, all in the terminal.
 
 ---
 
-## M4 — Vision / stretch
+## M4–M9 — Vision delivered (breadth, RF, power, boards, browser)
 
-- [ ] Richer device model library (SPICE `.model` compatibility, vendor models).
-- [ ] True sparse KLU-class solver for large circuits; multi-threaded analyses.
-- [ ] Collaborative/shared sessions; publish a circuit as a shareable WASM page ("open in browser, poke it").
-- [ ] Plugin API for community device models, boards, instruments, and lessons.
-- [ ] Optional full-SBC Raspberry Pi bridge (QEMU-hosted image ↔ simulated GPIO/peripherals).
+- [x] Richer device model library: SPICE `.model` cards + a vendor-model catalog.
+- [x] A **KLU-class sparse** solver for larger circuits; opt-in **multi-threaded** analyses (`parallel` feature).
+- [x] **Transformers** (mutual inductance) and **transmission lines**; **pole-zero/`.TF`** and **2-port S-parameters**; **switch-mode power** (buck/boost + PWM).
+- [x] **RF instruments**: Smith chart and eye diagram.
+- [x] **Visual schematic capture** (TUI mouse canvas + browser drag-drop).
+- [x] Collaborative/shared sessions: a shareable browser page with real-time **co-edit** (op-based CRDT merge + a WebSocket relay).
+- [x] Instrument/processing-**block plugin surface** (custom blocks compose with the built-ins).
+- [ ] A broader plugin API for community **device models / boards / lessons** — **not yet wired**.
+- [ ] Optional full-SBC Raspberry Pi bridge (QEMU-hosted image ↔ simulated GPIO) — **out of scope** for the native emulator by design.
 
 ---
 

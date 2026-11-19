@@ -2,25 +2,67 @@
 
 `eesh` is a dedicated REPL for building, wiring, probing, running, and reasoning about circuits. It's keyboard-first, scriptable, and speaks the same API the TUI and AI use — so anything you can click or ask for, you can type, and vice-versa.
 
-## Implemented today (M1/M2)
+## Implemented today
 
-The grammar below (under "Command families") is the **design target**. What ships and is tested today is a focused subset — see [`tutorials/getting-started.md`](tutorials/getting-started.md) for a worked session:
+This is the full grammar the shell ships and tests today — it matches the
+binary's own `help`. Part kind is inferred from the reference's first letter.
+See [`tutorials/getting-started.md`](tutorials/getting-started.md) for a worked
+session.
 
-```
-add <ref> <nodeA> <nodeB> <value>   # kind from the ref's first letter: R C L V I D
-wire <nodeA> <nodeB>                 # merge two named nets
+```text
+# build
+add <ref> <a> <b> [value]            # R/C/L/V/I (2-terminal); D (diode, value = I_s, optional)
+add Q<n> <c> <b> <e> [npn|pnp]       # BJT (collector base emitter)
+add M<n> <d> <g> <s> [nmos|pmos]     # MOSFET (drain gate source)
+add E/G <o+> <o-> <c+> <c-> <k>      # VCVS (V/V) / VCCS (A/V)
+add H/F <o+> <o-> <k> <Vctrl>        # CCVS (V/A) / CCCS (A/A)
+wire <a> <b>                         # merge two named nodes into one net
+remove <ref>                         # delete a placed part
 probe <node>                         # mark a node to plot on the next run
-run [tran [<dur>]] | run op          # transient (braille scope) or DC operating point
-show                                 # list placed parts
-undo · checkpoint <name> · restore <name>
+
+# parameters & stimuli
+set <ref>.value <value>              # retarget a component value (live-tunable)
+set <ref> dc <v>                     # DC source level
+set <ref> sine <amp> <freq> [off] [phase]    # attach a sine drive (AC/Bode/transient)
+set <ref> pulse <v1> <v2> <d> <w> <per>      # attach a pulse drive
+set tol|tempco <ref> <n>             # per-part tolerance (Monte-Carlo) / temperature coefficient
+set temp <celsius>                   # circuit operating temperature
+
+# analyses
+run tran [<dur> [<step>]]            # transient (default 1 ms); a fixed <step> samples sine/PWM
+run op                               # DC operating-point node-voltage table
+run ac <f0> <f1> [ppd]               # small-signal AC sweep (Bode per probe)
+run dc <src> <start> <stop> <step>   # DC sweep of a source's level
+run noise <node> <f0> <f1> [ppd]     # output-referred noise PSD
+run mc <node> <runs> [seed]          # Monte-Carlo tolerance spread
+run tf <node> <src>                  # transfer function / pole-zero report
+run sparams <p1> <p2> [z0] [freq]    # 2-port S-parameters + Smith chart
+
+# session
+show                                 # list the placed parts
+undo                                 # revert the last add/wire/probe/set
+checkpoint <name> · restore <name>   # named snapshot / jump back to it
+save <path> · load <path>            # write / replace the whole session
 help
 ```
 
-- **Part kind is inferred from the reference's first letter** (`R1`→resistor, `C1`→capacitor, `V1`→source, …); there is no `<type>` token yet. 3-/4-terminal and controlled devices (BJT/MOSFET/VCVS/…) are modeled by the engine but not yet placeable from this grammar — build those via the netlist/project formats or the engine API.
-- **Scripting** (`set`, `repeat … { }`, `$vars`, deterministic replay) and **comments** (`#`) run through the script engine: pipe a file in — `ee < script.eesh` or `cat script.eesh | ee`. The interactive REPL runs one command per line.
-- The binary also has non-REPL showcases: `of demo` (RC scope), `of bode`, `of amp`, `of cosim`, and `of tui` (interactive panels).
+- **Scripting runs when you pipe a file on stdin.** `#` comments, `set <var>`
+  bindings, `$var`/`${var}` expansion, and `repeat <n> [as <v>] { … }` loops are
+  handled by the embedded script engine, which expands a script into a flat
+  command list for **deterministic replay**:
+  `eesh < script.eesh` or `cat script.eesh | eesh`
+  (equivalently `cargo run -p ohmforge --bin eesh` from source). The interactive
+  REPL runs one command per line.
+- **Transformers and transmission lines** are circuit-level relations
+  (`Circuit::couple`, `Circuit::add_line`) placed through the engine API and the
+  project/SPICE formats, not through an `eesh` verb yet.
+- The `of` binary also has non-REPL showcases: `of demo` (RC scope), `of bode`,
+  `of amp`, `of cosim`, `of view`, and `of tui` (interactive panels); and the
+  copilot (`of review`/`of drc` offline, `of ask` live).
 
-Everything from here down is the broader design the shell is growing toward; not all of it is wired yet.
+Everything from here down is the broader design the shell is growing toward; the
+`add`/`wire`/`set`/`run`/session grammar above is what is wired today, and the
+richer project/board/AI verbs below are the design target.
 
 ## Design principles
 
@@ -109,6 +151,10 @@ help [<command>]
 ```
 
 ## A worked session
+
+> This illustrates the **design-target** grammar above, not the shipped verbs.
+> For a session you can run today, see
+> [`tutorials/getting-started.md`](tutorials/getting-started.md).
 
 ```eesh
 new project rc-lowpass

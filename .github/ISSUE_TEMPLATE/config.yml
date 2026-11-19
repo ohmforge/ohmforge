@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions & discussion
+    url: https://github.com/ohmforge/ohmforge/discussions
+    about: Ask how to do something, get help, or propose an idea. Please use Discussions for questions rather than opening an issue.
+  - name: Security vulnerability
+    url: https://github.com/ohmforge/ohmforge/security/advisories/new
+    about: Report a security issue privately. Do NOT open a public issue — see SECURITY.md.
+  - name: Documentation
+    url: https://github.com/ohmforge/ohmforge/blob/main/docs/README.md
+    about: Browse the guides, tutorial, and reference before filing.

@@ -7,14 +7,16 @@ checkpoints let you explore without fear.
 
 Everything here is real, verified output from the current build. The runnable
 scripts live in [`examples/tutorial/`](../../examples/tutorial); each command
-block was produced by piping the matching file through the `of` binary.
+block was produced by piping the matching file through the `eesh` binary. The
+`ohmforge` crate builds two binaries (`of` and `eesh`), so from source you name
+the one you want with `--bin`.
 
 ## Starting the shell
 
-Run the binary with no arguments for an interactive prompt:
+Run the shell binary with no arguments for an interactive prompt:
 
 ```console
-$ cargo run -p ohmforge
+$ cargo run -p ohmforge --bin eesh
 eesh> add R1 in out 1k
 added R1
 eesh> help
@@ -25,7 +27,7 @@ eesh> help
 line in order, printing output to stdout:
 
 ```console
-$ cat examples/tutorial/divider.eesh | cargo run -p ohmforge
+$ cat examples/tutorial/divider.eesh | cargo run -p ohmforge --bin eesh
 ```
 
 That is exactly how every transcript below was captured.
@@ -62,7 +64,7 @@ show
 ```
 
 ```console
-$ cat examples/tutorial/divider.eesh | cargo run -p ohmforge
+$ cat examples/tutorial/divider.eesh | cargo run -p ohmforge --bin eesh
 added V1
 added R1
 added R2
@@ -106,7 +108,7 @@ show
 high-resolution **braille scope**:
 
 ```console
-$ cat examples/tutorial/rc_lowpass.eesh | cargo run -p ohmforge
+$ cat examples/tutorial/rc_lowpass.eesh | cargo run -p ohmforge --bin eesh
 added V1
 added R1
 added C1
@@ -178,7 +180,7 @@ show
 ```
 
 ```console
-$ cat examples/tutorial/checkpoints.eesh | cargo run -p ohmforge
+$ cat examples/tutorial/checkpoints.eesh | cargo run -p ohmforge --bin eesh
 added V1
 added R1
 added C1
@@ -253,12 +255,13 @@ Because the expanded list is deterministic and `execute` is pure, the run is
 replaying the recording against a fresh shell reproduces a byte-identical
 transcript — ideal for tutorials, regression tests, and bug reports.
 
-> **Note.** Loop/parameter scripts run through the scripting engine
-> (`Shell::run_script`). The plain command-only scripts above (`divider.eesh`,
-> `rc_lowpass.eesh`, `checkpoints.eesh`) also run line-by-line straight through
-> the `of` binary's stdin; a `.eesh` file that uses `#` comments, `set`,
-> `repeat`, or `$vars` needs the scripting engine. (A `source <file>` verb that
-> routes a piped file through the engine is on the roadmap.)
+> **Note.** A piped `.eesh` file always runs through the scripting engine
+> (`Shell::run_script`), so `#` comments, `set <var>`, `$vars`, and `repeat`
+> loops work in every piped script — including the plain ones above
+> (`divider.eesh`, `rc_lowpass.eesh`, `checkpoints.eesh`). The difference is the
+> *interactive* REPL on a TTY, which runs one plain command per line and does not
+> expand loops or variables. (A `source <file>` verb that routes a file through
+> the engine from inside the REPL is on the roadmap.)
 
 ## Where to next
 

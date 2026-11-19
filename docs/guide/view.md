@@ -1,4 +1,4 @@
-# Debugging things for the view
+# Seeing a circuit: the TUI and instruments
 
 This guide is about *looking* at a circuit: the interactive `of tui` and the
 virtual instruments you drive from it. Where [getting started](../tutorials/getting-started.md)
@@ -12,7 +12,7 @@ implementation and its tests.
 ## The interactive TUI (`of tui`)
 
 ```console
-$ cargo run -p ohmforge tui
+$ cargo run -p ohmforge --bin of -- tui
 ```
 
 takes over the terminal (raw mode, alternate screen, mouse capture) and runs the
@@ -69,8 +69,19 @@ selection, `Enter` to run it, `Esc` to close. The commands are:
 | `focus schematic` / `focus scope` / `focus shell` | jump focus to a panel |
 | `grow panel` / `shrink panel` | resize the focused panel at its neighbours' expense |
 | `toggle overlay` | switch the left panel between the schematic list and the op-point overlay |
+| `edit mode` | toggle keyboard topology editing on the schematic |
+| `capture mode` | toggle mouse schematic capture (place / move / wire on a grid canvas) |
 | `clear log` | empty the shell log |
 | `quit` | exit the app |
+
+### Schematic capture (mouse)
+
+`capture mode` turns the schematic panel into a grid **canvas**: left-click places
+the selected part kind, drag to move a placed part, and drag between two terminals
+to draw a wire. Every edit lowers to the same shared `EditAction` path the shell
+uses, so a mouse-placed part is `undo`-able exactly like a typed `add` — the
+canvas never keeps a parallel model of the circuit. (The browser build has the
+same drag-and-drop canvas.)
 
 ### A debugging loop
 
@@ -233,6 +244,29 @@ Three transport decoders turn channels into frames, each degrading gracefully
 (baud, SPI mode, bit order) — the decoders are exact on a correct capture, so a
 wrong setting is usually the cause, and the framing/ACK flags point at where the
 bus actually broke.
+
+### RF panels — Smith chart & eye diagram
+
+Two panels render RF/signal-integrity data (and pair with the engine's
+`run sparams` and transient outputs):
+
+- **Smith chart** — plots a reflection coefficient Γ (or S11) on the Smith grid.
+  A matched load (Γ = 0) lands dead centre, a short (Γ = −1) at the left rim and
+  an open (Γ = +1) at the right rim, with reactive loads around the rim; Γ and the
+  normalized impedance round-trip. Feed it S11 from `run sparams`.
+- **Eye diagram** — folds a bitstream or periodic signal onto one symbol period
+  so jitter and inter-symbol interference show as a closing "eye." An alternating
+  NRZ pattern opens a full-swing eye crossing at mid-level; a constant signal has
+  no open eye.
+
+Both render from *provided* data (a Γ/S-parameter value, a signal buffer), so they
+are deterministic and testable with no live terminal.
+
+### Breadboard view
+
+The TUI can also render the circuit as a **breadboard layout** — the "what it
+looks like physically" view — for teaching and for sanity-checking a wiring plan
+against the schematic.
 
 ## See also
 

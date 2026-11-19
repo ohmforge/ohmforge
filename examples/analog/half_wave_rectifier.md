@@ -8,11 +8,12 @@
  gnd
 ```
 
-> **Shell limitation.** This circuit needs a *time-varying (sine) source*. The
-> engine models it ([`ohmforge_core::Waveform::Sine`], driven in transient by
-> [`Analysis::Transient`]), but the current stdin shell grammar can only `add` DC
-> sources, so this example is driven through the **engine API** rather than an
-> `.eesh` script. See the note at the bottom of [`diode.md`](diode.md).
+> **Why the engine API.** This circuit needs a *time-varying (sine) source*. The
+> shell can attach one (`set V1 sine 5 1k`) and sample it with a fixed-step
+> transient (`run tran <dur> <step>`), but the clean, numerically-verified
+> rectified waveform below is presented through the **engine API** — it is the
+> form backed directly by an `ohmforge-sim` regression test, so the peak/trough
+> figures are canonical. See the note at the bottom of [`diode.md`](diode.md).
 
 ## The circuit
 

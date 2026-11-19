@@ -24,9 +24,9 @@
 > cat examples/analog/common_emitter_bjt.eesh | cargo run -p ohmforge --bin eesh
 > ```
 >
-> The same bias is also the built-in `cargo run -p ohmforge amp` demo, and is
-> exercised by the `bjt_common_emitter_bias` and `bjt_ce_small_signal_gain`
-> regression tests in `ohmforge-sim`.
+> The same bias is also the built-in `cargo run -p ohmforge --bin of -- amp`
+> demo, and is exercised by the `bjt_common_emitter_bias` and
+> `bjt_ce_small_signal_gain` regression tests in `ohmforge-sim`.
 
 ## The circuit
 
@@ -51,7 +51,7 @@ Newton–Raphson over the full 3×3 Ebers–Moll Jacobian (two junction diodes p
 the transport source), with the gmin / source-stepping convergence aids available
 if the cold-start guess is too far off.
 
-## Expected result (verified — `cargo run -p ohmforge amp`)
+## Expected result (verified — `cargo run -p ohmforge --bin of -- amp`)
 
 ```
   Vb = 2.00 V   Vc = 9.09 V   Ve = 1.33 V   →   Vbe = 0.662 V, Ic ≈ 1.33 mA (active region)
