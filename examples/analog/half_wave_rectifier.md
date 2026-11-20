@@ -8,12 +8,28 @@
  gnd
 ```
 
-> **Why the engine API.** This circuit needs a *time-varying (sine) source*. The
-> shell can attach one (`set V1 sine 5 1k`) and sample it with a fixed-step
-> transient (`run tran <dur> <step>`), but the clean, numerically-verified
-> rectified waveform below is presented through the **engine API** — it is the
-> form backed directly by an `ohmforge-sim` regression test, so the peak/trough
-> figures are canonical. See the note at the bottom of [`diode.md`](diode.md).
+> **Two ways to run this.** The shell reproduces it directly (see below) — attach
+> a sine with `set V1 sine 5 1k` and pin a fixed timestep so the waveform is
+> sampled uniformly (`run tran 3m 10u`); `v(out)` then tracks the rectified crests
+> over `[0, ~4.37 V]`, matching the **engine-API** form that follows. The engine
+> form is the same circuit backed directly by an `ohmforge-sim` regression test,
+> so its peak/trough figures are canonical.
+
+## Run it in the shell (`eesh`)
+
+```text
+add V1 in gnd 5
+set V1 sine 5 1k        # 5 V, 1 kHz sine stimulus
+add D1 in out           # diode: anode = in, cathode = out
+add R1 out gnd 10k
+probe out
+run tran 3m 10u         # a fixed 10 µs step samples the sine uniformly
+show
+```
+
+`v(out)` rectifies to `[0, ~4.37 V]` (the 5 V crest minus the ~0.63 V junction
+drop); the negative half-cycles are blocked and the load pulls `out` to 0 V. A
+fixed `<step>` matters here — the adaptive default can stride past a fast source.
 
 ## The circuit
 
