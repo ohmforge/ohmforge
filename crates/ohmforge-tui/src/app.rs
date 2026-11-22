@@ -974,7 +974,7 @@ impl<B: Backend> App<B> {
 
     /// The scope's cursor measurement — Δt, Δv (on channel 0) and the implied
     /// frequency `1/Δt` — read from the cached capture at the two cursor indices
-    /// via the real [`Oscilloscope`](ohmforge_instruments::Oscilloscope). `None`
+    /// via the real [`Oscilloscope`]. `None`
     /// when no transient is loaded. Pure — no tty (`CP-UX-M10.1`).
     pub fn cursor_readout(&self) -> Option<CursorReadout> {
         self.build_scope(72, 6, true).and_then(|s| s.measure())
