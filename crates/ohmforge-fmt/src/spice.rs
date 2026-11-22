@@ -16,6 +16,17 @@
 //!   (farads), `L` (henries), `V` (volt source), `I` (current source). Each is a
 //!   two-terminal device written `Ref node1 node2 value`; sources also accept an
 //!   optional `DC`/`AC` keyword before the value (`Vxxx n+ n- [DC] value`).
+//! * **Time-varying source stimuli (`CP-AF-M10.1`).** A `V`/`I` source may carry
+//!   a `SINE(...)` or `PULSE(...)` transient spec in place of a plain magnitude,
+//!   attaching a [`Waveform`] to the part so an imported
+//!   deck simulates in the transient/AC engines:
+//!   * `SINE(offset amplitude freq [delay theta phase])` →
+//!     [`Waveform::Sine`]. The `delay`/`theta`
+//!     damping terms have no engine analogue and are ignored; the DC/op value is
+//!     the `offset`. `SIN(...)` is accepted as a spelling of `SINE(...)`.
+//!   * `PULSE(v1 v2 [delay trise tfall width period])` →
+//!     [`Waveform::Pulse`]. The engine's pulse has
+//!     ideal edges, so `trise`/`tfall` are ignored; the DC/op value is `v1`.
 //! * **Ground** is node `0` (the SPICE convention); `gnd`/`ground` are also
 //!   accepted. Every other node name allocates a net, and reusing a name wires
 //!   parts together (as in the friendly netlist).
@@ -101,7 +112,9 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{self, Write as _};
 
-use ohmforge_core::graph::{BjtModel, Circuit, DiodeModel, MosfetModel, NetId, PartKind, Polarity};
+use ohmforge_core::graph::{
+    BjtModel, Circuit, DiodeModel, MosfetModel, NetId, PartKind, Polarity, Waveform,
+};
 use ohmforge_core::units::Unit;
 use ohmforge_core::value::Value;
 
@@ -127,6 +140,10 @@ pub enum ErrorKind {
     MissingValue,
     /// The value field could not be parsed as a SPICE magnitude.
     BadValue(String),
+    /// A `SINE(...)`/`PULSE(...)` source stimulus was malformed (missing a
+    /// closing paren, too few parameters, or a non-numeric parameter). The reason
+    /// is a short human description.
+    BadWaveform(String),
     /// Two parts share a reference designator.
     DuplicateReference(String),
     /// A `.model` card could not be parsed (missing name/type, unknown type, or a
@@ -180,6 +197,7 @@ impl fmt::Display for ErrorKind {
             }
             ErrorKind::MissingValue => write!(f, "missing value after element nodes"),
             ErrorKind::BadValue(tok) => write!(f, "bad value {tok:?}"),
+            ErrorKind::BadWaveform(why) => write!(f, "malformed source waveform: {why}"),
             ErrorKind::DuplicateReference(r) => write!(f, "duplicate element reference {r:?}"),
             ErrorKind::MalformedModel(why) => write!(f, "malformed .model card: {why}"),
             ErrorKind::BadDeviceLine {
@@ -467,6 +485,19 @@ fn parse_element(ctx: &mut Ctx, text: &str, line: usize) -> Result<(), SpiceErro
                     rest = &rest[1..];
                 }
             }
+            // A `V`/`I` source may carry a `SINE(...)`/`PULSE(...)` transient spec
+            // instead of (or trailing) a plain magnitude. Its bias sets the part's
+            // DC value; the full stimulus becomes the part's [`Waveform`].
+            let is_source = matches!(kind, PartKind::VoltageSource | PartKind::CurrentSource);
+            if is_source {
+                let tail = rest.join(" ");
+                if let Some((waveform, dc)) = parse_source_waveform(&tail, line)? {
+                    ctx.circuit
+                        .add_part(reference, kind, Some(Value::new(dc, unit)), vec![a, b]);
+                    ctx.circuit.set_waveform(reference, waveform);
+                    return Ok(());
+                }
+            }
             let value_tok = rest
                 .first()
                 .ok_or_else(|| err(line, ErrorKind::MissingValue))?;
@@ -557,6 +588,85 @@ fn parse_ccontrolled(
     };
     ctx.circuit.add_part(reference, kind, None, terminals);
     Ok(())
+}
+
+/// Parse a `V`/`I` source's optional `SINE(...)`/`PULSE(...)` transient stimulus
+/// from the text trailing its nodes (and any `DC`/`AC` keyword).
+///
+/// Returns `Ok(Some((waveform, dc)))` when `tail` is a recognized stimulus —
+/// `dc` is the bias the part's [`Value`] should carry (the sine `offset`, the
+/// pulse `v1`), which is also the operating-point value. Returns `Ok(None)` when
+/// `tail` is not a `SINE`/`PULSE` spec, so the caller falls back to parsing a
+/// plain magnitude. A malformed spec is an [`ErrorKind::BadWaveform`].
+///
+/// Parameters are whitespace- and/or comma-separated and accept the same SPICE
+/// magnitude suffixes as element values. SPICE carries terms the engine's
+/// waveforms do not model (a sine `delay`/`theta`, a pulse `trise`/`tfall`);
+/// those are parsed positionally and ignored.
+fn parse_source_waveform(tail: &str, line: usize) -> Result<Option<(Waveform, f64)>, SpiceError> {
+    let trimmed = tail.trim();
+    let upper = trimmed.to_ascii_uppercase();
+    let is_sine = upper.starts_with("SINE(") || upper.starts_with("SIN(");
+    let is_pulse = upper.starts_with("PULSE(");
+    if !is_sine && !is_pulse {
+        return Ok(None);
+    }
+    let kind = if is_sine { "SINE" } else { "PULSE" };
+
+    // Extract the parenthesized argument list and parse its numbers.
+    let open = trimmed.find('(').expect("prefix guarantees an open paren");
+    let close = trimmed.rfind(')').ok_or_else(|| {
+        err(
+            line,
+            ErrorKind::BadWaveform(format!("{kind} spec is missing its closing ')'")),
+        )
+    })?;
+    let inner = &trimmed[open + 1..close];
+    let nums: Vec<f64> = inner
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|t| !t.is_empty())
+        .map(|t| {
+            spice_magnitude(t).ok_or_else(|| {
+                err(
+                    line,
+                    ErrorKind::BadWaveform(format!("{kind} parameter {t:?} is not a number")),
+                )
+            })
+        })
+        .collect::<Result<_, _>>()?;
+
+    if is_sine {
+        // SPICE: SIN(Voffset Vamplitude Freq [Tdelay Theta Phase]).
+        if nums.len() < 3 {
+            return Err(err(
+                line,
+                ErrorKind::BadWaveform("SINE needs at least `offset amplitude freq`".to_string()),
+            ));
+        }
+        let waveform = Waveform::Sine {
+            amplitude: nums[1],
+            freq: nums[2],
+            offset: nums[0],
+            phase_deg: nums.get(5).copied().unwrap_or(0.0),
+        };
+        Ok(Some((waveform, nums[0])))
+    } else {
+        // SPICE: PULSE(V1 V2 [Tdelay Trise Tfall Pwidth Period]).
+        if nums.len() < 2 {
+            return Err(err(
+                line,
+                ErrorKind::BadWaveform("PULSE needs at least `v1 v2`".to_string()),
+            ));
+        }
+        let waveform = Waveform::Pulse {
+            v1: nums[0],
+            v2: nums[1],
+            delay: nums.get(2).copied().unwrap_or(0.0),
+            width: nums.get(5).copied().unwrap_or(0.0),
+            period: nums.get(6).copied().unwrap_or(0.0),
+        };
+        Ok(Some((waveform, nums[0])))
+    }
 }
 
 /// Reserve a reference designator, erroring if it was already used.
@@ -1137,6 +1247,124 @@ R2 mid 0   1k
             .expect("v(mid) present");
         let v = sig.real().unwrap();
         assert!((v[0] - 5.0).abs() < 1e-9, "midpoint = {}", v[0]);
+    }
+
+    // ── SINE/PULSE source stimuli (CP-AF-M10.1) ──────────────────────────────
+
+    #[test]
+    fn sine_source_imports_with_waveform_and_simulates() {
+        // `V1 in 0 SINE(0 5 1k)` — a 5 V, 1 kHz sine about 0 V — attaches a
+        // `Waveform::Sine` and drives a real transient that swings with the sine.
+        use ohmforge_sim::{Analysis, Engine};
+        let deck = "\
+sine source demo
+V1 in 0 SINE(0 5 1k)
+R1 in 0 1k
+.end
+";
+        let c = import(deck).unwrap();
+        let v1 = c.part_by_ref("V1").unwrap();
+        assert_eq!(
+            v1.waveform,
+            Waveform::Sine {
+                amplitude: 5.0,
+                freq: 1000.0,
+                offset: 0.0,
+                phase_deg: 0.0,
+            }
+        );
+        // The DC/op value is the sine's offset (0 V here).
+        assert_eq!(v1.value.as_ref().unwrap().magnitude, 0.0);
+
+        // A transient over one period must actually swing (not sit at the bias).
+        let node = v1.terminals[0]; // `in`
+        let sigs = Engine::new()
+            .run(
+                &c,
+                &Analysis::Transient {
+                    duration: 1e-3,
+                    step: Some(1e-5),
+                },
+            )
+            .unwrap();
+        let name = format!("v(n{})", c.resolve(node).0);
+        let y = sigs
+            .iter()
+            .find(|s| s.name == name)
+            .and_then(|s| s.real())
+            .expect("v(in) present");
+        let max = y.iter().cloned().fold(f64::MIN, f64::max);
+        let min = y.iter().cloned().fold(f64::MAX, f64::min);
+        assert!(max > 3.0, "sine rises toward +5 V (max = {max})");
+        assert!(min < -3.0, "sine falls toward −5 V (min = {min})");
+    }
+
+    #[test]
+    fn pulse_source_imports_with_waveform() {
+        // `PULSE(v1 v2 td tr tf pw per)` — the engine ignores the ideal-edge
+        // rise/fall (td=0, tr=tf=0, pw=5µs, per=10µs); the DC/op value is v1.
+        let deck = "\
+pulse source demo
+V1 clk 0 PULSE(0 5 0 0 0 5u 10u)
+R1 clk 0 1k
+.end
+";
+        let c = import(deck).unwrap();
+        let v1 = c.part_by_ref("V1").unwrap();
+        match v1.waveform.clone() {
+            Waveform::Pulse {
+                v1,
+                v2,
+                delay,
+                width,
+                period,
+            } => {
+                assert_eq!((v1, v2, delay), (0.0, 5.0, 0.0));
+                // `5u`/`10u` are `5·1e-6`/`10·1e-6` — compare within float epsilon.
+                assert!((width - 5e-6).abs() < 1e-18, "width = {width}");
+                assert!((period - 1e-5).abs() < 1e-18, "period = {period}");
+            }
+            other => panic!("expected a Pulse waveform, got {other:?}"),
+        }
+        assert_eq!(v1.value.as_ref().unwrap().magnitude, 0.0);
+    }
+
+    #[test]
+    fn sine_accepts_the_sin_spelling_and_a_current_source() {
+        // `SIN(...)` is an accepted spelling, and `I` sources carry waveforms too.
+        let c = import("t\nI1 a 0 SIN(1 2 50)\nR1 a 0 1k\n.end").unwrap();
+        assert_eq!(
+            c.part_by_ref("I1").unwrap().waveform,
+            Waveform::Sine {
+                amplitude: 2.0,
+                freq: 50.0,
+                offset: 1.0,
+                phase_deg: 0.0,
+            }
+        );
+        // The bias (offset) is the op-point current.
+        assert_eq!(
+            c.part_by_ref("I1")
+                .unwrap()
+                .value
+                .as_ref()
+                .unwrap()
+                .magnitude,
+            1.0
+        );
+    }
+
+    #[test]
+    fn malformed_waveform_is_a_clean_error() {
+        // Missing closing paren.
+        let e = import("t\nV1 a 0 SINE(0 5 1k\nR1 a 0 1k\n.end").unwrap_err();
+        assert!(matches!(e.kind, ErrorKind::BadWaveform(_)), "{e:?}");
+        // Too few sine parameters.
+        let e = import("t\nV1 a 0 SINE(0 5)\n.end").unwrap_err();
+        assert!(matches!(e.kind, ErrorKind::BadWaveform(_)), "{e:?}");
+        // A non-numeric parameter.
+        let e = import("t\nV1 a 0 PULSE(0 x)\n.end").unwrap_err();
+        assert!(matches!(e.kind, ErrorKind::BadWaveform(_)), "{e:?}");
     }
 
     #[test]

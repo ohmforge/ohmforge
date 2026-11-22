@@ -7,7 +7,11 @@
 use ohmforge_core::graph::{DiodeModel, NetId, PartKind};
 use ohmforge_core::units::Unit;
 use ohmforge_core::value::Value;
-use ohmforge_fmt::{import_kicad, import_spice, load_project, save_project, to_bom_csv};
+use ohmforge_core::Complex;
+use ohmforge_fmt::{
+    export_touchstone, import_kicad, import_spice, load_project, parse_touchstone, save_project,
+    to_bom_csv,
+};
 use ohmforge_sim::{Analysis, Engine};
 
 /// The example files, embedded at compile time (paths are relative to this
@@ -16,6 +20,7 @@ const DIVIDER_CIR: &str = include_str!("../../../examples/formats/divider.cir");
 const DIVIDER_NET: &str = include_str!("../../../examples/formats/divider.net");
 const RC_LOWPASS: &str = include_str!("../../../examples/formats/rc-lowpass.eeproj");
 const DIODE_CLAMP: &str = include_str!("../../../examples/formats/diode-clamp.cir");
+const SHUNT_CAP_S2P: &str = include_str!("../../../examples/formats/shunt-cap.s2p");
 
 /// Read one solved node voltage by its resolved-net signal name.
 fn node_volts(circuit: &ohmforge_core::graph::Circuit, net: ohmforge_core::graph::NetId) -> f64 {
@@ -150,4 +155,43 @@ fn example_spice_model_deck_applies_params_and_simulates() {
         "the IS/N/RS model should move the operating point off the default: \
          modeled {v_modeled} V vs default {v_default} V"
     );
+}
+
+/// The shipped Touchstone example is real: the known shunt-element 2-port whose
+/// exact S-parameters are `S11 = S22 = −jk/(2+jk)`, `S21 = S12 = 2/(2+jk)` at
+/// three normalized points `k ∈ {0,1,2}` exports **byte-for-byte** to the
+/// checked-in `.s2p` (the `CP-AF-M10.1` golden), and parses back within 1e-9.
+#[test]
+fn example_touchstone_exports_byte_exact_and_round_trips() {
+    // s[row][col]; a reciprocal, symmetric 2-port so S12 = S21 and S22 = S11.
+    let point = |freq: f64, s11: Complex, s21: Complex| (freq, [[s11, s21], [s21, s11]]);
+    let sweep = [
+        point(1e6, Complex::new(0.0, 0.0), Complex::new(1.0, 0.0)),
+        point(2e6, Complex::new(-0.2, -0.4), Complex::new(0.8, -0.4)),
+        point(3e6, Complex::new(-0.5, -0.5), Complex::new(0.5, -0.5)),
+    ];
+
+    // Byte-exact golden: the exporter reproduces the shipped file exactly.
+    let s2p = export_touchstone(&sweep, 50.0).expect("the known 2-port exports");
+    assert_eq!(
+        s2p, SHUNT_CAP_S2P,
+        "the shipped .s2p is exactly what export_touchstone() emits"
+    );
+
+    // Round trip: parse the shipped file and recover the reference impedance and
+    // every S-parameter magnitude within 1e-9.
+    let back = parse_touchstone(SHUNT_CAP_S2P).expect("the shipped .s2p parses");
+    assert_eq!(back.z0, 50.0);
+    assert_eq!(back.points.len(), sweep.len());
+    for ((f0, s0), (f1, s1)) in sweep.iter().zip(back.points.iter()) {
+        assert_eq!(f0, f1, "frequency survives the round trip");
+        for r in 0..2 {
+            for c in 0..2 {
+                assert!(
+                    (s0[r][c].magnitude() - s1[r][c].magnitude()).abs() < 1e-9,
+                    "|S[{r}][{c}]| within 1e-9"
+                );
+            }
+        }
+    }
 }
