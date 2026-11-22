@@ -6,7 +6,7 @@
 //! methods that take an abstract [`AppEvent`] and mutate [`App`], and
 //! [`App::render`] is a pure function from state to a single `String` of a given
 //! width and height. No `crossterm`, no raw mode, no `tty` — so the whole thing
-//! is unit-testable the way [`Screen`](crate::Screen) and [`Plot`]
+//! is unit-testable the way [`Screen`](crate::Screen) and [`Plot`](crate::Plot)
 //! already are.
 //!
 //! The crossterm raw-mode glue (reading real key/mouse events, drawing the frame)
@@ -35,12 +35,12 @@
 use ohmforge_core::graph::Circuit;
 use ohmforge_core::units::Unit;
 use ohmforge_core::value::Value;
+use ohmforge_instruments::{CursorReadout, Cursors, Oscilloscope, Slope, Timebase, Trigger};
 
 use crate::canvas::{Canvas, CanvasEvent, Cell};
 use crate::current::{branch_currents, BranchCurrents};
 use crate::overlay::{NodeVoltages, Overlay};
 use crate::playback::Playback;
-use crate::plot::Plot;
 use crate::schematic::{fmt_value, Schematic};
 use crate::screen::Pane;
 
@@ -307,6 +307,7 @@ enum Action {
     ToggleOverlay,
     ToggleEdit,
     ToggleCapture,
+    ToggleHelp,
     ClearLog,
     Quit,
 }
@@ -352,6 +353,10 @@ const COMMANDS: &[Command] = &[
         action: Action::ToggleCapture,
     },
     Command {
+        name: "help",
+        action: Action::ToggleHelp,
+    },
+    Command {
         name: "clear log",
         action: Action::ClearLog,
     },
@@ -367,6 +372,26 @@ struct Palette {
     open: bool,
     query: String,
     selected: usize,
+}
+
+/// The live scope pane's instrument sub-state (`CP-UX-M10.1`).
+///
+/// The scope pane renders the cached transient through the real
+/// [`Oscilloscope`](ohmforge_instruments::Oscilloscope) rather than a bare plot, so
+/// it carries the instrument's own controls: an edge trigger (to lock a periodic
+/// capture) and two measurement cursors (reporting Δt / Δv / 1·Δt⁻¹). The cursors
+/// are sample **indices** into the cached series, so a readout maps straight back
+/// to known samples with no interpolation.
+#[derive(Debug, Default)]
+struct ScopeState {
+    /// Whether the edge trigger is armed (else free-run from the capture start).
+    triggered: bool,
+    /// Whether the two measurement cursors (and their Δ readout) are shown.
+    cursors: bool,
+    /// First cursor's sample index into the cached series.
+    c1: usize,
+    /// Second cursor's sample index into the cached series.
+    c2: usize,
 }
 
 /// The live application state.
@@ -411,6 +436,11 @@ pub struct App<B: Backend> {
     scrubbing: bool,
     /// Animation frame counter — the run loop bumps it so the flow arrows march.
     tick: u64,
+    /// The live scope pane's instrument controls — trigger + cursors
+    /// (`CP-UX-M10.1`).
+    scope_state: ScopeState,
+    /// Whether the in-TUI help / keymap overlay is shown (`CP-UX-M10.2`).
+    help: bool,
     /// Last known terminal size, for mouse hit-testing between renders.
     size: (usize, usize),
     should_quit: bool,
@@ -438,6 +468,8 @@ impl<B: Backend> App<B> {
             playback: Playback::new(),
             scrubbing: false,
             tick: 0,
+            scope_state: ScopeState::default(),
+            help: false,
             size: (100, 30),
             should_quit: false,
         }
@@ -470,9 +502,15 @@ impl<B: Backend> App<B> {
     }
 
     fn on_key(&mut self, key: KeyEvent) {
-        // Ctrl-C always quits, palette open or not.
+        // Ctrl-C always quits, palette or help open or not.
         if key.ctrl && key.code == KeyCode::Char('c') {
             self.should_quit = true;
+            return;
+        }
+        // The help / keymap overlay is modal: while it is open any key dismisses it
+        // (`CP-UX-M10.2`).
+        if self.help {
+            self.help = false;
             return;
         }
         if self.palette.open {
@@ -482,6 +520,12 @@ impl<B: Backend> App<B> {
         // Ctrl-P opens the palette from anywhere.
         if key.ctrl && key.code == KeyCode::Char('p') {
             self.open_palette();
+            return;
+        }
+        // `?` opens the help / keymap overlay — except while typing in the shell,
+        // where `?` is literal input (reach help there via Ctrl-P → "help").
+        if key.code == KeyCode::Char('?') && !self.edit.active && self.focus != PanelId::Shell {
+            self.help = true;
             return;
         }
         // Ctrl-arrows resize the split boundaries.
@@ -516,6 +560,18 @@ impl<B: Backend> App<B> {
     /// jump to the first/last frame. All clamp at the ends; an empty playback is a
     /// no-op.
     fn on_scope_key(&mut self, key: KeyEvent) {
+        // Instrument controls — the trigger arm and the measurement cursors
+        // (`CP-UX-M10.1`). These measure the capture; they do not scrub the
+        // playhead, so they return before the scrubbing flag is set.
+        match key.code {
+            KeyCode::Char('t') => return self.toggle_scope_trigger(),
+            KeyCode::Char('c') => return self.toggle_scope_cursors(),
+            KeyCode::Char('[') => return self.move_cursor(0, -1),
+            KeyCode::Char(']') => return self.move_cursor(0, 1),
+            KeyCode::Char('{') => return self.move_cursor(1, -1),
+            KeyCode::Char('}') => return self.move_cursor(1, 1),
+            _ => {}
+        }
         match key.code {
             KeyCode::Char(' ') => self.playback.toggle(),
             KeyCode::Left => self.playback.step(-1),
@@ -704,6 +760,7 @@ impl<B: Backend> App<B> {
             Action::ToggleOverlay => self.overlay = !self.overlay,
             Action::ToggleEdit => self.toggle_edit_mode(),
             Action::ToggleCapture => self.toggle_capture(),
+            Action::ToggleHelp => self.toggle_help(),
             Action::ClearLog => self.log.clear(),
             Action::Quit => self.should_quit = true,
         }
@@ -764,6 +821,9 @@ impl<B: Backend> App<B> {
     /// is the backend's; this only caches its signals (`CP-UX-M7.1`).
     fn refresh_playback(&mut self) {
         self.playback = Playback::from_signals(&self.backend.transient());
+        // Reset the measurement cursors to span the whole fresh capture.
+        self.scope_state.c1 = 0;
+        self.scope_state.c2 = self.playback.len().saturating_sub(1);
     }
 
     /// Advance the animation one frame: bump the current-flow phase and, when the
@@ -857,6 +917,152 @@ impl<B: Backend> App<B> {
     /// The branch currents derived from the last solve (for tests and the overlay).
     pub fn branch_currents(&self) -> &BranchCurrents {
         &self.currents
+    }
+
+    // ── scope instrument controls (CP-UX-M10.1) ────────────────────────────
+
+    /// Whether the scope's edge trigger is armed (else it free-runs).
+    pub fn scope_triggered(&self) -> bool {
+        self.scope_state.triggered
+    }
+
+    /// Whether the scope's measurement cursors (and Δ readout) are shown.
+    pub fn scope_cursors_shown(&self) -> bool {
+        self.scope_state.cursors
+    }
+
+    /// The two measurement cursors' sample indices (for tests and the readout).
+    pub fn cursor_indices(&self) -> (usize, usize) {
+        (self.scope_state.c1, self.scope_state.c2)
+    }
+
+    /// Arm / disarm the scope's edge trigger.
+    pub fn toggle_scope_trigger(&mut self) {
+        self.scope_state.triggered = !self.scope_state.triggered;
+    }
+
+    /// Show / hide the scope's measurement cursors.
+    pub fn toggle_scope_cursors(&mut self) {
+        self.scope_state.cursors = !self.scope_state.cursors;
+    }
+
+    /// Place a measurement cursor (`which`: 0 or 1) at an absolute sample index,
+    /// clamped to the cached capture. Showing the cursors too, so the move is
+    /// visible.
+    pub fn set_cursor(&mut self, which: u8, index: usize) {
+        let n = self.playback.len();
+        let clamped = if n == 0 { 0 } else { index.min(n - 1) };
+        if which == 0 {
+            self.scope_state.c1 = clamped;
+        } else {
+            self.scope_state.c2 = clamped;
+        }
+        self.scope_state.cursors = true;
+    }
+
+    /// Nudge a measurement cursor (`which`: 0 or 1) by `delta` samples (negative
+    /// rewinds), clamped to the cached capture.
+    pub fn move_cursor(&mut self, which: u8, delta: isize) {
+        let cur = if which == 0 {
+            self.scope_state.c1
+        } else {
+            self.scope_state.c2
+        };
+        let next = (cur as isize + delta).max(0) as usize;
+        self.set_cursor(which, next);
+    }
+
+    /// The scope's cursor measurement — Δt, Δv (on channel 0) and the implied
+    /// frequency `1/Δt` — read from the cached capture at the two cursor indices
+    /// via the real [`Oscilloscope`](ohmforge_instruments::Oscilloscope). `None`
+    /// when no transient is loaded. Pure — no tty (`CP-UX-M10.1`).
+    pub fn cursor_readout(&self) -> Option<CursorReadout> {
+        self.build_scope(72, 6, true).and_then(|s| s.measure())
+    }
+
+    /// Build the scope instrument over the cached transient at the given interior
+    /// size. `with_cursors` places the two measurement cursors (used for both the
+    /// shown readout and [`cursor_readout`](App::cursor_readout)). `None` when no
+    /// transient is loaded. Cursor times are expressed relative to the window start
+    /// (the trigger point when armed, else the capture start), matching the
+    /// `Oscilloscope`'s own cursor contract.
+    fn build_scope(
+        &self,
+        width: usize,
+        channel_height: usize,
+        with_cursors: bool,
+    ) -> Option<Oscilloscope> {
+        let sigs = self.playback.signals();
+        let first = sigs.first()?;
+        let start = first.x.first().copied().unwrap_or(0.0);
+        let end = first.x.last().copied().unwrap_or(start);
+        let span = end - start;
+
+        let mut scope = Oscilloscope::new(self.scope_title())
+            .size(width, channel_height)
+            .timebase(Timebase::new(span));
+
+        if self.scope_state.triggered {
+            // Trigger on channel 0 rising through its mid-level, so a periodic
+            // capture locks regardless of where the window happens to begin.
+            let y = first.real().unwrap_or(&[]);
+            let (lo, hi) = y
+                .iter()
+                .copied()
+                .filter(|v| v.is_finite())
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
+                    (lo.min(v), hi.max(v))
+                });
+            let level = if lo.is_finite() && hi.is_finite() {
+                (lo + hi) / 2.0
+            } else {
+                0.0
+            };
+            scope = scope.trigger(Trigger::Edge {
+                source: 0,
+                level,
+                slope: Slope::Rising,
+            });
+        }
+
+        for s in sigs {
+            scope = scope.channel(s.clone());
+        }
+
+        if with_cursors {
+            let n = self.playback.len();
+            if n > 0 {
+                let c1 = self.scope_state.c1.min(n - 1);
+                let c2 = self.scope_state.c2.min(n - 1);
+                let t1 = first.x.get(c1).copied().unwrap_or(start) - start;
+                let t2 = first.x.get(c2).copied().unwrap_or(start) - start;
+                scope = scope.cursors(Cursors::new(t1, t2, 0));
+            }
+        }
+        Some(scope)
+    }
+
+    /// The scope pane's title line, reflecting the live trigger / cursor state and
+    /// hinting the keys that toggle them.
+    fn scope_title(&self) -> String {
+        let on = |b: bool| if b { "on" } else { "off" };
+        format!(
+            "scope  [t]rig:{}  [c]ursors:{}",
+            on(self.scope_state.triggered),
+            on(self.scope_state.cursors)
+        )
+    }
+
+    // ── help / keymap overlay (CP-UX-M10.2) ─────────────────────────────────
+
+    /// Whether the help / keymap overlay is shown.
+    pub fn help_open(&self) -> bool {
+        self.help
+    }
+
+    /// Show / hide the help / keymap overlay.
+    pub fn toggle_help(&mut self) {
+        self.help = !self.help;
     }
 
     // ── interactive editing (CP-UX-M5.1) ──────────────────────────────────
@@ -1163,6 +1369,10 @@ impl<B: Backend> App<B> {
         if self.palette.open {
             self.render_palette(&mut grid, w, h);
         }
+        // The help / keymap overlay draws on top of everything (`CP-UX-M10.2`).
+        if self.help {
+            self.render_help(&mut grid, w, h);
+        }
 
         grid.into_iter()
             .map(|row| row.into_iter().collect::<String>())
@@ -1260,18 +1470,20 @@ impl<B: Backend> App<B> {
     }
 
     /// The scope pane body, sized to its pane. When a transient is loaded it is
-    /// **re-plotted from the cached series at the live pane rect** so the waveform
-    /// (and its x-axis label) never clip, regardless of the fixed size the shell
-    /// first rendered at; a transport header rides on top (`CP-UX-M7.1`/`M8.1`).
-    /// Non-transient scope frames (AC/DC/noise) fall back to the shell's string.
+    /// **re-rendered through the real [`Oscilloscope`](ohmforge_instruments::Oscilloscope)
+    /// at the live pane rect** — edge trigger, measurement cursors and the Δt/Δv/freq
+    /// readout (`CP-UX-M10.1`) — so the waveform (and its x-axis label) never clip,
+    /// regardless of the fixed size the shell first rendered at; a transport header
+    /// rides on top (`CP-UX-M7.1`/`M8.1`). Non-transient scope frames (AC/DC/noise)
+    /// fall back to the shell's string.
     fn scope_body(&self, rect: Rect) -> String {
         // Pane interior: two border columns/rows are consumed by the frame.
         let inner_w = rect.w.saturating_sub(4);
         let inner_h = rect.h.saturating_sub(2);
         if !self.playback.is_empty() {
-            // One interior row goes to the transport header; the plots fill the rest.
+            // One interior row goes to the transport header; the scope fills the rest.
             let plot_h = inner_h.saturating_sub(1);
-            let body = self.replot_transient(inner_w, plot_h);
+            let body = self.scope_render(inner_w, plot_h);
             return format!("{}\n{body}", self.transport_line());
         }
         if self.scope.is_empty() {
@@ -1281,35 +1493,23 @@ impl<B: Backend> App<B> {
         }
     }
 
-    /// Re-plot every cached transient series into `inner_w × inner_h` interior
-    /// cells, splitting the height across the probed signals. Each [`Plot`] needs a
-    /// title row, an x-axis rule, and a labels row on top of its braille rows, and
-    /// a y-axis gutter on the left — budgeted here so nothing overruns the pane.
-    fn replot_transient(&self, inner_w: usize, inner_h: usize) -> String {
-        let sigs = self.playback.signals();
-        if sigs.is_empty() {
-            return String::new();
+    /// Render the cached transient through the [`Oscilloscope`](ohmforge_instruments::Oscilloscope)
+    /// into at most `avail_rows` interior rows of `inner_w` cells. The per-channel
+    /// braille height is budgeted from the rows left after the scope's own chrome
+    /// (title, optional cursor readout, per-channel label, and the shared x-axis
+    /// rule + labels) so the axis never overruns the pane (`CP-UX-M10.1`).
+    fn scope_render(&self, inner_w: usize, avail_rows: usize) -> String {
+        let n = self.playback.signals().len().max(1);
+        // Chrome: title(1) + cursor readout(1 when shown) + axis rule + labels(2) +
+        // one label row per channel.
+        let cursor_rows = usize::from(self.scope_state.cursors);
+        let overhead = 1 + cursor_rows + 2 + n;
+        let traces = avail_rows.saturating_sub(overhead);
+        let channel_height = (traces / n).max(2);
+        match self.build_scope(inner_w, channel_height, self.scope_state.cursors) {
+            Some(scope) => scope.render(),
+            None => String::new(),
         }
-        // Chrome per plot: title + x rule + x labels = 3 rows; gutter ≈ 7 cols.
-        const PLOT_CHROME_ROWS: usize = 3;
-        const GUTTER_BUDGET: usize = 7;
-        let per = (inner_h / sigs.len()).max(PLOT_CHROME_ROWS + 1);
-        let plot_h = per.saturating_sub(PLOT_CHROME_ROWS).max(1);
-        let plot_w = inner_w.saturating_sub(GUTTER_BUDGET).max(1);
-        let mut out = String::new();
-        for (i, s) in sigs.iter().enumerate() {
-            if i > 0 {
-                out.push('\n');
-            }
-            let y = s.real().unwrap_or(&[]);
-            out.push_str(
-                &Plot::new(&s.name)
-                    .units("V", "s")
-                    .size(plot_w, plot_h)
-                    .render(&s.x, y),
-            );
-        }
-        out
     }
 
     /// The playback transport status line: play/pause state, the playhead time,
@@ -1400,11 +1600,60 @@ impl<B: Backend> App<B> {
         blit(grid, &lines, rect.x, rect.y);
     }
 
+    /// The centred, framed help-overlay box at the given screen size — shared by
+    /// the renderer and (potentially) a hit-test, sized to hold the keymap.
+    fn help_rect(&self, w: usize, h: usize) -> Rect {
+        let box_w = 46.min(w.saturating_sub(4)).max(20);
+        // One row per keymap entry, a title line, plus two border rows.
+        let box_h = (KEYMAP.len() + 3).min(h.saturating_sub(2)).max(5);
+        Rect {
+            x: (w - box_w) / 2,
+            y: (h - box_h) / 2,
+            w: box_w,
+            h: box_h,
+        }
+    }
+
+    /// Draw the help / keymap overlay as a centred, framed box listing every
+    /// binding grouped by context (`CP-UX-M10.2`). A pure render — one boolean in
+    /// [`App`] gates it, so it never forces a repaint or touches a mutation path.
+    fn render_help(&self, grid: &mut [Vec<char>], w: usize, h: usize) {
+        let rect = self.help_rect(w, h);
+        let mut body = String::new();
+        for (i, (keys, desc)) in KEYMAP.iter().enumerate() {
+            if i > 0 {
+                body.push('\n');
+            }
+            // Pad the key column so the descriptions line up.
+            body.push_str(&format!("{keys:<13} {desc}"));
+        }
+        let lines = Pane::new("keymap  (any key / ? to close)", &body).render(rect.w, rect.h);
+        blit(grid, &lines, rect.x, rect.y);
+    }
+
     /// Borrow the backend (e.g. to read the circuit after the loop exits).
     pub fn backend(&self) -> &B {
         &self.backend
     }
 }
+
+/// The keymap shown by the help overlay (`CP-UX-M10.2`), grouped by context. Kept
+/// in one table so the overlay cannot drift from the handlers it documents.
+const KEYMAP: &[(&str, &str)] = &[
+    ("Tab/BackTab", "cycle panel focus"),
+    ("Ctrl-P", "command palette"),
+    ("Ctrl-←→↑↓", "resize the split"),
+    ("?/F1", "toggle this help"),
+    ("e", "edit mode (schematic)"),
+    ("a/w/d", "add / wire / delete (edit)"),
+    ("+/-", "tune selected value (edit)"),
+    ("space", "scope: play / pause"),
+    ("←/→", "scope: step the playhead"),
+    (",/.", "scope: jump to start / end"),
+    ("t/c", "scope: trigger / cursors"),
+    ("[ ] { }", "scope: move cursors 1 / 2"),
+    ("Ctrl-C", "quit"),
+];
 
 /// A fuzzy subsequence score of `query` against `candidate`, or `None` if the
 /// query is not a subsequence.
@@ -2619,6 +2868,124 @@ mod tests {
                 .any(|c| ('\u{2801}'..='\u{28FF}').contains(&c)),
             "the waveform drew braille dots inside the pane:\n{scope_text}"
         );
+    }
+
+    /// Gate (`CP-UX-M10.1`): the live scope pane wires the real `Oscilloscope`, so
+    /// its measurement cursors read the correct Δt / Δv / frequency off a known
+    /// capture, and the rendered scope carries the formatted readout line — all on
+    /// data, no tty. The `PlayBackend` ramp is `v(n1) = [0,1,2,3] V` at `[0,1,2,3]`
+    /// ms, so cursors at samples 0 and 3 span Δt = 3 ms, Δv = 3 V, 1/Δt ≈ 333.3 Hz.
+    #[test]
+    fn scope_cursors_read_dt_dv_and_frequency_on_a_known_capture() {
+        let mut a = App::new(PlayBackend::new());
+        a.focus = PanelId::Shell;
+        typ(&mut a, "run tran 3m");
+        key(&mut a, KeyCode::Enter);
+        assert_eq!(a.playback().len(), 4, "the capture loaded");
+
+        // Place the two cursors at known sample indices and read the measurement.
+        a.set_cursor(0, 0);
+        a.set_cursor(1, 3);
+        assert_eq!(a.cursor_indices(), (0, 3));
+        let r = a.cursor_readout().expect("a loaded capture measures");
+        assert!((r.dt - 3e-3).abs() < 1e-12, "Δt = {} s, want 3 ms", r.dt);
+        assert!((r.dv - 3.0).abs() < 1e-9, "Δv = {} V, want 3 V", r.dv);
+        assert!(
+            (r.freq - 1.0 / 3e-3).abs() < 1e-6,
+            "1/Δt = {} Hz, want ≈333.3 Hz",
+            r.freq
+        );
+
+        // Half the span reads the implied doubled frequency.
+        a.set_cursor(1, 1);
+        let half = a.cursor_readout().unwrap();
+        assert!((half.dt - 1e-3).abs() < 1e-12, "Δt = {} s", half.dt);
+        assert!((half.freq - 1000.0).abs() < 1e-6, "1/Δt = {} Hz", half.freq);
+
+        // The rendered scope pane carries the formatted Δt / Δv readout line.
+        a.set_cursor(1, 3);
+        assert!(a.scope_cursors_shown(), "placing a cursor shows them");
+        a.focus = PanelId::Scope;
+        let frame = a.render(120, 30);
+        assert!(
+            frame.contains("Δt=") && frame.contains("1/Δt=") && frame.contains("Δv="),
+            "the scope shows the cursor readout line:\n{frame}"
+        );
+    }
+
+    /// The scope-pane keys drive the instrument controls: `t` arms the trigger,
+    /// `c` shows the cursors, and `[`/`]`/`{`/`}` step the two cursors — without
+    /// scrubbing the playhead.
+    #[test]
+    fn scope_keys_drive_the_trigger_and_cursors() {
+        let mut a = App::new(PlayBackend::new());
+        a.focus = PanelId::Shell;
+        typ(&mut a, "run tran 3m");
+        key(&mut a, KeyCode::Enter);
+        a.focus = PanelId::Scope;
+
+        assert!(
+            !a.scope_triggered() && !a.scope_cursors_shown(),
+            "off by default"
+        );
+        a.handle_event(AppEvent::Key(KeyEvent::char('t')));
+        assert!(a.scope_triggered(), "t armed the trigger");
+        a.handle_event(AppEvent::Key(KeyEvent::char('c')));
+        assert!(a.scope_cursors_shown(), "c showed the cursors");
+
+        // Cursors reset to span the capture (0 and the last sample).
+        assert_eq!(a.cursor_indices(), (0, 3));
+        a.handle_event(AppEvent::Key(KeyEvent::char(']'))); // cursor 0 forward
+        a.handle_event(AppEvent::Key(KeyEvent::char('{'))); // cursor 1 back
+        assert_eq!(a.cursor_indices(), (1, 2));
+        // The playhead did not move — these are measurement controls, not scrubs.
+        assert_eq!(a.playback().cursor(), 0, "the playhead stayed put");
+    }
+
+    /// Gate (`CP-UX-M10.2`): `?` toggles the in-TUI help / keymap overlay, which
+    /// renders representative bindings; toggling off removes them; and it never
+    /// forces an animation repaint.
+    #[test]
+    fn help_overlay_renders_the_keymap_and_toggles() {
+        let mut a = app();
+        a.set_size(80, 24);
+        a.focus = PanelId::Schematic; // `?` is literal input in the shell
+        assert!(!a.help_open());
+
+        a.handle_event(AppEvent::Key(KeyEvent::char('?')));
+        assert!(a.help_open(), "? opened the help overlay");
+        let frame = a.render(80, 24);
+        for want in ["Tab", "Ctrl-P", "edit", "space", "cycle panel focus"] {
+            assert!(frame.contains(want), "the keymap lists {want:?}:\n{frame}");
+        }
+        // The overlay is a pure render — nothing animates because of it.
+        assert!(
+            !a.is_animating(),
+            "the help overlay must not force repaints"
+        );
+
+        // Any key dismisses the modal overlay; the rows are gone. (The shell log's
+        // own "press Ctrl-P" hint is unrelated, so assert on a keymap-only row.)
+        a.handle_event(AppEvent::Key(KeyEvent::char('?')));
+        assert!(!a.help_open(), "? closed the help overlay");
+        let frame2 = a.render(80, 24);
+        assert!(
+            !frame2.contains("cycle panel focus"),
+            "the keymap is gone once closed:\n{frame2}"
+        );
+    }
+
+    /// The command palette also opens the help overlay (so it is reachable while
+    /// the shell holds focus, where `?` is literal input).
+    #[test]
+    fn palette_help_entry_opens_the_overlay() {
+        let mut a = app();
+        a.set_size(80, 24);
+        a.focus = PanelId::Shell;
+        a.open_palette();
+        typ(&mut a, "help");
+        key(&mut a, KeyCode::Enter);
+        assert!(a.help_open(), "the palette `help` entry opened the overlay");
     }
 
     /// Edit-mode chrome takes precedence over the overlay: with the overlay toggled

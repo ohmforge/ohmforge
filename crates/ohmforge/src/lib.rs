@@ -566,8 +566,15 @@ fn history_path() -> PathBuf {
         .join(".eesh_history")
 }
 
-/// The analysis keywords completed after `run` (mirrors the shell's `run` verbs).
-const RUN_ANALYSES: &[&str] = &["tran", "op", "ac", "dc", "noise", "mc", "tf"];
+/// The analysis keywords completed after `run` (mirrors the shell's `run` verbs
+/// in `cmd_run`). Kept in lockstep with the shell so Tab offers every subcommand —
+/// `sparams`/`fft` were previously missing (`CP-UX-M10.2`).
+const RUN_ANALYSES: &[&str] = &[
+    "tran", "op", "ac", "dc", "noise", "mc", "tf", "fft", "sparams",
+];
+
+/// The waveform sub-verbs completed after `set <ref>` (e.g. `set V1 sine …`).
+const SET_WAVEFORMS: &[&str] = &["sine", "pulse", "dc"];
 
 /// Tab completion: commands in the first position; after that, node names, part
 /// references, checkpoint names, or `run`'s analysis keywords, as the context
@@ -608,15 +615,15 @@ impl EeshHelper {
     }
 }
 
-impl Completer for EeshHelper {
-    type Candidate = Pair;
-
-    fn complete(
-        &self,
-        line: &str,
-        pos: usize,
-        _ctx: &Context<'_>,
-    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+impl EeshHelper {
+    /// The completion pool start offset and matching replacements for `line[..pos]`.
+    ///
+    /// Pure (no rustyline `Context`), so it is unit-testable directly: the first
+    /// token completes command keywords; `run`'s second token completes the
+    /// analysis verbs; `set <ref>`'s third token completes the waveform sub-verbs;
+    /// `restore` completes checkpoint names; everything else completes node names
+    /// and part references.
+    fn candidates(&self, line: &str, pos: usize) -> (usize, Vec<String>) {
         let start = line[..pos].rfind(char::is_whitespace).map_or(0, |i| i + 1);
         let word = &line[start..pos];
         // Which token are we on, and what was the command (first token)?
@@ -629,6 +636,8 @@ impl Completer for EeshHelper {
             self.commands.iter().map(String::as_str).collect()
         } else if command == "run" && token_index == 1 {
             RUN_ANALYSES.to_vec()
+        } else if command == "set" && token_index == 2 {
+            SET_WAVEFORMS.to_vec()
         } else if command == "restore" {
             self.checkpoints.iter().map(String::as_str).collect()
         } else {
@@ -639,12 +648,30 @@ impl Completer for EeshHelper {
                 .map(String::as_str)
                 .collect()
         };
-        let candidates = pool
+        let matches = pool
             .iter()
             .filter(|c| c.starts_with(word))
+            .map(|c| (*c).to_string())
+            .collect();
+        (start, matches)
+    }
+}
+
+impl Completer for EeshHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        let (start, matches) = self.candidates(line, pos);
+        let candidates = matches
+            .into_iter()
             .map(|c| Pair {
-                display: (*c).to_string(),
-                replacement: (*c).to_string(),
+                display: c.clone(),
+                replacement: c,
             })
             .collect();
         Ok((start, candidates))
@@ -658,3 +685,59 @@ impl Hinter for EeshHelper {
 impl Highlighter for EeshHelper {}
 impl Validator for EeshHelper {}
 impl Helper for EeshHelper {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Gate (`CP-UX-M10.2`): the `run` completion pool now offers `sparams` (and
+    /// `fft`), which the stale `RUN_ANALYSES` list previously omitted though
+    /// `cmd_run` has long supported them.
+    #[test]
+    fn completion_offers_sparams_and_the_new_run_verbs() {
+        let mut h = EeshHelper::new();
+        let mut sh = Shell::new();
+        sh.execute("add R1 in out 50").unwrap();
+        h.refresh(&sh);
+
+        let (_, run) = h.candidates("run ", 4);
+        assert!(
+            run.iter().any(|s| s == "sparams"),
+            "run offers sparams: {run:?}"
+        );
+        assert!(run.iter().any(|s| s == "fft"), "run offers fft: {run:?}");
+        // The prior verbs are still there.
+        for want in ["tran", "op", "ac", "dc", "noise", "mc", "tf"] {
+            assert!(
+                run.iter().any(|s| s == want),
+                "run still offers {want}: {run:?}"
+            );
+        }
+
+        // A partial prefix filters as expected.
+        let (_, sp) = h.candidates("run spa", 7);
+        assert_eq!(sp, vec!["sparams".to_string()]);
+    }
+
+    /// First-token completion offers the new top-level `measure` verb, and
+    /// `set <ref>` completes the waveform sub-verbs.
+    #[test]
+    fn completion_offers_measure_and_set_subverbs() {
+        let mut h = EeshHelper::new();
+        let mut sh = Shell::new();
+        sh.execute("add R1 in out 1k").unwrap();
+        h.refresh(&sh);
+
+        let (_, first) = h.candidates("meas", 4);
+        assert!(
+            first.iter().any(|s| s == "measure"),
+            "offers measure: {first:?}"
+        );
+
+        let (_, set) = h.candidates("set R1 si", 9);
+        assert!(
+            set.iter().any(|s| s == "sine"),
+            "set <ref> offers sine: {set:?}"
+        );
+    }
+}
