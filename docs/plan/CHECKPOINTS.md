@@ -211,8 +211,8 @@ _From a six-track planning fan-out (`docs/plan/m10-proposals/*.md`). Executed in
 - [~] **CP-SIM-M10.2** (sim-core) Opt-in trapezoidal/Gear-2 transient integration (Backward-Euler stays default). — *gate:* an LC tank rings with trap where BE over-damps; the BE path stays bit-for-bit; selectable via the analysis API.
 - [~] **CP-BRD-M10.1** (boards) Cortex-M Thumb-2 correctness (`CBZ/CBNZ`, `UDIV/SDIV`, load/store writeback) + graceful `Unknown` opcode (no `debug_assert!` panic). — *gate:* a Thumb-2 program hitting CBZ/UDIV/writeback runs correctly; an unknown opcode no longer panics in test builds.
 - [~] **CP-BRD-M10.2** (boards) AVR timer + USART interrupt vectors (`millis`/`delay`/`Serial` ISR firmware). — *gate:* a timer-overflow ISR advances a counter at the expected rate; a USART-RX ISR fires on a received byte.
-- [~] **CP-UX-M10.1** (ui-shell) Wire the real `Oscilloscope` (trigger/cursors/measurements) into the live scope pane + sweep `run sparams` into an S11 locus on the Smith chart. — *gate:* no-tty tests — cursors read Δt/Δv on a known capture; the Smith pane plots a swept S11 locus.
-- [~] **CP-UX-M10.2** (ui-shell) In-TUI help/keymap overlay (`?`/F1); fix the `RUN_ANALYSES` completion omission of `sparams`; surface FFT/DMM as shell verbs. — *gate:* completion offers `sparams`; the overlay renders the keymap (asserted on data).
+- [x] **CP-UX-M10.1** (ui-shell) Wire the real `Oscilloscope` (trigger/cursors/measurements) into the live scope pane + sweep `run sparams` into an S11 locus on the Smith chart. — *gate (passing, no tty):* `ohmforge-tui` `app::tests::scope_cursors_read_dt_dv_and_frequency_on_a_known_capture` (cursors read Δt=3 ms / Δv=3 V / 1·Δt⁻¹≈333 Hz on the `PlayBackend` ramp, and the rendered pane carries the Δt/Δv readout) + `scope_keys_drive_the_trigger_and_cursors`; `scope_renders_within_an_80x24_pane_without_clipping_the_axis` still passes through the new `Oscilloscope` path; `ohmforge-shell` `run_sparams_sweeps_an_s11_locus_across_frequency` (a series-L 2-port swept over three decades plots a multi-point `●` S11 locus vs. the single-frequency dot; reversed/non-positive ranges error cleanly). `Oscilloscope` fed from `Playback::signals()`; swept `run sparams <p1> <p2> [z0] <f0> <f1> [ppd]` loops `Engine::s_parameters` → `SmithChart::render(&locus)`.
+- [x] **CP-UX-M10.2** (ui-shell) In-TUI help/keymap overlay (`?`/F1); fix the `RUN_ANALYSES` completion omission of `sparams`; surface FFT/DMM as shell verbs. — *gate (passing, no tty):* `ohmforge` `tests::completion_offers_sparams_and_the_new_run_verbs` (Tab now offers `sparams`/`fft`) + `completion_offers_measure_and_set_subverbs`; `ohmforge-tui` `app::tests::help_overlay_renders_the_keymap_and_toggles` (the `?`-toggled overlay renders `Tab`/`Ctrl-P`/`edit`/`space`/`cycle panel focus`, toggles off, and never animates) + `palette_help_entry_opens_the_overlay`; `ohmforge-shell` `run_fft_and_measure_read_a_known_sine` (`run fft` peaks at the 1 kHz drive within one bin; `measure … vpp` ≈ 2 V; missing capture → `NoCapture`). New `run fft <node>` + `measure <node> [mode]` verbs over `magnitude_spectrum`/`Multimeter`.
 - [~] **CP-AF-M10.1** (ai-fmt) Touchstone `.sNp` export (sweep `Engine::s_parameters`; exporter takes `Complex` so `ohmforge-fmt` stays core-only) + SINE/PULSE waveform parsing in the netlist importer. — *gate:* a byte-exact Touchstone golden; a netlist with a `SINE`/`PULSE` source imports and simulates.
 - [~] **CP-AF-M10.2** (ai-fmt) Deeper offline no-key heuristics — more DRC rules, value calculators, parts catalog (pure, deterministic). — *gate:* each new rule/calculator unit-tested vs hand analysis; surfaced by `of review` with no key/network.
 - [ ] **CP-WEB-M10.1** (web, W2) Unlock diodes/transistors/current sources in the browser via the existing wasm-clean `ohmforge_fmt::spice::import`. — *gate:* a diode/BJT deck imports and solves through the web path.
@@ -229,11 +229,11 @@ _From a six-track planning fan-out (`docs/plan/m10-proposals/*.md`). Executed in
 |---|---|---|---|
 | sim-core | 28 | 2 | 30 |
 | boards | 18 | 2 | 20 |
-| ui-shell | 23 | 2 | 25 |
+| ui-shell | 25 | 0 | 25 |
 | ai-fmt | 19 | 2 | 21 |
 | platform | 11 | 0 | 14 |
 | web | 7 | 0 | 9 |
-| **Total** | **106** | **8** | **119** |
+| **Total** | **108** | **6** | **119** |
 
 _**67/67 — M0 through M4 all complete** (M0–M3 tagged v0.1.0; M4 adds the rest). M4 delivered the **plugin device-model API** + an **instrument/block plugin trait**, a **KLU-class ordered/reusable sparse solver** and **multithreaded analyses**, a **Cortex-M3/M4 (Thumb-2)** core with an STM32 board, **SPICE `.model` import** + a vendor model library, and **shareable circuit links** in the browser. Deferred by design: real-time collaboration, the QEMU full-SBC bridge, and full vendor-SPICE `.model` fidelity — the standing M-next horizon._
 

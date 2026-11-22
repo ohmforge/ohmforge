@@ -47,7 +47,9 @@ use ohmforge_core::graph::{
 use ohmforge_core::signal::Complex;
 use ohmforge_core::units::Unit;
 use ohmforge_core::value::{ParseError, Value};
-use ohmforge_instruments::{Bode, SmithChart};
+use ohmforge_instruments::{
+    magnitude_spectrum, Bode, DmmMode, Multimeter, SmithChart, Spectrum, Window,
+};
 use ohmforge_sim::{Analysis, Engine, SimError};
 use ohmforge_tui::Plot;
 
@@ -187,6 +189,7 @@ impl Shell {
         "remove",
         "set",
         "run",
+        "measure",
         "show",
         "undo",
         "checkpoint",
@@ -242,6 +245,7 @@ impl Shell {
                 result
             }
             "run" => self.cmd_run(&args),
+            "measure" => self.cmd_measure(&args),
             "show" => Ok(self.render_show()),
             "undo" => self.cmd_undo(&args),
             "checkpoint" => self.cmd_checkpoint(&args),
@@ -1081,6 +1085,7 @@ impl Shell {
                 self.run_mc(out, runs, seed)
             }
             ["tf", out, source] => self.run_tf(out, source),
+            ["fft", node] => self.run_fft(node),
             ["sparams", p1, p2] => self.run_sparams(p1, p2, DEFAULT_Z0, DEFAULT_SPARAM_FREQ),
             ["sparams", p1, p2, z0] => {
                 let z = self.parse_value(z0, Unit::Ohm)?.magnitude;
@@ -1091,9 +1096,24 @@ impl Shell {
                 let fr = self.parse_value(f, Unit::Hertz)?.magnitude;
                 self.run_sparams(p1, p2, z, fr)
             }
+            // Swept form: a stop frequency turns the lone Smith dot into an S11
+            // locus across the decade sweep (`CP-UX-M10.1`).
+            ["sparams", p1, p2, z0, f0, f1] => {
+                let z = self.parse_value(z0, Unit::Ohm)?.magnitude;
+                let a = self.parse_value(f0, Unit::Hertz)?.magnitude;
+                let b = self.parse_value(f1, Unit::Hertz)?.magnitude;
+                self.run_sparams_sweep(p1, p2, z, a, b, DEFAULT_PPD)
+            }
+            ["sparams", p1, p2, z0, f0, f1, ppd] => {
+                let z = self.parse_value(z0, Unit::Ohm)?.magnitude;
+                let a = self.parse_value(f0, Unit::Hertz)?.magnitude;
+                let b = self.parse_value(f1, Unit::Hertz)?.magnitude;
+                let ppd = self.parse_count(ppd, "points-per-decade")?;
+                self.run_sparams_sweep(p1, p2, z, a, b, ppd)
+            }
             _ => Err(ShellError::Usage {
                 command: "run",
-                usage: "run tran [<dur> [<step>]] | op | ac <f0> <f1> [ppd] | dc <src> <start> <stop> <step> | noise <node> <f0> <f1> [ppd] | mc <node> <runs> [seed] | tf <node> <src> | sparams <p1> <p2> [z0] [freq]",
+                usage: "run tran [<dur> [<step>]] | op | ac <f0> <f1> [ppd] | dc <src> <start> <stop> <step> | noise <node> <f0> <f1> [ppd] | mc <node> <runs> [seed] | tf <node> <src> | fft <node> | sparams <p1> <p2> [z0] [f0 [f1 [ppd]]]",
             }),
         }
     }
@@ -1386,6 +1406,98 @@ impl Shell {
         Ok(out)
     }
 
+    /// `run sparams <p1> <p2> [z0] <f0> <f1> [ppd]` — sweep the two-port over a
+    /// log-spaced frequency range and draw the resulting **S11 locus** on the Smith
+    /// chart (`CP-UX-M10.1`). Where the single-frequency form plots one Γ dot, the
+    /// sweep calls [`Engine::s_parameters`](ohmforge_sim::Engine::s_parameters) at
+    /// each frequency and hands the whole Γ trajectory to
+    /// [`SmithChart::render`](ohmforge_instruments::SmithChart::render), so the
+    /// reflection coefficient's path across frequency is read straight off the grid.
+    fn run_sparams_sweep(
+        &self,
+        p1: &str,
+        p2: &str,
+        z0: f64,
+        f0: f64,
+        f1: f64,
+        ppd: u32,
+    ) -> Result<String, ShellError> {
+        let n1 = self.net_known(p1)?;
+        let n2 = self.net_known(p2)?;
+        if !(f0.is_finite() && f1.is_finite() && f0 > 0.0 && f1 > f0) {
+            return Err(ShellError::Usage {
+                command: "run",
+                usage: "run sparams <p1> <p2> [z0] <f0> <f1> [ppd] — the stop frequency must exceed a positive start",
+            });
+        }
+        let freqs = log_sweep(f0, f1, ppd);
+        let engine = Engine::new();
+        let mut locus = Vec::with_capacity(freqs.len());
+        for &f in &freqs {
+            let sp = engine
+                .s_parameters(&self.circuit, n1, n2, z0, f)
+                .map_err(ShellError::Sim)?;
+            locus.push(sp.s11);
+        }
+        let mut out = format!(
+            "S11 locus  (Z0 = {z0:.0} Ω, {f0:.3e} … {f1:.3e} Hz, {} pts)\n",
+            freqs.len()
+        );
+        out.push_str(&SmithChart::new(&format!("S11 locus ({p1})")).render(&locus));
+        Ok(out)
+    }
+
+    /// `run fft <node>` — render the magnitude spectrum of the probed node's last
+    /// transient capture (`CP-UX-M10.2`). Reuses the already-tested
+    /// [`magnitude_spectrum`](ohmforge_instruments::magnitude_spectrum) /
+    /// [`Spectrum`](ohmforge_instruments::Spectrum) instrument logic; a Hann window
+    /// tames spectral leakage so a clean tone lands in one bin.
+    fn run_fft(&self, node: &str) -> Result<String, ShellError> {
+        let sig = self.cached_transient_signal(node)?;
+        let spectrum = magnitude_spectrum(sig, Window::Hann);
+        Ok(Spectrum::new(&format!("FFT v({node})")).render(&spectrum))
+    }
+
+    /// `measure <node> [dc|rms|vpp|freq]` — a multimeter readout of the probed
+    /// node's last transient capture (`CP-UX-M10.2`), surfacing the existing DMM
+    /// [`Multimeter`](ohmforge_instruments::Multimeter) (Vpp / mean / RMS /
+    /// frequency). The selected mode is shown large; the others ride the summary
+    /// line.
+    fn cmd_measure(&self, args: &[&str]) -> Result<String, ShellError> {
+        let (node, mode) = match args {
+            [node] => (*node, DmmMode::DcVolts),
+            [node, m] => (*node, parse_dmm_mode(m)?),
+            _ => {
+                return Err(ShellError::Usage {
+                    command: "measure",
+                    usage: "measure <node> [dc|rms|vpp|freq]",
+                })
+            }
+        };
+        let sig = self.cached_transient_signal(node)?;
+        Ok(Multimeter::new(format!("DMM v({node})"))
+            .mode(mode)
+            .render(sig))
+    }
+
+    /// The cached transient series for a named node, for the instrument verbs
+    /// (`run fft` / `measure`). Rejects an unknown node name, and a missing capture
+    /// with the friendly [`ShellError::NoCapture`] (probe + `run tran` first).
+    fn cached_transient_signal(
+        &self,
+        node: &str,
+    ) -> Result<&ohmforge_core::signal::Signal, ShellError> {
+        self.net_known(node)?; // reject a typo'd / never-added node name
+        if self.last_transient.is_empty() {
+            return Err(ShellError::NoCapture);
+        }
+        let name = self.signal_name(node);
+        self.last_transient
+            .iter()
+            .find(|s| s.name == name)
+            .ok_or(ShellError::NoCapture)
+    }
+
     /// Solve the DC operating point and tabulate every named node's voltage.
     fn run_op(&self) -> Result<String, ShellError> {
         let signals = Engine::new()
@@ -1462,7 +1574,9 @@ impl Shell {
             "  run noise <node> <f0> <f1> [ppd]     output-referred noise PSD",
             "  run mc <node> <runs> [seed]  Monte-Carlo tolerance spread",
             "  run tf <node> <src>         transfer function / pole-zero report",
-            "  run sparams <p1> <p2> [z0] [f]   2-port S-parameters + Smith chart",
+            "  run sparams <p1> <p2> [z0] [f0 [f1 [ppd]]]   2-port S-params; a range sweeps an S11 locus",
+            "  run fft <node>              magnitude spectrum of the node's last transient",
+            "  measure <node> [dc|rms|vpp|freq]   multimeter readout of the last transient",
             "  show                        list the placed parts",
             "  undo                        revert the last add/wire/probe/set",
             "  checkpoint <name>           save the session under a name",
@@ -1614,6 +1728,34 @@ fn fmt_complex_rad(z: &Complex) -> String {
     }
 }
 
+/// Log-spaced sweep frequencies from `f0` to `f1` inclusive at `ppd` points per
+/// decade (at least the two endpoints). The last point is pinned exactly to `f1`
+/// so the locus always reaches the stop frequency. Callers validate `0 < f0 < f1`.
+fn log_sweep(f0: f64, f1: f64, ppd: u32) -> Vec<f64> {
+    let per = ppd.max(1) as f64;
+    let decades = (f1 / f0).log10();
+    let n = (decades * per).ceil().max(1.0) as usize;
+    let mut v: Vec<f64> = (0..=n).map(|i| f0 * 10f64.powf(i as f64 / per)).collect();
+    if let Some(last) = v.last_mut() {
+        *last = f1;
+    }
+    v
+}
+
+/// Map a DMM mode token (`dc`/`rms`/`vpp`/`freq`) to its [`DmmMode`].
+fn parse_dmm_mode(token: &str) -> Result<DmmMode, ShellError> {
+    match token.to_ascii_lowercase().as_str() {
+        "dc" => Ok(DmmMode::DcVolts),
+        "rms" => Ok(DmmMode::Rms),
+        "vpp" | "pp" => Ok(DmmMode::PeakToPeak),
+        "freq" | "f" => Ok(DmmMode::Frequency),
+        _ => Err(ShellError::Usage {
+            command: "measure",
+            usage: "measure <node> [dc|rms|vpp|freq]",
+        }),
+    }
+}
+
 /// `gnd`, `ground`, and `0` all name the ground reference.
 fn is_ground(name: &str) -> bool {
     matches!(name.to_ascii_lowercase().as_str(), "gnd" | "ground" | "0")
@@ -1680,6 +1822,9 @@ pub enum ShellError {
     },
     /// A `load` file was not a valid session.
     Session(SessionError),
+    /// An instrument verb (`run fft`, `measure`) ran with no cached transient to
+    /// read — the user must probe a node and run a transient first.
+    NoCapture,
     /// The simulation engine rejected or could not solve the circuit.
     Sim(SimError),
 }
@@ -1736,6 +1881,10 @@ impl fmt::Display for ShellError {
                 write!(f, "could not access {path:?}: {detail}")
             }
             ShellError::Session(e) => write!(f, "{e}"),
+            ShellError::NoCapture => write!(
+                f,
+                "no captured waveform — `probe <node>` then `run tran <dur> <step>` first"
+            ),
             ShellError::Sim(e) => write!(f, "simulation failed: {e}"),
         }
     }
@@ -2664,6 +2813,90 @@ mod tests {
         assert!(out.contains("S11 (Γ"), "renders a Smith chart:\n{out}");
         // An unknown port node is a clean error, not a panic.
         assert!(sh.execute("run sparams in nope").is_err());
+    }
+
+    /// Gate (`CP-UX-M10.1`): the swept `run sparams` form plots a multi-point S11
+    /// locus across frequency, not the single Γ dot the one-frequency form does. A
+    /// series inductor's reflection swings from near-through to near-open across
+    /// three decades, so its Γ traces an arc of distinct Smith cells.
+    #[test]
+    fn run_sparams_sweeps_an_s11_locus_across_frequency() {
+        let mut sh = Shell::new();
+        sh.execute("add L1 in out 100n").unwrap(); // series inductor between the two ports
+        let dots = |s: &str| s.chars().filter(|&c| c == '●').count();
+
+        let one = sh.execute("run sparams in out 50 1e6").unwrap(); // one frequency → one dot
+        let swept = sh.execute("run sparams in out 50 1e6 1e9 6").unwrap(); // three-decade sweep
+        assert!(swept.contains("S11 locus"), "names the locus:\n{swept}");
+        assert_eq!(
+            dots(&one),
+            1,
+            "the single-frequency form plots one point:\n{one}"
+        );
+        assert!(
+            dots(&swept) > dots(&one),
+            "the sweep plots more points than the single frequency:\n{swept}"
+        );
+        assert!(
+            dots(&swept) >= 3,
+            "a multi-point S11 locus is drawn:\n{swept}"
+        );
+        // A reversed / non-positive range is a clean error, not a panic.
+        assert!(sh.execute("run sparams in out 50 1e9 1e6").is_err());
+        assert!(sh.execute("run sparams in out 50 0 1e6").is_err());
+    }
+
+    /// Gate (`CP-UX-M10.2`): `run fft` and `measure` surface the FFT / DMM
+    /// instruments on a known sine capture — the peak bin lands at the drive
+    /// frequency (±1 bin) and the DMM's peak-to-peak reads ≈ 2·amplitude.
+    #[test]
+    fn run_fft_and_measure_read_a_known_sine() {
+        use ohmforge_instruments::{magnitude_spectrum, peak_bin, Window};
+        use ohmforge_tui::Backend;
+
+        let mut sh = Shell::new();
+        sh.execute("add V1 in gnd 0").unwrap();
+        sh.execute("set V1 sine 1 1k").unwrap(); // 1 V amplitude, 1 kHz
+        sh.execute("probe in").unwrap();
+        // A fixed step samples the 1 kHz sine uniformly (fs = 100 kHz, 10 periods).
+        sh.execute("run tran 10m 10u").unwrap();
+
+        // `run fft` renders a spectrum panel with a peak readout.
+        let fft = sh.execute("run fft in").unwrap();
+        assert!(fft.contains("FFT v(in)"), "a spectrum panel:\n{fft}");
+        assert!(fft.contains("peak"), "a peak readout:\n{fft}");
+
+        // The peak bin lands at the 1 kHz drive, within one FFT bin.
+        let cached = sh.transient();
+        let spectrum = magnitude_spectrum(&cached[0], Window::Hann);
+        let (f_peak, _db) = peak_bin(&spectrum).expect("a dominant bin");
+        let bin = spectrum.x[1] - spectrum.x[0];
+        assert!(
+            (f_peak - 1000.0).abs() <= bin,
+            "peak at {f_peak} Hz, want 1 kHz within one {bin} Hz bin"
+        );
+
+        // `measure` reports Vpp ≈ 2·amplitude on the same capture.
+        let vpp = sh.execute("measure in vpp").unwrap();
+        assert!(vpp.contains("Vpp"), "the DMM reports Vpp:\n{vpp}");
+        let reading = ohmforge_instruments::measure(&cached[0]);
+        assert!(
+            (reading.vpp - 2.0).abs() < 0.05,
+            "Vpp ≈ 2 V for a 1 V sine, got {}",
+            reading.vpp
+        );
+
+        // Without a capture, the instrument verbs fail cleanly (no panic).
+        let mut empty = Shell::new();
+        empty.execute("add R1 a b 1k").unwrap();
+        assert!(matches!(
+            empty.execute("run fft a"),
+            Err(ShellError::NoCapture)
+        ));
+        assert!(matches!(
+            empty.execute("measure a"),
+            Err(ShellError::NoCapture)
+        ));
     }
 
     /// Regression: `run noise` reaches the noise engine and reports a PSD readout.
