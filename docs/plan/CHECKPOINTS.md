@@ -203,7 +203,7 @@ _(Maintenance, post-v0.8.0: **elite landing-page redesign** + `.gitattributes` (
 
 ---
 
-## M10 — improvements across every area  🚧 in progress → plan: [`M10-PLAN.md`](M10-PLAN.md)
+## M10 — improvements across every area  ✅ complete (13/13) → plan: [`M10-PLAN.md`](M10-PLAN.md)
 
 _From a six-track planning fan-out (`docs/plan/m10-proposals/*.md`). Executed in dependency waves: W1 sim-core/boards/ui-shell/ai-fmt · W2 web (after AF-M10.1) · W3 platform. Standing rules hold; determinism-moving work ships opt-in._
 
@@ -219,7 +219,7 @@ _From a six-track planning fan-out (`docs/plan/m10-proposals/*.md`). Executed in
 - [x] **CP-WEB-M10.2** (web, W2) In-browser AC/Bode (bind `Analysis::Ac` + SVG Bode) + PWA/offline (service worker + manifest). — *gate:* host-test for the AC binding; a registered service worker + valid manifest. `run_ac`/`AcReport::{to_json,to_svg}` + wasm `ac`/`ac_bode_svg` bindings; a Bode panel in `index.html`. Added `www/manifest.webmanifest` + `www/sw.js` (cache-first shell + `pkg/`), registered from `index.html` degrading gracefully. Tests `ac_sweep_hits_minus_3db_at_the_rc_corner`, `ac_json_is_wellformed`, `ac_bode_svg_renders_a_plot`, `ac_svg_without_a_drive_renders_a_hint_not_a_crash`, `manifest_is_valid_and_complete`, `service_worker_precaches_the_app_shell_and_wasm`.
 - [x] **CP-PLAT-M10.1** (platform, W3) Performance-regression CI — run the Criterion `solve`/`parse` benches vs a committed baseline and flag regressions. — *gate (passing):* `python3 -I benches/ci/compare.py` runs the hot-path quick-pass (`value_parse/mix`, `op_point/ladder_16`, `transient/rc_1000`, `transient/rlc_500`) against the committed `benches/baseline.json` (threshold +25%) and reports PASS (exit 0); a seeded regression exits 1. New `.github/workflows/perf.yml` (push-to-`main` + `workflow_dispatch`, off the PR matrix) runs the benches then invokes the script; `just bench-ci` mirrors it.
 - [x] **CP-PLAT-M10.2** (platform, W3) Fuzzing + property tests (`proptest`/`cargo-fuzz`, dev-only) on the parsers + a solver KCL-residual property. — *gate (passing):* proptest suites green under `cargo test --workspace` — `value_proptest::{parse_never_panics, parse_eng_tokens_never_panic, plain_number_roundtrips}`, `expr_proptest::{parse_never_panics, parse_boolean_tokens_never_panic, valid_expr_parses_and_evals}`, `import_proptest::{netlist_parse_never_panics, spice_import_never_panics, spice_shaped_lines_never_panic, spice_export_import_roundtrips}`, `kcl_proptest::op_point_satisfies_kcl`. Surfaced + fixed a real UTF-8 panic in the digital `Expr` lexer (`hdl.rs` byte-index slice; regression seed committed). Standalone `fuzz/` cargo-fuzz workspace (excluded from the main workspace) with targets `value_parse`/`netlist_parse`/`spice_import`/`digital_expr` — `cargo +nightly fuzz build` + 5s smoke each clean; `.github/workflows/fuzz.yml` builds + smokes them. `cargo tree -e normal` shows no `proptest`/`libfuzzer-sys`/`arbitrary` in any shipped crate.
-- [ ] **CP-SHIP.6** (platform) Polish & tag **v0.9.0**: full CI-parity gate sweep, README/docs/CHANGELOG refreshed to M0–M10, tag.
+- [x] **CP-SHIP.6** (platform) Polish & tag **v0.9.0**: full CI-parity gate sweep (fmt + `clippy -D warnings` + `cargo test --workspace` + `--features http`/`relay` + `wasm32` core & `ohmforge-web` + `-D warnings` docs) all exit-0 on fully-merged `main`; README/CHANGELOG refreshed to M0–M10; **v0.9.0** tagged + pushed.
 
 ---
 
@@ -231,9 +231,9 @@ _From a six-track planning fan-out (`docs/plan/m10-proposals/*.md`). Executed in
 | boards | 20 | 0 | 20 |
 | ui-shell | 25 | 0 | 25 |
 | ai-fmt | 21 | 0 | 21 |
-| platform | 11 | 0 | 14 |
+| platform | 14 | 0 | 14 |
 | web | 9 | 0 | 9 |
-| **Total** | **116** | **0** | **119** |
+| **Total** | **119** | **0** | **119** |
 
 _**67/67 — M0 through M4 all complete** (M0–M3 tagged v0.1.0; M4 adds the rest). M4 delivered the **plugin device-model API** + an **instrument/block plugin trait**, a **KLU-class ordered/reusable sparse solver** and **multithreaded analyses**, a **Cortex-M3/M4 (Thumb-2)** core with an STM32 board, **SPICE `.model` import** + a vendor model library, and **shareable circuit links** in the browser. Deferred by design: real-time collaboration, the QEMU full-SBC bridge, and full vendor-SPICE `.model` fidelity — the standing M-next horizon._
 

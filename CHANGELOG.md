@@ -12,6 +12,22 @@ timestamps see the Git tag history.
 
 _Nothing yet. Open a [Discussion](https://github.com/ohmforge/ohmforge/discussions) or [Issue](https://github.com/ohmforge/ohmforge/issues) to propose the next change._
 
+## [0.9.0]
+
+**M10 — improvements across every area** (from a six-track planning fan-out).
+
+### Added
+- **Simulation:** opt-in **trapezoidal integration** (`IntegrationMethod`, Backward-Euler stays default) so LC tanks ring correctly; a reusable ordered **complex-solver** for AC/noise (**~6–18× faster swept-AC** at scale).
+- **MCU:** Cortex-M **Thumb-2 correctness** (`CBZ/CBNZ`, `UDIV/SDIV`, load/store writeback) so compiled C runs, a graceful `Unknown`-opcode halt (no panic), and **AVR Timer0/1 + USART interrupt vectors** (`millis`/`delay`/`Serial`-style ISRs).
+- **UI:** live oscilloscope **trigger + Δt/Δv/freq cursors** in the scope pane, a swept **Smith S11 locus**, a `?`/F1 **help/keymap overlay**, and `run fft` / `measure` shell verbs.
+- **Formats/AI:** **Touchstone `.s2p`** export; **SINE/PULSE** source parsing in the netlist importer; 3 new DRC rules, 11 new calculators, 10 new catalog parts in the offline (no-key) copilot.
+- **Browser:** diodes/BJTs/MOSFETs/current sources now **simulate in the browser** (auto-routing through the SPICE importer); in-browser **AC/Bode**; **PWA/offline** (manifest + service worker).
+- **Platform:** a **performance-regression CI** (Criterion benches vs a committed baseline), and **`proptest` property tests + `cargo-fuzz` targets** on the parsers and a solver KCL property (dev-only; shipped crates stay dependency-free).
+
+### Fixed
+- Digital `Expr` lexer panicked on multi-byte UTF-8 input (found by the new fuzzing); now iterates `char_indices`.
+- README `cargo run -p ohmforge` commands disambiguated to `--bin of`/`--bin eesh` (two binaries).
+
 ## [0.8.1]
 
 ### Added

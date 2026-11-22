@@ -14,7 +14,7 @@
   <img src="https://img.shields.io/badge/built%20with-Rust-dea584.svg" alt="Built with Rust">
   <img src="https://img.shields.io/badge/runs-terminal%20%2B%20WASM-ff9f1c.svg" alt="Terminal + WASM">
   <img src="https://img.shields.io/badge/no%20cloud-required-brightgreen.svg" alt="No cloud required">
-  <a href="docs/plan/CHECKPOINTS.md"><img src="https://img.shields.io/badge/milestones-M0–M9%20✓-success.svg" alt="M0–M9 complete"></a>
+  <a href="docs/plan/CHECKPOINTS.md"><img src="https://img.shields.io/badge/milestones-M0–M10%20✓-success.svg" alt="M0–M10 complete"></a>
 </p>
 
 ---
@@ -78,7 +78,7 @@ Scripts are plain `.eesh` files — see [`examples/`](examples/README.md). Pipe 
 - **AI copilot** — Ask / Design / Debug / Firmware, grounded in the real engine via a verify loop, with spec-driven auto-tune and a tutor — plus a fully **offline, no-key** mode (DRC, value calculators, parts index, grader).
 - **Browser** — a WASM build with an in-page editor, a **drag-and-drop schematic canvas**, a runnable example gallery with live component tuning, shareable-session links, and real-time co-editing.
 
-Full status and the 106-checkpoint ledger: [`docs/plan/CHECKPOINTS.md`](docs/plan/CHECKPOINTS.md). Current release: **v0.8.0** (M0–M9 complete). The whole workspace stays green — `clippy -D warnings`, `wasm32` core + `ohmforge-web`, `-D warnings` docs.
+Full status and the 119-checkpoint ledger: [`docs/plan/CHECKPOINTS.md`](docs/plan/CHECKPOINTS.md). Current release: **v0.9.0** (M0–M10 complete). M10 was a breadth push across every area: a reusable complex-solver (**6–18× faster AC sweeps**) + opt-in trapezoidal integration; **Cortex-M Thumb-2 correctness** + AVR timer/USART interrupts; live oscilloscope cursors + a swept Smith locus; **Touchstone `.s2p` export** + SINE/PULSE netlist parsing + deeper offline DRC; **SPICE devices, AC/Bode and PWA/offline in the browser**; and perf-regression CI + fuzzing/property tests. The whole workspace stays green — `clippy -D warnings`, `wasm32` core + `ohmforge-web`, `-D warnings` docs.
 
 ## The AI copilot
 
