@@ -17,3 +17,8 @@ workspace = true
 # The kernel is self-contained: integer femtosecond time and index-based nets,
 # no shared ohmforge-core types needed yet. Kept dependency-free so it stays trivially
 # WASM/MSRV-clean. (M2 bus/protocol work may reintroduce an ohmforge-core dep.)
+
+[dev-dependencies]
+# Property tests only (CP-PLAT-M10.2); dev-dep, so the shipped crate stays
+# dependency-free and wasm/MSRV-clean.
+proptest = { workspace = true }

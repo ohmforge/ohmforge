@@ -2,6 +2,11 @@
 # See docs/ARCHITECTURE.md for what each crate does.
 [workspace]
 resolver = "2"
+# The `fuzz/` crate is a standalone cargo-fuzz workspace (its own [workspace],
+# nightly + libFuzzer only). It is intentionally EXCLUDED so the default
+# `cargo build/test/clippy --workspace` never pulls in libfuzzer-sys and nothing
+# shipped depends on it. (CP-PLAT-M10.2.)
+exclude = ["fuzz"]
 members = [
     "crates/ohmforge-core",
     "crates/ohmforge-sim",
@@ -44,6 +49,9 @@ ohmforge-fmt         = { path = "crates/ohmforge-fmt", version = "0.8.1" }
 ohmforge-tui         = { path = "crates/ohmforge-tui", version = "0.8.1" }
 ohmforge-shell       = { path = "crates/ohmforge-shell", version = "0.8.1" }
 ohmforge-ai          = { path = "crates/ohmforge-ai", version = "0.8.1" }
+# Dev-only (never a normal/shipped dependency): property-testing harness shared
+# across the parser crates' and the solver's `[dev-dependencies]`. (CP-PLAT-M10.2.)
+proptest = "1"
 # Third-party (uncomment as milestones need them):
 # ratatui   = "0.28"
 # crossterm = "0.28"

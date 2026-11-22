@@ -245,55 +245,59 @@ enum Tok {
 /// word operator forms are both accepted.
 fn lex(src: &str) -> Result<Vec<Tok>, ExprError> {
     let mut out = Vec::new();
-    let bytes = src.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i] as char;
+    // Iterate by `char`, not raw bytes: a multi-byte UTF-8 char must advance by
+    // its full length and must never be sliced mid-codepoint. (A non-ASCII letter
+    // becomes an identifier that later resolves to an UnknownName; a stray symbol
+    // is a clean Syntax error — neither panics. Regression: CP-PLAT-M10.2 proptest.)
+    let mut chars = src.char_indices().peekable();
+    while let Some(&(start, c)) = chars.peek() {
         match c {
-            c if c.is_whitespace() => i += 1,
+            c if c.is_whitespace() => {
+                chars.next();
+            }
             '&' => {
                 out.push(Tok::And);
-                i += 1;
+                chars.next();
             }
             '|' => {
                 out.push(Tok::Or);
-                i += 1;
+                chars.next();
             }
             '^' => {
                 out.push(Tok::Xor);
-                i += 1;
+                chars.next();
             }
             '!' | '~' => {
                 out.push(Tok::Not);
-                i += 1;
+                chars.next();
             }
             '(' => {
                 out.push(Tok::LParen);
-                i += 1;
+                chars.next();
             }
             ')' => {
                 out.push(Tok::RParen);
-                i += 1;
+                chars.next();
             }
             '0' => {
                 out.push(Tok::Zero);
-                i += 1;
+                chars.next();
             }
             '1' => {
                 out.push(Tok::One);
-                i += 1;
+                chars.next();
             }
             c if c.is_alphabetic() || c == '_' => {
-                let start = i;
-                while i < bytes.len() {
-                    let d = bytes[i] as char;
+                let mut end = start;
+                while let Some(&(idx, d)) = chars.peek() {
                     if d.is_alphanumeric() || d == '_' {
-                        i += 1;
+                        end = idx + d.len_utf8();
+                        chars.next();
                     } else {
                         break;
                     }
                 }
-                let word = &src[start..i];
+                let word = &src[start..end];
                 match word.to_ascii_lowercase().as_str() {
                     "and" => out.push(Tok::And),
                     "or" => out.push(Tok::Or),

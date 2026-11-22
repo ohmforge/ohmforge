@@ -43,6 +43,21 @@ wasm:
 bench:
     cargo bench --workspace
 
+# The perf-regression gate (CP-PLAT-M10.1): run the hot-path benches with the
+# quick-pass settings and diff their means against benches/baseline.json. Mirrors
+# the `perf` CI workflow. Append `--update` args via `just bench-ci-update`.
+bench-ci:
+    cargo bench -p ohmforge-core --bench parse -- --warm-up-time 0.2 --measurement-time 1.0 --sample-size 20 'value_parse/mix'
+    cargo bench -p ohmforge-sim --bench solve -- --warm-up-time 0.2 --measurement-time 1.0 --sample-size 20 'op_point/ladder_16|transient/'
+    python3 -I benches/ci/compare.py
+
+# Regenerate the committed perf baseline from a fresh quick-pass run (use only
+# after an intentional, reviewed performance change).
+bench-ci-update:
+    cargo bench -p ohmforge-core --bench parse -- --warm-up-time 0.2 --measurement-time 1.0 --sample-size 20 'value_parse/mix'
+    cargo bench -p ohmforge-sim --bench solve -- --warm-up-time 0.2 --measurement-time 1.0 --sample-size 20 'op_point/ladder_16|transient/'
+    python3 -I benches/ci/compare.py --update
+
 # Run the app.
 run *ARGS:
     cargo run -p ohmforge -- {{ARGS}}

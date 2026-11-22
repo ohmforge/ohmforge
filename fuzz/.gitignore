@@ -1,0 +1,5 @@
+# cargo-fuzz build + run artifacts (the committed `corpus/` seeds are kept).
+/target
+/artifacts
+/coverage
+Cargo.lock
