@@ -199,7 +199,27 @@ _(Post-M8: rebranded ee-assist → **ohmforge**, published to github.com/ohmforg
 - [x] **CP-WEB.8** (web) Drag-and-drop schematic canvas in the browser: place/wire parts visually, round-trip to netlist + re-simulate. A pure host-tested `Schematic` model (grid `Point` terminals + `Wire`s union into nodes, ground markers, deterministic `n1…`/`gnd` naming) serializes to the R/C/L/V netlist `run`/`simulate` accept; a line-oriented canvas blob + JSON layout cross the thin `canvas_netlist`/`canvas_layout` wasm bindings. The page gains an SVG grid editor (R/C/L/V/ground palette, drag-to-wire, move/delete, Simulate) alongside the preserved demo/gallery/tune-slider/co-edit. — *gate:* `canvas_schematic_serializes_to_a_simulatable_netlist`, `canvas_place_wire_remove_round_trips`, `canvas_blob_parses_and_rejects_garbage_cleanly`, `canvas_empty_and_invalid_parts_are_clean` (4 new host tests, 38 total in `ohmforge-web`); fmt + clippy(`-D warnings`) + test(workspace) + wasm(`ohmforge-web`/`-core`/`-sim`) + doc all green; no new deps. Palette is R/C/L/V only (the web `simulate` path's `classify()` accepts no other kind).
 - [x] **CP-SHIP.5** (platform) Polish & tag **v0.8.0**: full CI-parity gate sweep (fmt + `clippy -D warnings` + `cargo test --workspace` (39 suites) + feature tests + `wasm32` core & `ohmforge-web` + `-D warnings` docs) all green on fully-merged `main`; README refreshed to M0–M9; **v0.8.0** tagged + pushed.
 
-_(Maintenance, post-v0.8.0: **elite landing-page redesign** + `.gitattributes` (eol=lf) and crossterm `windows` feature → **CI green on Linux/macOS/Windows**; manifest warnings cleaned. **M10 follow-ups shipped:** `run tran <dur> <step>` fixed-step transient (samples sine/PWM sources that the adaptive default strode past — test `run_tran_fixed_step_samples_a_sine`), and `run sparams <p1> <p2> [z0] [freq]` wiring `Engine::s_parameters` S11 onto a Smith chart (test `run_sparams_reports_s_params_and_a_smith_chart`). Tagged v0.8.1.)_
+_(Maintenance, post-v0.8.0: **elite landing-page redesign** + `.gitattributes` (eol=lf) and crossterm `windows` feature → **CI green on Linux/macOS/Windows**; manifest warnings cleaned. **Post-M9 follow-ups shipped:** `run tran <dur> <step>` fixed-step transient (samples sine/PWM sources that the adaptive default strode past — test `run_tran_fixed_step_samples_a_sine`), and `run sparams <p1> <p2> [z0] [freq]` wiring `Engine::s_parameters` S11 onto a Smith chart (test `run_sparams_reports_s_params_and_a_smith_chart`). Tagged v0.8.1.)_
+
+---
+
+## M10 — improvements across every area  🚧 in progress → plan: [`M10-PLAN.md`](M10-PLAN.md)
+
+_From a six-track planning fan-out (`docs/plan/m10-proposals/*.md`). Executed in dependency waves: W1 sim-core/boards/ui-shell/ai-fmt · W2 web (after AF-M10.1) · W3 platform. Standing rules hold; determinism-moving work ships opt-in._
+
+- [~] **CP-SIM-M10.1** (sim-core) Reuse the ordered symbolic/numeric factorization on the complex AC/noise solver (re-factors every swept frequency today), size-gated. — *gate:* AC/noise bit-for-bit vs today, swept-AC benchmark markedly faster at scale, golden suite unchanged.
+- [~] **CP-SIM-M10.2** (sim-core) Opt-in trapezoidal/Gear-2 transient integration (Backward-Euler stays default). — *gate:* an LC tank rings with trap where BE over-damps; the BE path stays bit-for-bit; selectable via the analysis API.
+- [~] **CP-BRD-M10.1** (boards) Cortex-M Thumb-2 correctness (`CBZ/CBNZ`, `UDIV/SDIV`, load/store writeback) + graceful `Unknown` opcode (no `debug_assert!` panic). — *gate:* a Thumb-2 program hitting CBZ/UDIV/writeback runs correctly; an unknown opcode no longer panics in test builds.
+- [~] **CP-BRD-M10.2** (boards) AVR timer + USART interrupt vectors (`millis`/`delay`/`Serial` ISR firmware). — *gate:* a timer-overflow ISR advances a counter at the expected rate; a USART-RX ISR fires on a received byte.
+- [~] **CP-UX-M10.1** (ui-shell) Wire the real `Oscilloscope` (trigger/cursors/measurements) into the live scope pane + sweep `run sparams` into an S11 locus on the Smith chart. — *gate:* no-tty tests — cursors read Δt/Δv on a known capture; the Smith pane plots a swept S11 locus.
+- [~] **CP-UX-M10.2** (ui-shell) In-TUI help/keymap overlay (`?`/F1); fix the `RUN_ANALYSES` completion omission of `sparams`; surface FFT/DMM as shell verbs. — *gate:* completion offers `sparams`; the overlay renders the keymap (asserted on data).
+- [~] **CP-AF-M10.1** (ai-fmt) Touchstone `.sNp` export (sweep `Engine::s_parameters`; exporter takes `Complex` so `ohmforge-fmt` stays core-only) + SINE/PULSE waveform parsing in the netlist importer. — *gate:* a byte-exact Touchstone golden; a netlist with a `SINE`/`PULSE` source imports and simulates.
+- [~] **CP-AF-M10.2** (ai-fmt) Deeper offline no-key heuristics — more DRC rules, value calculators, parts catalog (pure, deterministic). — *gate:* each new rule/calculator unit-tested vs hand analysis; surfaced by `of review` with no key/network.
+- [ ] **CP-WEB-M10.1** (web, W2) Unlock diodes/transistors/current sources in the browser via the existing wasm-clean `ohmforge_fmt::spice::import`. — *gate:* a diode/BJT deck imports and solves through the web path.
+- [ ] **CP-WEB-M10.2** (web, W2) In-browser AC/Bode (bind `Analysis::Ac` + SVG Bode) + PWA/offline (service worker + manifest). — *gate:* host-test for the AC binding; a registered service worker + valid manifest.
+- [ ] **CP-PLAT-M10.1** (platform, W3) Performance-regression CI — run the Criterion `solve`/`parse` benches vs a committed baseline and flag regressions. — *gate:* the CI job runs and compares to baseline.
+- [ ] **CP-PLAT-M10.2** (platform, W3) Fuzzing + property tests (`proptest`/`cargo-fuzz`, dev-only) on the parsers + a solver KCL-residual property. — *gate:* proptest suites pass, fuzz targets build + smoke in CI, shipped crates stay dependency-free.
+- [ ] **CP-SHIP.6** (platform) Polish & tag **v0.9.0**: full CI-parity gate sweep, README/docs/CHANGELOG refreshed to M0–M10, tag.
 
 ---
 
@@ -207,13 +227,13 @@ _(Maintenance, post-v0.8.0: **elite landing-page redesign** + `.gitattributes` (
 
 | Track | Done | In progress | Total |
 |---|---|---|---|
-| sim-core | 28 | 0 | 28 |
-| boards | 18 | 0 | 18 |
-| ui-shell | 23 | 0 | 23 |
-| ai-fmt | 19 | 0 | 19 |
-| platform | 11 | 0 | 11 |
-| web | 7 | 0 | 7 |
-| **Total** | **106** | **0** | **106** |
+| sim-core | 28 | 2 | 30 |
+| boards | 18 | 2 | 20 |
+| ui-shell | 23 | 2 | 25 |
+| ai-fmt | 19 | 2 | 21 |
+| platform | 11 | 0 | 14 |
+| web | 7 | 0 | 9 |
+| **Total** | **106** | **8** | **119** |
 
 _**67/67 — M0 through M4 all complete** (M0–M3 tagged v0.1.0; M4 adds the rest). M4 delivered the **plugin device-model API** + an **instrument/block plugin trait**, a **KLU-class ordered/reusable sparse solver** and **multithreaded analyses**, a **Cortex-M3/M4 (Thumb-2)** core with an STM32 board, **SPICE `.model` import** + a vendor model library, and **shareable circuit links** in the browser. Deferred by design: real-time collaboration, the QEMU full-SBC bridge, and full vendor-SPICE `.model` fidelity — the standing M-next horizon._
 
