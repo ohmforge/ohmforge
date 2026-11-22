@@ -465,7 +465,18 @@ select {
   max-width: 100%;
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
+.demo-head-actions { display: flex; align-items: center; gap: 8px; }
 .scope-label { display: flex; align-items: center; justify-content: space-between; margin-top: var(--s-4); }
+.bode-plot {
+  margin: 6px 0 0;
+  background: var(--field);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  padding: 10px;
+  color: var(--scope);
+  overflow: hidden;
+}
+.bode-plot .bode-svg { display: block; width: 100%; height: auto; }
 pre.scope {
   margin: 6px 0 0;
   overflow: auto;

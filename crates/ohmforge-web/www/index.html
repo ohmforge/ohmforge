@@ -11,6 +11,7 @@
     <meta name="theme-color" content="#fbfbfd" media="(prefers-color-scheme: light)" />
     <meta name="theme-color" content="#0f1115" media="(prefers-color-scheme: dark)" />
     <link rel="icon" href="./ohmforge-mark.svg" type="image/svg+xml" />
+    <link rel="manifest" href="./manifest.webmanifest" />
     <link rel="stylesheet" href="./style.css" />
   </head>
   <body>
@@ -108,7 +109,10 @@
             <div class="demo-body">
               <div class="demo-head">
                 <label for="netlist" style="margin:0">Netlist</label>
-                <button id="run" class="btn tiny" type="button" disabled>Run it</button>
+                <span class="demo-head-actions">
+                  <button id="bode" class="btn tiny" type="button" disabled>Bode (AC)</button>
+                  <button id="run" class="btn tiny" type="button" disabled>Run it</button>
+                </span>
               </div>
               <textarea id="netlist" spellcheck="false"></textarea>
 
@@ -116,6 +120,15 @@
                 <label style="margin:0">Scope — transient node voltages (braille)</label>
               </div>
               <pre class="scope" id="scope">(loading…)</pre>
+
+              <!-- In-browser AC / Bode plot (CP-WEB-M10.2). Hidden until the user
+                   asks for it; drive the sweep by marking a source with SINE(…). -->
+              <div class="bode-wrap" id="bode-wrap" hidden>
+                <div class="scope-label">
+                  <label style="margin:0">Bode — AC magnitude vs. frequency</label>
+                </div>
+                <div class="bode-plot" id="bode-plot"></div>
+              </div>
 
               <!-- Live "tune" slider — sweeps one component of the loaded example and
                    re-runs the sim on every drag, through the real edit_remove/edit_add
@@ -387,6 +400,18 @@
       const statusEl = $("status");
       const errEl = $("error");
 
+      // PWA / offline (CP-WEB-M10.2): register the service worker so the shell +
+      // wasm bundle are cached and the fully client-side simulator works offline
+      // and is installable. Degrade silently where SW is unavailable (older
+      // browsers, insecure origins, private windows) — the page still runs.
+      if ("serviceWorker" in navigator) {
+        window.addEventListener("load", () => {
+          navigator.serviceWorker
+            .register("./sw.js")
+            .catch((e) => console.warn("ohmforge: service worker registration failed —", e));
+        });
+      }
+
       // Terminal snippet copy button (works with or without WASM).
       $("copy-term").addEventListener("click", async () => {
         const text = $("term-code").innerText
@@ -427,6 +452,7 @@
       const {
         default: init,
         simulate,
+        ac_bode_svg,
         decode_share,
         list_parts,
         edit_add,
@@ -718,6 +744,26 @@ L1 mid gnd 0.1
             .join("");
         statusEl.textContent = `OK — ${r.nodes.length} node(s), ${r.x.length} transient sample(s).`;
         refreshParts();
+      }
+
+      // --- In-browser AC / Bode (CP-WEB-M10.2) ---------------------------
+      // Sweep the deck's AC response and drop the hand-rolled SVG the Rust side
+      // renders straight into the page. The deck drives the sweep by marking a
+      // source with a SINE(…) stimulus; a deck without one gets a readable hint.
+      function runBode() {
+        errEl.textContent = "";
+        const wrap = $("bode-wrap");
+        let svg;
+        try {
+          svg = ac_bode_svg(netlist.value, 10, 1e6, 20, 640, 260);
+        } catch (e) {
+          wrap.hidden = true;
+          errEl.textContent = String(e);
+          return;
+        }
+        $("bode-plot").innerHTML = svg;
+        wrap.hidden = false;
+        statusEl.textContent = "AC sweep complete — Bode magnitude plotted.";
       }
 
       // --- Structured editing (CP-WEB.3) ---------------------------------
@@ -1096,12 +1142,14 @@ L1 mid gnd 0.1
         .then(() => {
           statusEl.textContent = "Ready.";
           $("run").disabled = false;
+          $("bode").disabled = false;
           $("share").disabled = false;
           $("p-add").disabled = false;
           $("coedit").disabled = false;
           CV.wire();
           CV.enable();
           $("run").addEventListener("click", runSim);
+          $("bode").addEventListener("click", runBode);
           $("share").addEventListener("click", shareLink);
           $("p-add").addEventListener("click", addPart);
           $("coedit").addEventListener("click", toggleCoedit);
