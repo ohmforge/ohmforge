@@ -33,6 +33,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          # libFuzzer's sanitizers need a dynamic libc; pin the gnu target so
+          # cargo-fuzz doesn't default to the static musl target (crt-static,
+          # which the sanitizer rejects: "incompatible with statically linked libc").
+          targets: x86_64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "fuzz"
@@ -42,7 +47,7 @@ jobs:
           tool: cargo-fuzz
       - name: Build all fuzz targets
         working-directory: fuzz
-        run: cargo +nightly fuzz build
+        run: cargo +nightly fuzz build --target x86_64-unknown-linux-gnu
       # A few seconds per target on a push/dispatch; five minutes each nightly.
       - name: Smoke each target
         working-directory: fuzz
@@ -54,5 +59,5 @@ jobs:
           fi
           for target in value_parse netlist_parse spice_import digital_expr; do
             echo "=== fuzzing $target for ${MAX_TIME}s ==="
-            cargo +nightly fuzz run "$target" -- -max_total_time="$MAX_TIME"
+            cargo +nightly fuzz run "$target" --target x86_64-unknown-linux-gnu -- -max_total_time="$MAX_TIME"
           done
