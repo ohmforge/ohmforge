@@ -1,0 +1,26 @@
+{
+  "name": "ohmforge — circuit & firmware workbench",
+  "short_name": "ohmforge",
+  "description": "A fully client-side circuit simulator: parse a netlist or SPICE deck, solve op-point / transient / AC, all in your browser.",
+  "id": "/",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "theme_color": "#0f1115",
+  "background_color": "#0f1115",
+  "icons": [
+    {
+      "src": "./ohmforge-mark.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "./ohmforge-logo.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "maskable"
+    }
+  ]
+}

@@ -44,7 +44,7 @@ pub struct Report {
 /// comes back as a human-readable `String` (the wasm layer turns it into a JS
 /// exception; the host test asserts on it).
 pub fn run(netlist: &str, duration: f64, step: Option<f64>) -> Result<Report, String> {
-    let circuit = ohmforge_fmt::netlist::parse(netlist).map_err(|e| e.to_string())?;
+    let circuit = parse_deck(netlist)?;
     let engine = Engine::new();
 
     let op_sigs = engine
@@ -108,6 +108,72 @@ fn render_scope(title: &str, x: &[f64], nodes: &[(String, Vec<f64>)]) -> String 
         out.push('\n');
     }
     out
+}
+
+// --- Deck parsing: netlist for R/C/L/V, SPICE for everything richer ---------
+//
+// The historical web path routed every deck through `ohmforge_fmt::netlist::parse`,
+// whose `classify()` only knows R/C/L/V — so diodes, transistors and current
+// sources (all of which `ohmforge-sim` already models) could never reach the
+// browser. `ohmforge-fmt` also ships a full, wasm-clean SPICE importer
+// (`spice::import`) that lifts R/C/L/V/I **plus** `.model`-backed `D`/`Q`/`M`
+// devices and `SINE(...)`/`PULSE(...)` stimuli into a `Circuit`.
+//
+// We route a deck through whichever parser it needs (CP-WEB-M10.1). A plain
+// R/C/L/V/.title netlist keeps going through the *unchanged* `netlist::parse`
+// path — byte-for-byte the same behaviour (and error messages) as before, so
+// every existing demo/gallery/canvas deck is untouched. A deck that uses a
+// capability only the SPICE importer understands — a `.model` card, a `D`/`Q`/`M`
+// device, a current source `I…`, or a `SINE`/`PULSE` waveform — is lifted by
+// `spice::import` instead, which is where diodes/BJTs/MOSFETs come alive.
+
+/// Parse a deck into a [`Circuit`](ohmforge_core::graph::Circuit), auto-selecting
+/// the netlist or SPICE parser.
+///
+/// See the module notes above: a bare R/C/L/V/`.title` netlist uses the original
+/// `netlist::parse` (unchanged); anything the SPICE importer alone can handle
+/// (`.model`, `D`/`Q`/`M`, a current source, a `SINE`/`PULSE` stimulus) is routed
+/// to `spice::import`. Errors from either parser are returned verbatim as strings.
+pub fn parse_deck(src: &str) -> Result<ohmforge_core::graph::Circuit, String> {
+    if looks_like_spice(src) {
+        ohmforge_fmt::spice::import(src).map_err(|e| e.to_string())
+    } else {
+        ohmforge_fmt::netlist::parse(src).map_err(|e| e.to_string())
+    }
+}
+
+/// Whether a deck needs the richer SPICE importer. True when any line declares a
+/// `.model` card, references a diode/BJT/MOSFET (`D`/`Q`/`M`) or current source
+/// (`I`), or carries a `SINE(…)`/`PULSE(…)` stimulus — none of which the plain
+/// R/C/L/V netlist grammar accepts. A deck that uses none of these is a classic
+/// netlist and stays on the original path, so R/C/L/V behaviour never changes.
+fn looks_like_spice(src: &str) -> bool {
+    for raw in src.lines() {
+        let text = strip_netlist_comment(raw).trim();
+        if text.is_empty() {
+            continue;
+        }
+        if let Some(rest) = text.strip_prefix('.') {
+            if rest
+                .split_whitespace()
+                .next()
+                .is_some_and(|w| w.eq_ignore_ascii_case("model"))
+            {
+                return true;
+            }
+            continue; // `.title` and other directives do not force the SPICE path
+        }
+        if let Some(c) = text.chars().next() {
+            if matches!(c.to_ascii_uppercase(), 'D' | 'Q' | 'M' | 'I') {
+                return true;
+            }
+        }
+        let upper = text.to_ascii_uppercase();
+        if upper.contains("SINE(") || upper.contains("SIN(") || upper.contains("PULSE(") {
+            return true;
+        }
+    }
+    false
 }
 
 impl Report {
@@ -185,6 +251,303 @@ fn push_json_nums(out: &mut String, xs: &[f64]) {
         push_json_num(out, v);
     }
     out.push(']');
+}
+
+// --- In-browser AC / Bode analysis (CP-WEB-M10.2) --------------------------
+//
+// `ohmforge-sim` already solves a small-signal AC sweep (`Analysis::Ac`), keyed
+// off a source carrying a `Waveform::Sine` as the 1∠0 drive — and the merged
+// `ohmforge-fmt` SINE parsing now gives an imported deck exactly such a source.
+// So a deck like `V1 in 0 SINE(0 1 1k)` / `R1 in out 1k` / `C1 out 0 …` sweeps a
+// real Bode response with no engine change: this is a pure binding + plot.
+//
+// The compute lives in plain host Rust ([`run_ac`], [`AcReport`]) so the −3 dB
+// corner is asserted in CI without a browser; the wasm layer is a thin wrapper.
+
+/// One node's frequency response: magnitude (dB) and phase (deg) per frequency.
+#[derive(Debug, Clone)]
+pub struct AcTrace {
+    /// Node label, e.g. `"v(n1)"`.
+    pub name: String,
+    /// Magnitude in decibels, `20·log10|V|`, one per swept frequency.
+    pub mag_db: Vec<f64>,
+    /// Phase in degrees, one per swept frequency.
+    pub phase_deg: Vec<f64>,
+}
+
+/// A finished AC sweep: the shared log-spaced frequency axis and one [`AcTrace`]
+/// per node. Produced by [`run_ac`]; render with [`AcReport::to_svg`] or hand the
+/// raw numbers to JS with [`AcReport::to_json`].
+#[derive(Debug, Clone)]
+pub struct AcReport {
+    /// Circuit title.
+    pub title: String,
+    /// The swept frequencies in hertz (log-spaced), shared by every trace.
+    pub freqs: Vec<f64>,
+    /// One response trace per (non-ground) node.
+    pub traces: Vec<AcTrace>,
+}
+
+/// Parse `deck`, run a small-signal AC sweep over `[f_start, f_stop]` hertz
+/// (log-spaced at `points_per_decade`), and bundle the per-node magnitude/phase.
+///
+/// The deck must mark a source as the AC drive by giving it a `SINE(...)`
+/// stimulus (e.g. `V1 in 0 SINE(0 1 1k)`); the engine then drives that source
+/// with a 1∠0 phasor. A deck with no such source still sweeps, but every node
+/// reads zero (−∞ dB) — [`AcReport::to_svg`] renders a hint in that case.
+/// Parse/solver failures come back as a human-readable `String`.
+pub fn run_ac(
+    deck: &str,
+    f_start: f64,
+    f_stop: f64,
+    points_per_decade: u32,
+) -> Result<AcReport, String> {
+    let circuit = parse_deck(deck)?;
+    let engine = Engine::new();
+    let sigs = engine
+        .run(
+            &circuit,
+            &Analysis::Ac {
+                f_start,
+                f_stop,
+                points_per_decade,
+            },
+        )
+        .map_err(|e| e.to_string())?;
+
+    let freqs = sigs.first().map(|s| s.x.clone()).unwrap_or_default();
+    let traces = sigs
+        .iter()
+        .filter_map(|s| {
+            let c = s.complex()?;
+            Some(AcTrace {
+                name: s.name.clone(),
+                mag_db: c.iter().map(|z| z.magnitude_db()).collect(),
+                phase_deg: c.iter().map(|z| z.phase_deg()).collect(),
+            })
+        })
+        .collect();
+
+    Ok(AcReport {
+        title: circuit.name,
+        freqs,
+        traces,
+    })
+}
+
+impl AcReport {
+    /// Serialize to compact JSON:
+    /// `{title, freqs:[…], traces:[{name, mag_db:[…], phase_deg:[…]}]}`.
+    /// Non-finite samples (−∞ dB at a dead node) serialize as JSON `null`.
+    pub fn to_json(&self) -> String {
+        let mut s = String::from("{\"title\":");
+        push_json_str(&mut s, &self.title);
+        s.push_str(",\"freqs\":");
+        push_json_nums(&mut s, &self.freqs);
+        s.push_str(",\"traces\":[");
+        for (i, t) in self.traces.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str("{\"name\":");
+            push_json_str(&mut s, &t.name);
+            s.push_str(",\"mag_db\":");
+            push_json_nums(&mut s, &t.mag_db);
+            s.push_str(",\"phase_deg\":");
+            push_json_nums(&mut s, &t.phase_deg);
+            s.push('}');
+        }
+        s.push_str("]}");
+        s
+    }
+
+    /// Render the magnitude response as a small, self-contained **Bode SVG**
+    /// (log-frequency x-axis, decibel y-axis), one colored polyline per node.
+    ///
+    /// Hand-rolled (no plotting dep), mirroring the braille scope's house style:
+    /// a deterministic string the page drops straight into the DOM. Non-finite
+    /// samples are skipped so a dead node never breaks the path. With no finite
+    /// response at all (no AC drive in the deck) it returns a readable hint.
+    pub fn to_svg(&self, width: u32, height: u32) -> String {
+        let w = width as f64;
+        let h = height as f64;
+        // Palette reused across traces (wraps if there are more nodes than hues).
+        const HUES: [&str; 6] = [
+            "#5b9dff", "#ff8a5b", "#4cc38a", "#c678dd", "#e5c07b", "#e06c75",
+        ];
+        let pad_l = 48.0;
+        let pad_r = 12.0;
+        let pad_t = 22.0;
+        let pad_b = 30.0;
+
+        // Collect the finite (freq, dB) range across every trace.
+        let mut fmin = f64::INFINITY;
+        let mut fmax = f64::NEG_INFINITY;
+        let mut ymin = f64::INFINITY;
+        let mut ymax = f64::NEG_INFINITY;
+        for t in &self.traces {
+            for (f, db) in self.freqs.iter().zip(&t.mag_db) {
+                if *f > 0.0 && f.is_finite() && db.is_finite() {
+                    fmin = fmin.min(*f);
+                    fmax = fmax.max(*f);
+                    ymin = ymin.min(*db);
+                    ymax = ymax.max(*db);
+                }
+            }
+        }
+
+        let mut svg = format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {width} {height}\" \
+             width=\"100%\" role=\"img\" aria-label=\"AC Bode magnitude plot\" \
+             class=\"bode-svg\" font-family=\"ui-monospace, monospace\" font-size=\"10\">"
+        );
+
+        if !(fmin.is_finite() && fmax > fmin && ymax >= ymin) {
+            // No usable response — most often a deck with no SINE AC drive.
+            svg.push_str(&format!(
+                "<text x=\"{x}\" y=\"{y}\" text-anchor=\"middle\" fill=\"currentColor\" \
+                 opacity=\"0.7\">no AC response — mark a source with SINE(…) to drive the sweep</text></svg>",
+                x = w / 2.0,
+                y = h / 2.0,
+            ));
+            return svg;
+        }
+
+        // A little vertical headroom so the trace never kisses the frame.
+        let span = (ymax - ymin).max(1.0);
+        ymin -= span * 0.08;
+        ymax += span * 0.08;
+        let lf_min = fmin.log10();
+        let lf_max = fmax.log10();
+
+        let px = |f: f64| pad_l + (f.log10() - lf_min) / (lf_max - lf_min) * (w - pad_l - pad_r);
+        let py = |db: f64| pad_t + (ymax - db) / (ymax - ymin) * (h - pad_t - pad_b);
+
+        // Plot frame.
+        svg.push_str(&format!(
+            "<rect x=\"{l}\" y=\"{t}\" width=\"{pw}\" height=\"{ph}\" fill=\"none\" \
+             stroke=\"currentColor\" stroke-opacity=\"0.25\"/>",
+            l = pad_l,
+            t = pad_t,
+            pw = w - pad_l - pad_r,
+            ph = h - pad_t - pad_b,
+        ));
+
+        // Vertical decade gridlines + frequency labels.
+        let dec_lo = lf_min.floor() as i32;
+        let dec_hi = lf_max.ceil() as i32;
+        for d in dec_lo..=dec_hi {
+            let f = 10f64.powi(d);
+            if f < fmin || f > fmax {
+                continue;
+            }
+            let x = px(f);
+            svg.push_str(&format!(
+                "<line x1=\"{x:.1}\" y1=\"{t}\" x2=\"{x:.1}\" y2=\"{b}\" stroke=\"currentColor\" \
+                 stroke-opacity=\"0.12\"/>",
+                t = pad_t,
+                b = h - pad_b,
+            ));
+            svg.push_str(&format!(
+                "<text x=\"{x:.1}\" y=\"{y:.1}\" text-anchor=\"middle\" fill=\"currentColor\" \
+                 opacity=\"0.7\">{lbl}</text>",
+                y = h - pad_b + 12.0,
+                lbl = fmt_hz(f),
+            ));
+        }
+
+        // Horizontal dB gridlines + labels (a handful of round ticks).
+        for k in 0..=4 {
+            let db = ymax - (ymax - ymin) * (k as f64) / 4.0;
+            let y = py(db);
+            svg.push_str(&format!(
+                "<line x1=\"{l}\" y1=\"{y:.1}\" x2=\"{r}\" y2=\"{y:.1}\" stroke=\"currentColor\" \
+                 stroke-opacity=\"0.12\"/>",
+                l = pad_l,
+                r = w - pad_r,
+            ));
+            svg.push_str(&format!(
+                "<text x=\"{x:.1}\" y=\"{y:.1}\" text-anchor=\"end\" fill=\"currentColor\" \
+                 opacity=\"0.7\">{db:.0}</text>",
+                x = pad_l - 4.0,
+                y = y + 3.0,
+            ));
+        }
+        svg.push_str(&format!(
+            "<text x=\"12\" y=\"{y:.1}\" transform=\"rotate(-90 12 {y:.1})\" text-anchor=\"middle\" \
+             fill=\"currentColor\" opacity=\"0.7\">dB</text>",
+            y = pad_t + (h - pad_t - pad_b) / 2.0,
+        ));
+
+        // One polyline per node, skipping non-finite points.
+        for (i, t) in self.traces.iter().enumerate() {
+            let hue = HUES[i % HUES.len()];
+            let mut pts = String::new();
+            for (f, db) in self.freqs.iter().zip(&t.mag_db) {
+                if *f > 0.0 && f.is_finite() && db.is_finite() {
+                    pts.push_str(&format!("{:.1},{:.1} ", px(*f), py(*db)));
+                }
+            }
+            if pts.is_empty() {
+                continue;
+            }
+            svg.push_str(&format!(
+                "<polyline fill=\"none\" stroke=\"{hue}\" stroke-width=\"1.6\" points=\"{pts}\"/>"
+            ));
+            // Legend swatch + node name.
+            let ly = pad_t + 2.0 + (i as f64) * 12.0;
+            svg.push_str(&format!(
+                "<rect x=\"{lx}\" y=\"{ly:.1}\" width=\"8\" height=\"8\" fill=\"{hue}\"/>",
+                lx = w - pad_r - 78.0,
+            ));
+            svg.push('<');
+            svg.push_str("text ");
+            svg.push_str(&format!(
+                "x=\"{tx}\" y=\"{ty:.1}\" fill=\"currentColor\" opacity=\"0.85\">",
+                tx = w - pad_r - 66.0,
+                ty = ly + 8.0,
+            ));
+            push_svg_text(&mut svg, &t.name);
+            svg.push_str("</text>");
+        }
+
+        svg.push_str("</svg>");
+        svg
+    }
+}
+
+/// A compact human frequency label: `50`, `1k`, `10k`, `1M` …
+fn fmt_hz(f: f64) -> String {
+    if f >= 1e6 {
+        format!("{}M", trim_num(f / 1e6))
+    } else if f >= 1e3 {
+        format!("{}k", trim_num(f / 1e3))
+    } else {
+        trim_num(f)
+    }
+}
+
+/// Format a number without a trailing `.0` (so `1.0` → `1`, `1.5` → `1.5`).
+fn trim_num(v: f64) -> String {
+    if (v - v.round()).abs() < 1e-9 {
+        format!("{}", v.round() as i64)
+    } else {
+        format!("{v:.1}")
+    }
+}
+
+/// Escape text for inclusion in SVG/XML content (the five predefined entities).
+fn push_svg_text(out: &mut String, s: &str) {
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            c => out.push(c),
+        }
+    }
 }
 
 // --- Shareable circuit links (CP-WEB.2) ------------------------------------
@@ -2014,6 +2377,40 @@ mod wasm {
             .map_err(|e| JsValue::from_str(&e))
     }
 
+    /// Run a small-signal AC sweep and return the per-node Bode response as JSON:
+    /// `{title, freqs, traces:[{name, mag_db, phase_deg}]}`. The deck must mark a
+    /// source as the AC drive with a `SINE(...)` stimulus. Errors throw.
+    /// (CP-WEB-M10.2.)
+    #[wasm_bindgen]
+    pub fn ac(
+        deck: &str,
+        f_start: f64,
+        f_stop: f64,
+        points_per_decade: u32,
+    ) -> Result<String, JsValue> {
+        super::run_ac(deck, f_start, f_stop, points_per_decade)
+            .map(|r| r.to_json())
+            .map_err(|e| JsValue::from_str(&e))
+    }
+
+    /// Run a small-signal AC sweep and return a ready-to-insert **Bode SVG**
+    /// (log-frequency magnitude plot) sized `width`×`height`. Same drive rule as
+    /// [`ac`]; a deck with no AC drive renders a hint rather than throwing.
+    /// (CP-WEB-M10.2.)
+    #[wasm_bindgen]
+    pub fn ac_bode_svg(
+        deck: &str,
+        f_start: f64,
+        f_stop: f64,
+        points_per_decade: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<String, JsValue> {
+        super::run_ac(deck, f_start, f_stop, points_per_decade)
+            .map(|r| r.to_svg(width, height))
+            .map_err(|e| JsValue::from_str(&e))
+    }
+
     /// Encode a netlist into a URL-fragment-safe share token (base64url, no
     /// padding). Drop the result into `location.hash` to make a shareable link.
     #[wasm_bindgen]
@@ -2336,6 +2733,252 @@ C1 out gnd 1u
         // A zero-ohm resistor is a bad value the solver rejects.
         let err = run("V1 in gnd 5\nR1 in gnd 0", 1e-3, None).unwrap_err();
         assert!(!err.is_empty(), "solver error surfaced as a message");
+    }
+
+    // --- CP-WEB-M10.1: SPICE devices reach the browser --------------------
+
+    #[test]
+    fn looks_like_spice_detects_devices_but_not_plain_rclv() {
+        // Plain R/C/L/V/.title stays on the netlist path…
+        assert!(!looks_like_spice(RC));
+        assert!(!looks_like_spice(
+            "V1 in gnd 5\nR1 in out 1k\nL1 out gnd 1m"
+        ));
+        // …while a `.model`, a D/Q/M device, a current source, or a SINE/PULSE
+        // stimulus trips the SPICE path.
+        assert!(looks_like_spice(".model Dm D (IS=2.52e-9)\nD1 a gnd Dm"));
+        assert!(looks_like_spice("Q1 c b e Qn"));
+        assert!(looks_like_spice("M1 d g s Mn"));
+        assert!(looks_like_spice("I1 a gnd 1m"));
+        assert!(looks_like_spice("V1 in 0 SINE(0 1 1k)"));
+        // A comment that merely mentions a device does not trip detection.
+        assert!(!looks_like_spice("R1 a b 1k # not a diode"));
+    }
+
+    #[test]
+    fn diode_deck_imports_and_op_points_through_the_web_path() {
+        // The proposal's gate deck (with a SPICE title line, which the importer
+        // consumes as line 1): a 5 V rail through 1 kΩ into a diode to ground.
+        // `node a` must clamp near one forward diode drop, not sit at the rail.
+        let deck = "diode clamp\n.model Dm D (IS=2.52e-9)\nV1 in gnd 5\nR1 in a 1k\nD1 a gnd Dm\n";
+        let r = run(deck, 1e-3, Some(1e-5)).expect("diode deck simulates via the web path");
+        // Identify node `a` by behaviour: the one node that is neither the 5 V
+        // rail nor ground — it sits in the diode-drop window.
+        let a =
+            r.op.iter()
+                .find(|(_, v)| (0.2..1.0).contains(v))
+                .expect("a clamped node in the diode-drop window");
+        assert!(
+            (0.2..1.0).contains(&a.1),
+            "node {} clamps at a diode drop, not the rail: {} V",
+            a.0,
+            a.1
+        );
+    }
+
+    #[test]
+    fn bjt_common_emitter_op_points_through_the_web_path() {
+        // The sim crate's CE-bias gate, driven through the web `run` path: Vcc=10 V,
+        // base via 1 MΩ, collector load 4.7 kΩ, NPN with default model params.
+        let deck = "ce amp\nVcc vcc 0 10\nRB vcc base 1meg\nRC vcc coll 4.7k\n\
+                    Q1 coll base 0 Qn\n.model Qn NPN ()\n";
+        let r = run(deck, 1e-3, Some(1e-5)).expect("BJT CE deck simulates via the web path");
+        // The base sits in the 0.6–0.7 V silicon window (Vbe, emitter grounded).
+        let vb =
+            r.op.iter()
+                .find(|(_, v)| (0.55..0.75).contains(v))
+                .expect("a base node in the silicon window");
+        // The collector sits forward-active: above the base, below the 10 V rail.
+        let has_active_collector = r.op.iter().any(|(_, v)| *v > vb.1 && *v < 9.9);
+        assert!(
+            has_active_collector,
+            "collector sits mid-rail (forward-active): {:?}",
+            r.op
+        );
+    }
+
+    #[test]
+    fn diode_half_wave_rectifier_transient_through_the_web_path() {
+        // A SINE-driven half-wave rectifier: the output follows the positive half
+        // of the swing and is clamped near zero on the negative half (no large
+        // negative excursion). Proves nonlinear transient convergence in the path.
+        let deck = "rectifier\nV1 in 0 SINE(0 5 1k)\nD1 in out Dm\nR1 out 0 1k\n\
+                    .model Dm D (IS=1e-14)\n";
+        let r = run(deck, 3e-3, Some(2e-6)).expect("rectifier simulates via the web path");
+        let out = r
+            .nodes
+            .iter()
+            .find(|(n, _)| n != "v(n0)" && n.starts_with("v(n"))
+            // `out` is the node that never swings strongly negative.
+            .filter(|(_, y)| y.iter().all(|v| *v > -0.6))
+            .or_else(|| {
+                r.nodes
+                    .iter()
+                    .find(|(_, y)| y.iter().all(|v| *v > -0.6) && y.iter().any(|v| *v > 1.0))
+            })
+            .expect("a rectified output node");
+        let max = out.1.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let min = out.1.iter().cloned().fold(f64::INFINITY, f64::min);
+        assert!(
+            max > 1.0,
+            "rectified output rises on the positive half: {max}"
+        );
+        assert!(
+            min > -0.6,
+            "rectified output is clamped on the negative half: {min}"
+        );
+    }
+
+    // --- CP-WEB-M10.2: in-browser AC / Bode -------------------------------
+
+    #[test]
+    fn ac_sweep_hits_minus_3db_at_the_rc_corner() {
+        // An RC low-pass with fc = 1/(2π·1k·159.155n) = 1000 Hz, driven by a SINE
+        // AC source. At the corner the magnitude is −3.01 dB and it rolls off at
+        // −20 dB/decade above it.
+        let deck = "rc ac\nV1 in 0 SINE(0 1 1k)\nR1 in out 1k\nC1 out 0 159.155n\n";
+        let report = run_ac(deck, 10.0, 1e5, 30).expect("AC sweep runs");
+
+        // Find the `out` node's trace by resolving the circuit's `out` net.
+        let circuit = ohmforge_fmt::spice::import(deck).unwrap();
+        let out_net = circuit.part_by_ref("R1").unwrap().terminals[1];
+        let out_name = format!("v(n{})", circuit.resolve(out_net).0);
+        let out = report
+            .traces
+            .iter()
+            .find(|t| t.name == out_name)
+            .expect("the `out` node trace is present");
+
+        // Sample nearest the 1000 Hz corner: magnitude ≈ −3.01 dB.
+        let fc = 1000.0_f64;
+        let (ic, _) = report
+            .freqs
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| (*a - fc).abs().partial_cmp(&(*b - fc).abs()).unwrap())
+            .unwrap();
+        assert!(
+            (out.mag_db[ic] + 3.01).abs() < 0.5,
+            "corner magnitude {} dB near −3.01 dB (f = {} Hz)",
+            out.mag_db[ic],
+            report.freqs[ic]
+        );
+
+        // A decade above the corner, the response is ≈ −20 dB (±2 dB) and clearly
+        // below the corner — confirming the −20 dB/decade roll-off.
+        let f10 = 10_000.0_f64;
+        let (i10, _) = report
+            .freqs
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| (*a - f10).abs().partial_cmp(&(*b - f10).abs()).unwrap())
+            .unwrap();
+        assert!(
+            (out.mag_db[i10] + 20.0).abs() < 2.0,
+            "a decade up rolls off to ≈ −20 dB: {} dB",
+            out.mag_db[i10]
+        );
+        assert!(
+            out.mag_db[i10] < out.mag_db[ic],
+            "roll-off is monotone past the corner"
+        );
+    }
+
+    #[test]
+    fn ac_json_is_wellformed() {
+        let deck = "rc ac\nV1 in 0 SINE(0 1 1k)\nR1 in out 1k\nC1 out 0 159.155n\n";
+        let json = run_ac(deck, 10.0, 1e5, 10).unwrap().to_json();
+        assert!(json.starts_with('{') && json.ends_with('}'));
+        assert!(json.contains("\"freqs\":["));
+        assert!(json.contains("\"traces\":["));
+        assert!(json.contains("\"mag_db\":["));
+        assert!(!json.contains("NaN") && !json.contains("inf"));
+    }
+
+    #[test]
+    fn ac_bode_svg_renders_a_plot() {
+        let deck = "rc ac\nV1 in 0 SINE(0 1 1k)\nR1 in out 1k\nC1 out 0 159.155n\n";
+        let svg = run_ac(deck, 10.0, 1e5, 20).unwrap().to_svg(640, 260);
+        assert!(svg.starts_with("<svg"));
+        assert!(svg.ends_with("</svg>"));
+        assert!(svg.contains("<polyline"), "a response trace is drawn");
+        assert!(svg.contains(">dB<"), "the magnitude axis is labelled");
+        assert!(
+            !svg.contains("no AC response"),
+            "a driven deck has a response"
+        );
+    }
+
+    #[test]
+    fn ac_svg_without_a_drive_renders_a_hint_not_a_crash() {
+        // No SINE source → no AC drive → every node is zero (−∞ dB). The SVG must
+        // degrade to a readable hint instead of emitting non-finite coordinates.
+        let svg = run_ac("V1 in 0 5\nR1 in out 1k\nC1 out 0 1u\n", 10.0, 1e4, 10)
+            .unwrap()
+            .to_svg(640, 260);
+        assert!(svg.contains("no AC response"), "hint shown: {svg}");
+        assert!(!svg.contains("NaN") && !svg.contains("inf"));
+    }
+
+    // --- CP-WEB-M10.2: PWA / offline app shell (static asset checks) ------
+
+    #[test]
+    fn manifest_is_valid_and_complete() {
+        let manifest = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/www/manifest.webmanifest"
+        ))
+        .expect("manifest.webmanifest exists");
+        // Minimal well-formedness: balanced braces, non-empty, and the install
+        // keys a browser needs to treat the page as an installable PWA.
+        assert!(manifest.trim_start().starts_with('{') && manifest.trim_end().ends_with('}'));
+        assert_eq!(
+            manifest.matches('{').count(),
+            manifest.matches('}').count(),
+            "braces balance"
+        );
+        for key in [
+            "\"name\"",
+            "\"short_name\"",
+            "\"start_url\"",
+            "\"display\"",
+            "\"icons\"",
+            "\"theme_color\"",
+            "\"background_color\"",
+        ] {
+            assert!(manifest.contains(key), "manifest declares {key}");
+        }
+        // The icons it names must be files that actually ship.
+        for icon in ["ohmforge-mark.svg", "ohmforge-logo.svg"] {
+            assert!(manifest.contains(icon), "manifest references {icon}");
+            assert!(
+                std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/www/"))
+                    .join(icon)
+                    .exists(),
+                "icon {icon} ships in www/"
+            );
+        }
+    }
+
+    #[test]
+    fn service_worker_precaches_the_app_shell_and_wasm() {
+        let sw = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/www/sw.js"))
+            .expect("sw.js exists");
+        // The precache list must name the self-contained app shell AND the wasm
+        // bundle + JS glue — without those, an offline reload cannot boot.
+        for asset in [
+            "index.html",
+            "style.css",
+            "manifest.webmanifest",
+            "pkg/ohmforge_web.js",
+            "pkg/ohmforge_web_bg.wasm",
+        ] {
+            assert!(sw.contains(asset), "service worker precaches {asset}");
+        }
+        // The three lifecycle handlers a cache-first SW needs.
+        for handler in ["install", "activate", "fetch"] {
+            assert!(sw.contains(handler), "service worker handles {handler}");
+        }
     }
 
     // --- share-link encode/decode -----------------------------------------
