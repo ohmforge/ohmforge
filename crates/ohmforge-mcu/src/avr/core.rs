@@ -1218,6 +1218,80 @@ mod tests {
     }
 
     #[test]
+    fn timer0_overflow_isr_advances_a_counter_at_the_expected_rate() {
+        // CP-BRD-M10.2 gate: a Timer0-overflow ISR increments r17 each time the
+        // timer wraps. Main enables the overflow interrupt, starts Timer0 in
+        // Normal mode at prescaler /1 (overflow every 256 cycles), then spins.
+        //   0: SEI                   0x9478
+        //   1: LDI r16, 0x01         0xE001  ; TOIE0
+        //   2: STS TIMSK0, r16       0x9300 0x006E
+        //   4: LDI r16, 0x01         0xE001  ; CS00 (prescaler /1), Normal mode
+        //   5: OUT TCCR0B, r16       0xBD05  ; I/O 0x25 = data 0x45
+        //   6: RJMP self             0xCFFF
+        // ISR at the TIMER0_OVF vector (vector 16 → word addr 16*2 = 32):
+        //  32: INC r17               0x9513
+        //  33: RETI                  0x9518
+        let mut prog = vec![0u16; 40];
+        prog[0] = 0x9478;
+        prog[1] = 0xE001;
+        prog[2] = 0x9300;
+        prog[3] = 0x006E;
+        prog[4] = 0xE001;
+        prog[5] = 0xBD05;
+        prog[6] = 0xCFFF;
+        prog[32] = 0x9513;
+        prog[33] = 0x9518;
+        let mut avr = Avr::new();
+        avr.load_program(&prog);
+        avr.set_clock_hz(1_000_000.0);
+        avr.step_to(0.004); // ~4000 cycles
+
+        // The timer starts after the OUT (~cycle 6); it overflows every 256
+        // cycles and no overflow is lost (the flag stays pending across the ISR).
+        let expected = (avr.cycles() as i64 - 6) / 256;
+        let got = avr.reg(17) as i64;
+        assert!(got >= 10, "several overflows were serviced: {got}");
+        assert!(
+            (got - expected).abs() <= 1,
+            "ISR counter {got} tracks the overflow rate (expected ~{expected})"
+        );
+    }
+
+    #[test]
+    fn usart_rx_isr_runs_when_a_byte_arrives() {
+        // CP-BRD-M10.2 gate: a USART RX-complete ISR reads the delivered byte.
+        // Main enables RXCIE0 and spins; a byte pushed through the exchange
+        // surface (`usart_rx_push`) raises RXC0 and vectors the handler.
+        //   0: SEI                   0x9478
+        //   1: LDI r16, 0x80         0xE800  ; RXCIE0
+        //   2: STS UCSR0B, r16       0x9300 0x00C1
+        //   4: RJMP self             0xCFFF
+        // ISR at the USART_RX vector (vector 18 → word addr 36):
+        //  36: LDS r18, UDR0         0x9120 0x00C6
+        //  38: RETI                  0x9518
+        let mut prog = vec![0u16; 44];
+        prog[0] = 0x9478;
+        prog[1] = 0xE800;
+        prog[2] = 0x9300;
+        prog[3] = 0x00C1;
+        prog[4] = 0xCFFF;
+        prog[36] = 0x9120;
+        prog[37] = 0x00C6;
+        prog[38] = 0x9518;
+        let mut avr = Avr::new();
+        avr.load_program(&prog);
+        run(&mut avr, 5); // SEI, LDI, STS, then spin on RJMP
+
+        avr.peripherals_mut().usart_rx_push(0x5A);
+        avr.step(); // dispatch the RX-complete interrupt → pc = 36
+        assert_eq!(avr.pc(), 36, "vectored to the USART_RX handler");
+        avr.step(); // LDS r18, UDR0 → read the received byte
+        avr.step(); // RETI
+        assert_eq!(avr.reg(18), 0x5A, "the RX ISR read the delivered byte");
+        assert_eq!(avr.pc(), 4, "returned to the interrupted spin loop");
+    }
+
+    #[test]
     fn pending_interrupt_waits_for_global_enable() {
         // Without SEI the interrupt must not fire.
         //   0: NOP ; 1: RJMP self.

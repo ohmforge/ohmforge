@@ -173,10 +173,14 @@ const ADIF: u8 = 1 << 4;
 const ADIE: u8 = 1 << 3;
 
 // UCSR0A bits.
+const RXC0: u8 = 1 << 7;
 const TXC0: u8 = 1 << 6;
 const UDRE0: u8 = 1 << 5;
 const U2X0: u8 = 1 << 1;
 // UCSR0B bits.
+const RXCIE0: u8 = 1 << 7;
+const TXCIE0: u8 = 1 << 6;
+const UDRIE0: u8 = 1 << 5;
 const TXEN0: u8 = 1 << 3;
 
 // SPCR bits.
@@ -361,6 +365,21 @@ impl Timer8 {
             .min(counts_to_match(self.tcnt, self.ocr_b, top));
         Some(counts as u64 * div as u64 - self.prescale_acc as u64)
     }
+
+    /// The highest-priority enabled-and-flagged timer interrupt, clearing its
+    /// flag on dispatch (the hardware clears `TOVn`/`OCFnx` when its vector is
+    /// serviced). Compare-A outranks compare-B, which outranks overflow, matching
+    /// the datasheet vector order. The `TIMSKn` enable bits line up bit-for-bit
+    /// with the `TIFRn` flags (`TOIE`/`OCIEA`/`OCIEB` ↔ `TOV`/`OCF_A`/`OCF_B`).
+    fn take_interrupt(&mut self, compa: u8, compb: u8, ovf: u8) -> Option<u8> {
+        for (flag, vector) in [(OCF_A, compa), (OCF_B, compb), (TOV, ovf)] {
+            if self.timsk & flag != 0 && self.tifr & flag != 0 {
+                self.tifr &= !flag;
+                return Some(vector);
+            }
+        }
+        None
+    }
 }
 
 /// The 16-bit Timer/Counter1.
@@ -463,6 +482,19 @@ impl Timer16 {
             .min(counts_to_match16(self.tcnt, self.ocr_a, top))
             .min(counts_to_match16(self.tcnt, self.ocr_b, top));
         Some(counts * div as u64 - self.prescale_acc as u64)
+    }
+
+    /// The highest-priority enabled-and-flagged timer interrupt, clearing its
+    /// flag on dispatch. See [`Timer8::take_interrupt`] — the `TIMSK1`/`TIFR1`
+    /// layout matches Timer0's.
+    fn take_interrupt(&mut self, compa: u8, compb: u8, ovf: u8) -> Option<u8> {
+        for (flag, vector) in [(OCF_A, compa), (OCF_B, compb), (TOV, ovf)] {
+            if self.timsk & flag != 0 && self.tifr & flag != 0 {
+                self.tifr &= !flag;
+                return Some(vector);
+            }
+        }
+        None
     }
 }
 
@@ -668,6 +700,25 @@ pub const VECTOR_PCINT0: u8 = 3;
 pub const VECTOR_PCINT1: u8 = 4;
 /// Pin-change interrupt 2 (`PCINT2`, bank PCMSK2 → Port D pins PCINT23:16).
 pub const VECTOR_PCINT2: u8 = 5;
+/// Timer/Counter1 compare-match A (`OCIE1A` + `OCF1A`).
+pub const VECTOR_TIMER1_COMPA: u8 = 11;
+/// Timer/Counter1 compare-match B (`OCIE1B` + `OCF1B`).
+pub const VECTOR_TIMER1_COMPB: u8 = 12;
+/// Timer/Counter1 overflow (`TOIE1` + `TOV1`).
+pub const VECTOR_TIMER1_OVF: u8 = 13;
+/// Timer/Counter0 compare-match A (`OCIE0A` + `OCF0A`).
+pub const VECTOR_TIMER0_COMPA: u8 = 14;
+/// Timer/Counter0 compare-match B (`OCIE0B` + `OCF0B`).
+pub const VECTOR_TIMER0_COMPB: u8 = 15;
+/// Timer/Counter0 overflow (`TOIE0` + `TOV0`) — the vector Arduino's
+/// `millis()`/`micros()`/`delay()` timebase runs on.
+pub const VECTOR_TIMER0_OVF: u8 = 16;
+/// USART receive complete (`RXCIE0` + `RXC0`).
+pub const VECTOR_USART_RX: u8 = 18;
+/// USART data-register empty (`UDRIE0` + `UDRE0`).
+pub const VECTOR_USART_UDRE: u8 = 19;
+/// USART transmit complete (`TXCIE0` + `TXC0`).
+pub const VECTOR_USART_TX: u8 = 20;
 /// ADC conversion complete.
 pub const VECTOR_ADC: u8 = 21;
 
@@ -752,11 +803,12 @@ impl ExtInt {
         }
     }
 
-    /// The highest-priority (lowest-vector) interrupt that is both pending and
-    /// enabled, clearing the latched flag as the controller would on dispatch.
-    /// `adc_pending` carries the ADC's already-latched enable+flag so the
-    /// ADC-complete vector is ordered in alongside.
-    fn take(&mut self, adc_pending: bool) -> Option<u8> {
+    /// The highest-priority (lowest-vector) external or pin-change interrupt that
+    /// is both pending and enabled, clearing the latched flag as the controller
+    /// would on dispatch. These carry the lowest vector numbers (`INT0`..`PCINT2`
+    /// = 1..5), so they outrank the timer/USART/ADC vectors sequenced after them
+    /// in [`Peripherals::take_pending_interrupt`].
+    fn take(&mut self) -> Option<u8> {
         for (idx, vector) in [VECTOR_INT0, VECTOR_INT1].into_iter().enumerate() {
             let bit = 1 << idx;
             if self.eimsk & bit == 0 {
@@ -783,7 +835,7 @@ impl ExtInt {
                 return Some(vector);
             }
         }
-        adc_pending.then_some(VECTOR_ADC)
+        None
     }
 }
 
@@ -876,6 +928,29 @@ impl Usart {
             }
             self.ucsr_a |= UDRE0; // buffer is empty again
         }
+    }
+
+    /// The highest-priority enabled-and-flagged USART interrupt, in datasheet
+    /// vector order: RX-complete, then data-register-empty, then TX-complete.
+    ///
+    /// `RXC0` (cleared in hardware by reading `UDR0`) and `TXC0` (cleared in
+    /// hardware when its vector runs) are cleared here on dispatch, so a handler
+    /// is serviced once per event. `UDRE0` is **level-sensitive** — it stays set
+    /// while the transmit buffer is empty and is cleared only by writing `UDR0`
+    /// — so the data-register-empty vector is reported without clearing it.
+    fn take_interrupt(&mut self) -> Option<u8> {
+        if self.ucsr_b & RXCIE0 != 0 && self.ucsr_a & RXC0 != 0 {
+            self.ucsr_a &= !RXC0;
+            return Some(VECTOR_USART_RX);
+        }
+        if self.ucsr_b & UDRIE0 != 0 && self.ucsr_a & UDRE0 != 0 {
+            return Some(VECTOR_USART_UDRE);
+        }
+        if self.ucsr_b & TXCIE0 != 0 && self.ucsr_a & TXC0 != 0 {
+            self.ucsr_a &= !TXC0;
+            return Some(VECTOR_USART_TX);
+        }
+        None
     }
 }
 
@@ -1444,20 +1519,45 @@ impl Peripherals {
     /// enabled, clearing its flag as the controller would on dispatch, or `None`
     /// if nothing is pending.
     ///
-    /// Covers the external (INT0/INT1) and pin-change (PCINT0..2) controller fed
-    /// by [`sample_inputs`](Self::sample_inputs), plus the ADC-complete interrupt
-    /// (`ADIE`). The core calls this before fetching, so an input edge vectors
-    /// through the same latched path as a manually requested interrupt — the
+    /// Covers, in datasheet vector order (lowest number = highest priority): the
+    /// external (INT0/INT1) and pin-change (PCINT0..2) controller fed by
+    /// [`sample_inputs`](Self::sample_inputs); the Timer1 then Timer0
+    /// compare-match/overflow interrupts (`TIMSKn` + `TIFRn`); the USART
+    /// RX-complete / data-register-empty / TX-complete interrupts (`UCSR0B` +
+    /// `UCSR0A`); and the ADC-complete interrupt (`ADIE` + `ADIF`). The core
+    /// calls this before fetching, so a timer tick or a received byte vectors
+    /// through the same latched path as a manually requested interrupt — any
     /// analog value only ever crosses as a plain pin voltage, never as an
     /// `ohmforge-sim` type.
     pub fn take_pending_interrupt(&mut self) -> Option<u8> {
-        let adc_pending = self.adc.adcsra & ADIE != 0 && self.adc.adcsra & ADIF != 0;
-        let vector = self.ext.take(adc_pending)?;
-        if vector == VECTOR_ADC {
-            // The ADC flag is cleared by hardware when its vector is serviced.
-            self.adc.adcsra &= !ADIF;
+        // External / pin-change (vectors 1..=5).
+        if let Some(v) = self.ext.take() {
+            return Some(v);
         }
-        Some(vector)
+        // Timer1 (vectors 11..=13) then Timer0 (vectors 14..=16).
+        if let Some(v) =
+            self.timer1
+                .take_interrupt(VECTOR_TIMER1_COMPA, VECTOR_TIMER1_COMPB, VECTOR_TIMER1_OVF)
+        {
+            return Some(v);
+        }
+        if let Some(v) =
+            self.timer0
+                .take_interrupt(VECTOR_TIMER0_COMPA, VECTOR_TIMER0_COMPB, VECTOR_TIMER0_OVF)
+        {
+            return Some(v);
+        }
+        // USART RX / UDRE / TX complete (vectors 18..=20).
+        if let Some(v) = self.usart.take_interrupt() {
+            return Some(v);
+        }
+        // ADC conversion complete (vector 21), lowest priority. The flag is
+        // cleared by hardware when its vector is serviced.
+        if self.adc.adcsra & ADIE != 0 && self.adc.adcsra & ADIF != 0 {
+            self.adc.adcsra &= !ADIF;
+            return Some(VECTOR_ADC);
+        }
+        None
     }
 
     /// The digital-input thresholds this core samples node voltages through.
@@ -2323,5 +2423,101 @@ mod tests {
             "ADIE + ADIF vectors to the ADC handler and clears ADIF"
         );
         assert_eq!(p.read(ADCSRA).unwrap() & ADIF, 0, "ADIF cleared on service");
+    }
+
+    #[test]
+    fn timer0_overflow_sources_its_vector_when_enabled() {
+        let mut p = Peripherals::new();
+        p.write(TIMSK0, 1); // TOIE0
+        p.write(TCCR0B, 0x01); // Normal mode, prescaler /1.
+        for _ in 0..256 {
+            p.tick(1);
+        }
+        assert_eq!(
+            p.take_pending_interrupt(),
+            Some(VECTOR_TIMER0_OVF),
+            "an enabled+flagged overflow vectors to TIMER0_OVF"
+        );
+        assert_eq!(
+            p.take_pending_interrupt(),
+            None,
+            "the TOV0 flag is cleared on dispatch"
+        );
+    }
+
+    #[test]
+    fn timer0_overflow_flag_without_enable_never_vectors() {
+        let mut p = Peripherals::new();
+        // TIMSK0 left at 0 (overflow interrupt disabled).
+        p.write(TCCR0B, 0x01);
+        for _ in 0..256 {
+            p.tick(1);
+        }
+        assert_eq!(p.read(TIFR0).unwrap() & TOV, TOV, "flag still latches");
+        assert_eq!(p.take_pending_interrupt(), None, "no enable ⇒ no vector");
+    }
+
+    #[test]
+    fn timer1_compare_a_sources_its_vector() {
+        let mut p = Peripherals::new();
+        p.write(TIMSK1, OCF_A); // OCIE1A (bit 1, same position as OCF1A)
+        p.write(OCR1AH, 0);
+        p.write(OCR1AL, 3); // compare at 3
+        p.write(TCCR1B, 0x09); // CTC (WGM12), prescaler /1.
+        for _ in 0..4 {
+            p.tick(1);
+        }
+        assert_eq!(
+            p.take_pending_interrupt(),
+            Some(VECTOR_TIMER1_COMPA),
+            "an enabled compare-A match vectors to TIMER1_COMPA"
+        );
+    }
+
+    #[test]
+    fn usart_rx_sources_its_vector_when_enabled() {
+        let mut p = Peripherals::new();
+        p.write(UCSR0B, RXCIE0);
+        p.usart_rx_push(0x5A);
+        assert_eq!(
+            p.take_pending_interrupt(),
+            Some(VECTOR_USART_RX),
+            "RXCIE0 + RXC0 vectors to USART_RX"
+        );
+        assert_eq!(
+            p.take_pending_interrupt(),
+            None,
+            "RXC0 cleared on dispatch (no immediate re-fire)"
+        );
+    }
+
+    #[test]
+    fn usart_rx_flag_without_enable_never_vectors() {
+        let mut p = Peripherals::new();
+        p.usart_rx_push(0x5A); // sets RXC0, but RXCIE0 is clear
+        assert_eq!(p.take_pending_interrupt(), None);
+    }
+
+    #[test]
+    fn interrupt_priority_prefers_the_lower_vector() {
+        let mut p = Peripherals::new();
+        // Flag both a Timer0 overflow and a USART RX; the lower vector (timer) wins.
+        p.write(TIMSK0, 1);
+        p.write(TCCR0B, 0x01);
+        for _ in 0..256 {
+            p.tick(1);
+        }
+        p.write(UCSR0B, RXCIE0);
+        p.usart_rx_push(0x11);
+        assert_eq!(
+            p.take_pending_interrupt(),
+            Some(VECTOR_TIMER0_OVF),
+            "TIMER0_OVF (16) outranks USART_RX (18)"
+        );
+        assert_eq!(
+            p.take_pending_interrupt(),
+            Some(VECTOR_USART_RX),
+            "USART_RX then serviced"
+        );
     }
 }

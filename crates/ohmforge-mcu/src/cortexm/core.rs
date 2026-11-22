@@ -114,6 +114,13 @@ pub struct CortexM {
     cycles: u64,
     /// Clock frequency in Hz (for the cycles→seconds mapping).
     f_cpu: f64,
+    /// Set when the core executes an [`Instr::Unknown`] — an encoding outside the
+    /// modelled subset. The core then stops advancing (a graceful halt) rather
+    /// than panicking, so ordinary compiled firmware that hits an unimplemented
+    /// opcode can be diagnosed instead of aborting the run.
+    halted: bool,
+    /// The opcode halfword that halted the core (for diagnostics), if any.
+    fault_opcode: Option<u16>,
 }
 
 impl Default for CortexM {
@@ -141,6 +148,8 @@ impl CortexM {
             cur_instr_addr: 0,
             cycles: 0,
             f_cpu: 1_000_000.0,
+            halted: false,
+            fault_opcode: None,
         };
         core.reset();
         core
@@ -159,6 +168,8 @@ impl CortexM {
         self.nvic_enabled = 0;
         self.cur_instr_addr = 0;
         self.cycles = 0;
+        self.halted = false;
+        self.fault_opcode = None;
         self.regs[SP as usize] = DEFAULT_SP;
         self.regs[PC as usize] = 0;
     }
@@ -218,6 +229,20 @@ impl CortexM {
     /// Elapsed CPU cycles since reset.
     pub fn cycles(&self) -> u64 {
         self.cycles
+    }
+
+    /// Whether the core has halted on an unimplemented opcode. Once halted the
+    /// core stops advancing: [`step`](McuCore::step) is a no-op and the stepping
+    /// loops return. [`reset`](CortexM::reset) (or loading new firmware) clears
+    /// it.
+    pub fn halted(&self) -> bool {
+        self.halted
+    }
+
+    /// The opcode halfword that halted the core, if it halted on an
+    /// unimplemented encoding (see [`halted`](CortexM::halted)).
+    pub fn fault_opcode(&self) -> Option<u16> {
+        self.fault_opcode
     }
 
     /// Read register `i`. `r15` yields the Thumb `PC` value (fetch address + 4).
@@ -864,6 +889,18 @@ impl CortexM {
             Instr::Stm { rn, regs } => self.exec_stm(rn, regs),
             Instr::Ldm { rn, regs } => self.exec_ldm(rn, regs),
 
+            Instr::Cb { nonzero, rn, imm } => {
+                let is_zero = self.reg(rn) == 0;
+                let take = if nonzero { !is_zero } else { is_zero };
+                if take {
+                    let target = self.reg(PC).wrapping_add(imm);
+                    self.set_reg(PC, target);
+                    3
+                } else {
+                    1
+                }
+            }
+
             Instr::B { offset } => {
                 let target = self.reg(PC).wrapping_add(offset as u32);
                 self.set_reg(PC, target);
@@ -1025,6 +1062,25 @@ impl CortexM {
                 2
             }
 
+            Instr::Udiv { rd, rn, rm } => {
+                // ARMv7-M returns 0 on divide-by-zero (no DIV_0_TRP modelled).
+                let r = self.reg(rn).checked_div(self.reg(rm)).unwrap_or(0);
+                self.set_reg(rd, r);
+                2
+            }
+            Instr::Sdiv { rd, rn, rm } => {
+                let divisor = self.reg(rm) as i32;
+                // Zero divisor → 0; `wrapping_div` gives the ARM result for the
+                // `i32::MIN / -1` overflow case instead of panicking.
+                let r = if divisor == 0 {
+                    0
+                } else {
+                    (self.reg(rn) as i32).wrapping_div(divisor) as u32
+                };
+                self.set_reg(rd, r);
+                2
+            }
+
             Instr::Clz { rd, rm } => {
                 self.set_reg(rd, self.reg(rm).leading_zeros());
                 1
@@ -1085,11 +1141,12 @@ impl CortexM {
             }
 
             Instr::Unknown(word) => {
-                debug_assert!(
-                    false,
-                    "unimplemented ARMv6-M opcode {word:#06x} at pc {:#010x}",
-                    self.cur_instr_addr
-                );
+                // An encoding outside the modelled subset. Halt gracefully and
+                // record the opcode rather than panicking, so ordinary compiled
+                // firmware that reaches an unimplemented instruction stops
+                // cleanly and can be diagnosed (see [`CortexM::halted`]).
+                self.halted = true;
+                self.fault_opcode = Some(word);
                 1
             }
         }
@@ -1103,18 +1160,38 @@ impl CortexM {
         } else {
             self.reg(m.rn)
         };
-        let addr = match m.addr {
-            AddrMode::Imm(off) => base.wrapping_add(off),
-            AddrMode::Reg(rm) => base.wrapping_add(self.reg(rm)),
+        // Resolve the accessed address and any base-register writeback.
+        let (addr, writeback) = match m.addr {
+            AddrMode::Imm(off) => (base.wrapping_add(off), None),
+            AddrMode::Reg(rm) => (base.wrapping_add(self.reg(rm)), None),
+            AddrMode::RegShift { rm, shift } => (base.wrapping_add(self.reg(rm) << shift), None),
+            AddrMode::ImmWb {
+                imm,
+                add,
+                index,
+                wback,
+            } => {
+                let offset_addr = if add {
+                    base.wrapping_add(imm)
+                } else {
+                    base.wrapping_sub(imm)
+                };
+                // Pre-index accesses `rn ± imm`; post-index accesses `rn`.
+                let access = if index { offset_addr } else { base };
+                (access, if wback { Some(offset_addr) } else { None })
+            }
         };
         if m.load {
             let v = self.load(addr, m.size, m.signed);
             self.set_reg(m.rt, v);
-            2
         } else {
+            // The stored value is read before any base writeback.
             self.store(addr, m.size, self.reg(m.rt));
-            2
         }
+        if let Some(new_base) = writeback {
+            self.set_reg(m.rn, new_base);
+        }
+        2
     }
 
     fn exec_push(&mut self, regs: u8, lr: bool) -> u64 {
@@ -1353,6 +1430,10 @@ fn bitfield_mask(width: u8) -> u32 {
 
 impl McuCore for CortexM {
     fn step(&mut self) {
+        // A core halted on an unimplemented opcode makes no further progress.
+        if self.halted {
+            return;
+        }
         // Take a pending exception before fetching the next instruction.
         if let Some(exc) = self.next_exception() {
             self.enter_exception(exc);
@@ -1387,7 +1468,7 @@ impl McuCore for CortexM {
     }
 
     fn step_to(&mut self, t: f64) {
-        while (self.cycles as f64) / self.f_cpu < t {
+        while !self.halted && (self.cycles as f64) / self.f_cpu < t {
             self.step();
         }
     }
@@ -1422,7 +1503,7 @@ impl McuCore for CortexM {
     fn step_to_cycle(&mut self, until_cycle: u64, io: &mut PinIo) -> u64 {
         self.sio.sample_inputs(io);
         self.stm32.sample_inputs(io);
-        while self.cycles < until_cycle {
+        while self.cycles < until_cycle && !self.halted {
             self.step();
         }
         self.sio.publish_drives(io);
@@ -1896,6 +1977,152 @@ mod tests {
         c.step(); // MOVS r1,#0x11
         assert_eq!(c.reg(1), 0x11);
         assert_eq!(c.reg(0), 0, "the skipped MOVS never ran");
+    }
+
+    #[test]
+    fn t2_cbz_branches_when_zero() {
+        // MOVS r0,#0 ; CBZ r0,#2 (skip) ; MOVS r1,#0xAA ; MOVS r2,#0x55.
+        //  0: MOVS r0,#0    0x2000
+        //  2: CBZ r0,done   0xB108 → PC(2+4=6)+imm; imm=2 → target 8? recompute.
+        // Target the instruction at 0x08. PC = 2+4 = 6, offset = 8-6 = 2 →
+        // i:imm5 = 1 → imm5=1,i=0. CBZ r0: 1011 0 0 0 1 00001 000 = 0xB108.
+        //  4: MOVS r1,#0xAA 0x21AA (skipped)
+        //  6: (filler)      0x0000
+        //  8: MOVS r2,#0x55 0x2255
+        let mut c = with_program(&[0x2000, 0xB108, 0x21AA, 0x0000, 0x2255]);
+        c.step(); // MOVS r0,#0
+        c.step(); // CBZ r0 → taken, branch to 0x08
+        assert_eq!(c.pc_raw(), 8, "CBZ with r0==0 branched forward");
+        c.step(); // MOVS r2,#0x55
+        assert_eq!(c.reg(2), 0x55);
+        assert_eq!(c.reg(1), 0, "the skipped MOVS r1 never ran");
+    }
+
+    #[test]
+    fn t2_cbz_falls_through_when_nonzero() {
+        // MOVS r0,#1 ; CBZ r0,#2 (not taken) ; MOVS r1,#0xAA.
+        let mut c = with_program(&[0x2001, 0xB108, 0x21AA]);
+        c.step(); // MOVS r0,#1
+        c.step(); // CBZ r0 → not taken (r0 != 0)
+        assert_eq!(c.pc_raw(), 4, "CBZ with r0!=0 fell through");
+        c.step(); // MOVS r1,#0xAA
+        assert_eq!(c.reg(1), 0xAA);
+    }
+
+    #[test]
+    fn t2_cbnz_branches_when_nonzero() {
+        // MOVS r0,#1 ; CBNZ r0,done ; MOVS r1,#0xAA (skipped) ; MOVS r2,#0x55.
+        // CBNZ r0 to 0x08: op=1,i=0,imm5=1 → 1011 1 0 0 1 00001 000 = 0xB908.
+        let mut c = with_program(&[0x2001, 0xB908, 0x21AA, 0x0000, 0x2255]);
+        c.step(); // MOVS r0,#1
+        c.step(); // CBNZ r0 → taken
+        assert_eq!(c.pc_raw(), 8);
+        c.step(); // MOVS r2,#0x55
+        assert_eq!(c.reg(2), 0x55);
+        assert_eq!(c.reg(1), 0, "the skipped MOVS r1 never ran");
+    }
+
+    #[test]
+    fn t2_udiv_and_sdiv() {
+        // UDIV r0, r1, r2 = 0xFBB1 0xF0F2.
+        let mut c = with_program(&[0xFBB1, 0xF0F2]);
+        c.set_reg_raw(1, 100);
+        c.set_reg_raw(2, 7);
+        c.step();
+        assert_eq!(c.reg(0), 14, "100 / 7 = 14 (unsigned, toward zero)");
+        // SDIV r0, r1, r2 = 0xFB91 0xF0F2 with a negative dividend.
+        let mut c = with_program(&[0xFB91, 0xF0F2]);
+        c.set_reg_raw(1, (-100i32) as u32);
+        c.set_reg_raw(2, 7);
+        c.step();
+        assert_eq!(c.reg(0), (-14i32) as u32, "-100 / 7 = -14 (toward zero)");
+        // UDIV by zero yields 0 (no trap, no panic).
+        let mut c = with_program(&[0xFBB1, 0xF0F2]);
+        c.set_reg_raw(1, 42);
+        c.set_reg_raw(2, 0);
+        c.step();
+        assert_eq!(c.reg(0), 0, "divide by zero returns 0");
+    }
+
+    #[test]
+    fn t2_ldr_post_index_writeback() {
+        // LDR r3, [r1], #4 = 0xF851 0x3B04 — load then post-increment the base.
+        let mut c = with_program(&[0xF851, 0x3B04]);
+        c.set_reg_raw(1, 0x2000);
+        c.write_u32(0x2000, 0xCAFE_F00D);
+        c.step();
+        assert_eq!(c.reg(3), 0xCAFE_F00D, "loaded the word at the base");
+        assert_eq!(c.reg(1), 0x2004, "base post-incremented by 4");
+    }
+
+    #[test]
+    fn t2_str_pre_index_writeback() {
+        // STR r0, [r1, #4]! = 0xF841 0x0F04 — pre-index with writeback.
+        let mut c = with_program(&[0xF841, 0x0F04]);
+        c.set_reg_raw(0, 0x1234_5678);
+        c.set_reg_raw(1, 0x2000);
+        c.step();
+        assert_eq!(c.read_u32(0x2004), 0x1234_5678, "stored at base+4");
+        assert_eq!(c.reg(1), 0x2004, "base updated to base+4");
+    }
+
+    #[test]
+    fn t2_ldr_scaled_register_offset() {
+        // LDR.W r2, [r0, r1, LSL #2] = 0xF850 0x2021 — array[index] addressing.
+        let mut c = with_program(&[0xF850, 0x2021]);
+        c.set_reg_raw(0, 0x3000); // base
+        c.set_reg_raw(1, 3); // index
+        c.write_u32(0x3000 + 3 * 4, 0xBEEF);
+        c.step();
+        assert_eq!(c.reg(2), 0xBEEF, "loaded base + (index << 2)");
+    }
+
+    #[test]
+    fn t2_unknown_opcode_halts_gracefully() {
+        // An unmodelled (coprocessor) encoding must NOT panic in a test build:
+        // the core halts cleanly and records the faulting opcode.
+        let mut c = with_program(&[0xEC00, 0x0A10, 0x2042]);
+        assert!(!c.halted());
+        c.step(); // execute the Unknown encoding
+        assert!(c.halted(), "unknown opcode halted the core");
+        assert_eq!(c.fault_opcode(), Some(0xEC00));
+        // Further stepping is a no-op; the follow-on MOVS never runs.
+        let cyc = c.cycles();
+        c.step();
+        c.step_to(1.0);
+        assert_eq!(c.cycles(), cyc, "a halted core does not advance");
+        assert_eq!(c.reg(0), 0, "the instruction after the fault never ran");
+    }
+
+    #[test]
+    fn t2_cbz_udiv_writeback_gate_program() {
+        // CP-BRD-M10.1 gate: sum a 3-word array via post-increment LDR inside a
+        // CBZ-guarded loop, then UDIV the sum by a constant.
+        //   0: MOVS r0,#0        0x2000   ; sum = 0
+        //   2: MOVS r2,#3        0x2203   ; count = 3
+        //   4: MOVS r1,#0x40     0x2140   ; base = 0x40
+        // loop (6):
+        //   6: CBZ r2,done       0xB122   ; exit when count == 0 (fwd to 0x12)
+        //   8: LDR r3,[r1],#4    0xF851 0x3B04 ; load, post-increment base
+        //   C: ADDS r0,r0,r3     0x18C0
+        //   E: SUBS r2,r2,#1     0x3A01
+        //  10: B loop            0xE7F9
+        // done (0x12):
+        //  12: MOVS r4,#6        0x2406
+        //  14: UDIV r5,r0,r4     0xFBB0 0xF5F4
+        //  18: B .               0xE7FE
+        let mut c = with_program(&[
+            0x2000, 0x2203, 0x2140, 0xB122, 0xF851, 0x3B04, 0x18C0, 0x3A01, 0xE7F9, 0x2406, 0xFBB0,
+            0xF5F4, 0xE7FE,
+        ]);
+        c.write_u32(0x40, 10);
+        c.write_u32(0x44, 20);
+        c.write_u32(0x48, 30);
+        run(&mut c, 30);
+        assert!(!c.halted(), "no unknown-opcode panic across the run");
+        assert_eq!(c.reg(0), 60, "sum of the array");
+        assert_eq!(c.reg(1), 0x4C, "base walked past all three words");
+        assert_eq!(c.reg(5), 10, "60 / 6 = 10 via UDIV");
     }
 
     #[test]
