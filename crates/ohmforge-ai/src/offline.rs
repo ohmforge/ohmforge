@@ -15,10 +15,15 @@
 //!
 //! * **Design-rule checks** ([`check`]) — [`drc`] walks the circuit graph and
 //!   flags a floating node, a node with no path to ground, an LED/diode with no
-//!   series resistor, and a short across a source.
+//!   series resistor, a short across a source, parallel voltage-source
+//!   contention, a capacitor with no DC discharge path, and a resistor value
+//!   off the standard E24 series.
 //! * **Value calculators** ([`calc`]) — divider output, RC/RL time constant and
-//!   cutoff, series/parallel resistance, and the series resistor for an LED at a
-//!   target current. Pure `f64 -> Result`, with a friendly [`CalcError`].
+//!   cutoff, series/parallel resistance, the series resistor for an LED at a
+//!   target current, 555-astable frequency/duty, op-amp gain, LC resonance,
+//!   capacitive/inductive reactance, dBV↔ratio, thermal-noise voltage, and
+//!   regulator dropout headroom. Pure `f64 -> Result`, with a friendly
+//!   [`CalcError`].
 //! * **Parts index** ([`parts`]) — a tiny static catalog with a keyword search,
 //!   a RAG-style lookup with no embeddings and no network.
 //!
@@ -96,6 +101,15 @@ pub mod drc {
         FloatingNode,
         /// A diode/LED with no current-limiting resistor in series.
         LedNoSeriesResistor,
+        /// Two or more ideal voltage sources driving the same node pair — they
+        /// contend (a hard conflict unless their values happen to agree).
+        SourceContention,
+        /// A capacitor whose two plates have no DC-conductive path between them,
+        /// so stored charge has no way to bleed off.
+        CapacitorNoDischargePath,
+        /// A resistor whose value is not close to any standard E24 preferred
+        /// value — often a typo or a unit slip.
+        ValueOffPreferredSeries,
     }
 
     /// One design-rule finding: the rule, its severity, the parts (and/or node)
@@ -122,6 +136,9 @@ pub mod drc {
         findings.extend(no_path_to_ground(circuit));
         findings.extend(floating_nodes(circuit));
         findings.extend(led_without_series_resistor(circuit));
+        findings.extend(source_contention(circuit));
+        findings.extend(capacitor_no_discharge_path(circuit));
+        findings.extend(value_off_preferred_series(circuit));
         // Stable, rule-major order; messages already carry the node/part so the
         // secondary sort on them is deterministic.
         findings.sort_by(|a, b| a.rule.cmp(&b.rule).then_with(|| a.message.cmp(&b.message)));
@@ -340,6 +357,172 @@ pub mod drc {
         }
         out
     }
+
+    /// Two or more **ideal voltage sources** across the *same* pair of nodes
+    /// fight each other: unless their forced voltages agree exactly they imply an
+    /// infinite current (a short through the pair). We flag any node pair driven
+    /// by more than one voltage source. A source whose own terminals collapse to
+    /// one node is [`ShortAcrossSource`](Rule::ShortAcrossSource)'s job, not this
+    /// rule's, so it is skipped here.
+    fn source_contention(circuit: &Circuit) -> Vec<Finding> {
+        // Group voltage sources by their unordered resolved net pair.
+        let mut by_pair: BTreeMap<(u32, u32), Vec<String>> = BTreeMap::new();
+        for part in circuit.parts() {
+            if !matches!(part.kind, PartKind::VoltageSource) || part.terminals.len() < 2 {
+                continue;
+            }
+            let a = res(circuit, part.terminals[0]);
+            let b = res(circuit, part.terminals[1]);
+            if a == b {
+                continue; // a self-short, handled elsewhere
+            }
+            let key = if a <= b { (a, b) } else { (b, a) };
+            by_pair.entry(key).or_default().push(part.reference.clone());
+        }
+
+        let mut out = Vec::new();
+        for ((a, b), mut refs) in by_pair {
+            if refs.len() < 2 {
+                continue;
+            }
+            refs.sort();
+            out.push(Finding {
+                rule: Rule::SourceContention,
+                severity: Severity::Error,
+                refs: refs.clone(),
+                message: format!(
+                    "{} drive the same node pair (n{a}, n{b}) — parallel ideal voltage sources contend",
+                    refs.join(", ")
+                ),
+            });
+        }
+        out
+    }
+
+    /// A capacitor stores charge on two plates; if nothing provides a
+    /// **DC-conductive** path between those plates, that charge has no way to
+    /// bleed off (a cap stranded across an open switch, or between two DC-isolated
+    /// islands). We build adjacency over every *non-capacitor* part — each
+    /// conducts DC between its terminals — and flag a capacitor whose two plates
+    /// land in different connected components. A DC-blocking coupling cap is not
+    /// flagged: its two plates still reach a common node (usually ground) through
+    /// the surrounding resistors/sources.
+    fn capacitor_no_discharge_path(circuit: &Circuit) -> Vec<Finding> {
+        // Adjacency through every DC-conductive (non-capacitor) part.
+        let mut adj: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+        for part in circuit.parts() {
+            if matches!(part.kind, PartKind::Capacitor) {
+                continue;
+            }
+            let nets: Vec<u32> = part.terminals.iter().map(|&t| res(circuit, t)).collect();
+            for (i, &a) in nets.iter().enumerate() {
+                for &b in &nets[i + 1..] {
+                    adj.entry(a).or_default().insert(b);
+                    adj.entry(b).or_default().insert(a);
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+        for part in circuit.parts() {
+            if !matches!(part.kind, PartKind::Capacitor) || part.terminals.len() < 2 {
+                continue;
+            }
+            let a = res(circuit, part.terminals[0]);
+            let b = res(circuit, part.terminals[1]);
+            if a == b {
+                continue;
+            }
+            // BFS from plate `a` over the DC-conductive graph.
+            let mut seen: BTreeSet<u32> = BTreeSet::new();
+            let mut queue: VecDeque<u32> = VecDeque::new();
+            seen.insert(a);
+            queue.push_back(a);
+            while let Some(n) = queue.pop_front() {
+                if let Some(neighbors) = adj.get(&n) {
+                    for &m in neighbors {
+                        if seen.insert(m) {
+                            queue.push_back(m);
+                        }
+                    }
+                }
+            }
+            if !seen.contains(&b) {
+                out.push(Finding {
+                    rule: Rule::CapacitorNoDischargePath,
+                    severity: Severity::Warning,
+                    refs: vec![part.reference.clone()],
+                    message: format!(
+                        "{} has no DC discharge path between its plates (n{a}, n{b}) — stored charge cannot bleed off",
+                        part.reference
+                    ),
+                });
+            }
+        }
+        out
+    }
+
+    /// The E24 (10 %) preferred-value mantissas spanning one decade `[1, 10)`,
+    /// plus `10.0` as the decade's upper neighbor so a value that normalizes to
+    /// the top of the decade matches instead of being mis-flagged.
+    const E24: [f64; 25] = [
+        1.0, 1.1, 1.2, 1.3, 1.5, 1.6, 1.8, 2.0, 2.2, 2.4, 2.7, 3.0, 3.3, 3.6, 3.9, 4.3, 4.7, 5.1,
+        5.6, 6.2, 6.8, 7.5, 8.2, 9.1, 10.0,
+    ];
+
+    /// A resistor value well off every standard E24 preferred value is usually a
+    /// typo or a unit slip (`4k7` fat-fingered, a stray digit). We normalize the
+    /// magnitude into one decade and flag it when its mantissa is more than 2 %
+    /// from the nearest E24 value, naming the closest standard value. Zero and
+    /// non-finite values are left to the other rules.
+    fn value_off_preferred_series(circuit: &Circuit) -> Vec<Finding> {
+        let mut out = Vec::new();
+        for part in circuit.parts() {
+            if !matches!(part.kind, PartKind::Resistor) {
+                continue;
+            }
+            let Some(value) = part.value else { continue };
+            let val = value.magnitude;
+            if !val.is_finite() || val <= 0.0 {
+                continue;
+            }
+            // Normalize to a mantissa in [1, 10) without log/floor rounding slips.
+            let mut mantissa = val;
+            let mut decade = 1.0_f64;
+            while mantissa >= 10.0 {
+                mantissa /= 10.0;
+                decade *= 10.0;
+            }
+            while mantissa < 1.0 {
+                mantissa *= 10.0;
+                decade /= 10.0;
+            }
+            // The nearest E24 mantissa by absolute distance.
+            let nearest = E24
+                .iter()
+                .copied()
+                .min_by(|&x, &y| {
+                    (x - mantissa)
+                        .abs()
+                        .partial_cmp(&(y - mantissa).abs())
+                        .expect("E24 values are finite")
+                })
+                .expect("E24 is non-empty");
+            if (mantissa - nearest).abs() / nearest > 0.02 {
+                let suggested = nearest * decade;
+                out.push(Finding {
+                    rule: Rule::ValueOffPreferredSeries,
+                    severity: Severity::Warning,
+                    refs: vec![part.reference.clone()],
+                    message: format!(
+                        "{} value {val} Ω is not a standard E24 value (nearest: {suggested} Ω)",
+                        part.reference
+                    ),
+                });
+            }
+        }
+        out
+    }
 }
 
 // ── Value calculators ─────────────────────────────────────────────────────────
@@ -486,6 +669,103 @@ pub mod calc {
         }
         Ok((v_supply - v_forward) / i_target)
     }
+
+    /// The oscillation frequency of a 555 timer in astable mode:
+    /// `f = 1.44 / ((R1 + 2·R2)·C)` (hertz), where `R1` is the charge resistor,
+    /// `R2` the charge/discharge resistor, and `C` the timing capacitor. All
+    /// three must be positive.
+    pub fn ne555_astable_frequency(r1: f64, r2: f64, c: f64) -> Result<f64, CalcError> {
+        let r1 = positive(r1, "R1")?;
+        let r2 = positive(r2, "R2")?;
+        let c = positive(c, "the capacitance")?;
+        Ok(1.44 / ((r1 + 2.0 * r2) * c))
+    }
+
+    /// The duty cycle (0–1) of a 555 timer in astable mode:
+    /// `D = (R1 + R2) / (R1 + 2·R2)`. Both resistances must be positive. The
+    /// classic topology cannot reach 50 % — the duty is always above one half.
+    pub fn ne555_astable_duty(r1: f64, r2: f64) -> Result<f64, CalcError> {
+        let r1 = positive(r1, "R1")?;
+        let r2 = positive(r2, "R2")?;
+        Ok((r1 + r2) / (r1 + 2.0 * r2))
+    }
+
+    /// The gain of an inverting op-amp stage: `−R_f / R_in`. The input resistance
+    /// must be positive and the feedback resistance non-negative. The result is
+    /// negative (the stage inverts).
+    pub fn op_amp_inverting_gain(r_in: f64, r_f: f64) -> Result<f64, CalcError> {
+        let r_in = positive(r_in, "the input resistance")?;
+        let r_f = non_negative(r_f, "the feedback resistance")?;
+        Ok(-r_f / r_in)
+    }
+
+    /// The gain of a non-inverting op-amp stage: `1 + R_f / R_in`. The input
+    /// (ground-leg) resistance must be positive and the feedback resistance
+    /// non-negative. The result is at least `1`.
+    pub fn op_amp_noninverting_gain(r_in: f64, r_f: f64) -> Result<f64, CalcError> {
+        let r_in = positive(r_in, "the input resistance")?;
+        let r_f = non_negative(r_f, "the feedback resistance")?;
+        Ok(1.0 + r_f / r_in)
+    }
+
+    /// The resonant frequency of an LC tank: `f = 1 / (2π·√(L·C))` (hertz). Both
+    /// the inductance and the capacitance must be positive.
+    pub fn lc_resonance_hz(l: f64, c: f64) -> Result<f64, CalcError> {
+        let l = positive(l, "the inductance")?;
+        let c = positive(c, "the capacitance")?;
+        Ok(1.0 / (std::f64::consts::TAU * (l * c).sqrt()))
+    }
+
+    /// The reactance of a capacitor at a frequency: `X_C = 1 / (2π·f·C)` (ohms).
+    /// Both the frequency and the capacitance must be positive.
+    pub fn capacitive_reactance(freq: f64, c: f64) -> Result<f64, CalcError> {
+        let freq = positive(freq, "the frequency")?;
+        let c = positive(c, "the capacitance")?;
+        Ok(1.0 / (std::f64::consts::TAU * freq * c))
+    }
+
+    /// The reactance of an inductor at a frequency: `X_L = 2π·f·L` (ohms). Both
+    /// the frequency and the inductance must be positive.
+    pub fn inductive_reactance(freq: f64, l: f64) -> Result<f64, CalcError> {
+        let freq = positive(freq, "the frequency")?;
+        let l = positive(l, "the inductance")?;
+        Ok(std::f64::consts::TAU * freq * l)
+    }
+
+    /// A voltage ratio expressed in decibels: `20·log10(ratio)` (dBV-style). The
+    /// ratio must be positive.
+    pub fn db_from_ratio(ratio: f64) -> Result<f64, CalcError> {
+        let ratio = positive(ratio, "the ratio")?;
+        Ok(20.0 * ratio.log10())
+    }
+
+    /// The linear voltage ratio for a level in decibels: `10^(db / 20)`, the
+    /// inverse of [`db_from_ratio`]. The input must be finite.
+    pub fn ratio_from_db(db: f64) -> Result<f64, CalcError> {
+        let db = finite(db)?;
+        Ok(10f64.powf(db / 20.0))
+    }
+
+    /// The RMS Johnson–Nyquist thermal-noise voltage of a resistor over a
+    /// bandwidth: `V_n = √(4·k·T·R·Δf)` (volts), with `k` the Boltzmann constant.
+    /// The resistance, temperature (kelvin), and bandwidth (hertz) must all be
+    /// positive.
+    pub fn thermal_noise_voltage(r: f64, temp_k: f64, bandwidth_hz: f64) -> Result<f64, CalcError> {
+        /// Boltzmann constant (J/K), the 2019 SI exact value.
+        const K_B: f64 = 1.380_649e-23;
+        let r = positive(r, "the resistance")?;
+        let temp_k = positive(temp_k, "the temperature")?;
+        let bandwidth_hz = positive(bandwidth_hz, "the bandwidth")?;
+        Ok((4.0 * K_B * temp_k * r * bandwidth_hz).sqrt())
+    }
+
+    /// A linear regulator's dropout headroom: `V_in − V_out` (volts). A positive
+    /// result is the margin above the regulator's minimum dropout; a negative one
+    /// means the input sits below the output (the regulator cannot regulate).
+    /// Both voltages must be finite.
+    pub fn regulator_dropout_headroom(v_in: f64, v_out: f64) -> Result<f64, CalcError> {
+        Ok(finite(v_in)? - finite(v_out)?)
+    }
 }
 
 // ── Parts index (RAG-style, static, offline) ──────────────────────────────────
@@ -567,6 +847,74 @@ pub mod parts {
             category: "regulator",
             summary: "Fixed +3.3 V LDO regulator, 1 A.",
             keywords: &["regulator", "ldo", "3v3", "3.3v", "power", "supply"],
+        },
+        CatalogEntry {
+            part_number: "LM317",
+            category: "regulator",
+            summary: "Adjustable positive linear regulator, 1.25–37 V, 1.5 A.",
+            keywords: &["regulator", "adjustable", "linear", "variable", "power"],
+        },
+        CatalogEntry {
+            part_number: "LM1117-3.3",
+            category: "regulator",
+            summary: "Fixed +3.3 V LDO regulator, 800 mA, low dropout.",
+            keywords: &["regulator", "ldo", "3v3", "3.3v", "dropout", "power"],
+        },
+        CatalogEntry {
+            part_number: "TL072",
+            category: "ic",
+            summary: "Dual JFET-input op-amp, low noise, audio-grade.",
+            keywords: &["opamp", "op-amp", "jfet", "amplifier", "dual", "audio"],
+        },
+        CatalogEntry {
+            part_number: "TLV9062",
+            category: "ic",
+            summary: "Dual rail-to-rail op-amp, 10 MHz, 1.8–5.5 V single-supply.",
+            keywords: &[
+                "opamp",
+                "op-amp",
+                "rail-to-rail",
+                "amplifier",
+                "dual",
+                "cmos",
+            ],
+        },
+        CatalogEntry {
+            part_number: "IRLZ44N",
+            category: "transistor",
+            summary: "N-channel logic-level power MOSFET, 55 V / 47 A.",
+            keywords: &["transistor", "mosfet", "nmos", "power", "logic", "switch"],
+        },
+        CatalogEntry {
+            part_number: "AO3400",
+            category: "transistor",
+            summary: "N-channel logic-level MOSFET (SOT-23), 30 V / 5.8 A.",
+            keywords: &["transistor", "mosfet", "nmos", "logic", "sot-23", "switch"],
+        },
+        CatalogEntry {
+            part_number: "1N4733A",
+            category: "diode",
+            summary: "5.1 V 1 W Zener diode for shunt regulation/clamping.",
+            keywords: &["diode", "zener", "clamp", "reference", "shunt"],
+        },
+        CatalogEntry {
+            part_number: "SMAJ5.0A",
+            category: "diode",
+            summary: "5 V unidirectional TVS diode for ESD/surge protection.",
+            keywords: &["diode", "tvs", "transient", "esd", "surge", "protection"],
+        },
+        CatalogEntry {
+            part_number: "ABM3-16.000MHZ",
+            category: "crystal",
+            summary: "16 MHz quartz crystal, 18 pF load, SMD (HC-49 style).",
+            keywords: &[
+                "crystal",
+                "quartz",
+                "oscillator",
+                "16mhz",
+                "clock",
+                "resonator",
+            ],
         },
     ];
 
@@ -879,6 +1227,134 @@ mod tests {
         );
     }
 
+    /// Two voltage sources across the identical node pair contend; one does not.
+    #[test]
+    fn parallel_voltage_sources_are_flagged_as_contention() {
+        let mut bad = Circuit::new("contention");
+        let n = bad.new_net();
+        bad.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            Some(Value::new(5.0, Unit::Volt)),
+            vec![n, NetId::GROUND],
+        );
+        // A second ideal source forced onto the same node pair — they fight.
+        bad.add_part(
+            "V2",
+            PartKind::VoltageSource,
+            Some(Value::new(3.3, Unit::Volt)),
+            vec![n, NetId::GROUND],
+        );
+        let fs = check(&bad);
+        assert!(
+            fs.iter().any(|f| f.rule == Rule::SourceContention
+                && f.refs == vec!["V1".to_string(), "V2".to_string()]),
+            "{fs:?}"
+        );
+
+        // A single source across the pair is fine (no contention).
+        let mut ok = Circuit::new("single source");
+        let n = ok.new_net();
+        let out = ok.new_net();
+        ok.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            Some(Value::new(5.0, Unit::Volt)),
+            vec![n, NetId::GROUND],
+        );
+        ok.add_part("R1", PartKind::Resistor, r(1000.0), vec![n, out]);
+        ok.add_part(
+            "R2",
+            PartKind::Resistor,
+            r(1000.0),
+            vec![out, NetId::GROUND],
+        );
+        assert!(
+            !check(&ok).iter().any(|f| f.rule == Rule::SourceContention),
+            "{:?}",
+            check(&ok)
+        );
+    }
+
+    /// A capacitor whose plates are in DC-isolated islands is flagged; a parallel
+    /// resistor gives a discharge path and clears it.
+    #[test]
+    fn capacitor_without_a_dc_discharge_path_is_flagged_then_cleared() {
+        // C1's plate `a` touches nothing else; plate `b` reaches ground via R1.
+        // No DC-conductive path joins the two plates.
+        let mut bad = Circuit::new("stranded cap");
+        let a = bad.new_net();
+        let b = bad.new_net();
+        bad.add_part("C1", PartKind::Capacitor, None, vec![a, b]);
+        bad.add_part("R1", PartKind::Resistor, r(1000.0), vec![b, NetId::GROUND]);
+        let fs = check(&bad);
+        assert!(
+            fs.iter()
+                .any(|f| f.rule == Rule::CapacitorNoDischargePath && f.refs == vec!["C1"]),
+            "{fs:?}"
+        );
+
+        // A resistor across the same two plates bleeds the charge — cleared.
+        let mut good = Circuit::new("bled cap");
+        let n = good.new_net();
+        let out = good.new_net();
+        good.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            Some(Value::new(5.0, Unit::Volt)),
+            vec![n, NetId::GROUND],
+        );
+        good.add_part("R1", PartKind::Resistor, r(1000.0), vec![n, out]);
+        good.add_part(
+            "R2",
+            PartKind::Resistor,
+            r(1000.0),
+            vec![out, NetId::GROUND],
+        );
+        good.add_part("C1", PartKind::Capacitor, None, vec![out, NetId::GROUND]);
+        assert!(
+            !check(&good)
+                .iter()
+                .any(|f| f.rule == Rule::CapacitorNoDischargePath),
+            "a cap whose plates share a DC path is not flagged: {:?}",
+            check(&good)
+        );
+    }
+
+    /// A resistor well off the E24 series is flagged with the nearest standard
+    /// value; exact E24 values (and a clean 1 k) are not.
+    #[test]
+    fn off_series_resistor_value_is_flagged() {
+        let mut c = Circuit::new("odd value");
+        let a = c.new_net();
+        c.add_part("R1", PartKind::Resistor, r(1234.0), vec![a, NetId::GROUND]);
+        let fs = check(&c);
+        let hit = fs
+            .iter()
+            .find(|f| f.rule == Rule::ValueOffPreferredSeries && f.refs == vec!["R1"])
+            .expect("1234 Ω is off the E24 series");
+        assert!(
+            hit.message.contains("1200"),
+            "names the nearest value: {hit:?}"
+        );
+
+        // Standard values across decades are accepted (no false positives).
+        let mut ok = Circuit::new("standard values");
+        let a = ok.new_net();
+        let b = ok.new_net();
+        let d = ok.new_net();
+        ok.add_part("R1", PartKind::Resistor, r(1000.0), vec![a, b]); // 1.0
+        ok.add_part("R2", PartKind::Resistor, r(4700.0), vec![b, d]); // 4.7
+        ok.add_part("R3", PartKind::Resistor, r(330.0), vec![d, NetId::GROUND]); // 3.3
+        assert!(
+            !check(&ok)
+                .iter()
+                .any(|f| f.rule == Rule::ValueOffPreferredSeries),
+            "{:?}",
+            check(&ok)
+        );
+    }
+
     /// `check` is deterministic: the same circuit yields byte-identical findings.
     #[test]
     fn check_is_deterministic() {
@@ -949,6 +1425,72 @@ mod tests {
             Err(NonPositive("the target current"))
         );
         assert_eq!(calc::voltage_divider(f64::NAN, 1.0, 1.0), Err(NotFinite));
+    }
+
+    #[test]
+    fn ne555_op_amp_and_resonance_calculators() {
+        // 555 astable R1=R2=1k, C=1µF: f = 1.44/((1k+2k)·1µF) = 480 Hz, duty = 2/3.
+        assert!(
+            (calc::ne555_astable_frequency(1000.0, 1000.0, 1e-6).unwrap() - 480.0).abs() < 1e-9
+        );
+        assert!((calc::ne555_astable_duty(1000.0, 1000.0).unwrap() - 2.0 / 3.0).abs() < 1e-12);
+        // Inverting gain −Rf/Rin = −10; non-inverting 1 + Rf/Rin = 11.
+        assert!((calc::op_amp_inverting_gain(1000.0, 10_000.0).unwrap() + 10.0).abs() < 1e-12);
+        assert!((calc::op_amp_noninverting_gain(1000.0, 10_000.0).unwrap() - 11.0).abs() < 1e-12);
+        // LC resonance, L=C=1µ: f = 1/(2π·1µ) ≈ 159154.943 Hz.
+        assert!((calc::lc_resonance_hz(1e-6, 1e-6).unwrap() - 159_154.943_091_895).abs() < 1e-3);
+    }
+
+    #[test]
+    fn reactance_db_noise_and_dropout_calculators() {
+        // Xc = 1/(2π·1kHz? no) — f=159.1549 Hz, C=1µF → 1/(2π·159.1549·1µ) ≈ 1000 Ω.
+        assert!(
+            (calc::capacitive_reactance(159.154_943_091_895, 1e-6).unwrap() - 1000.0).abs() < 1e-6
+        );
+        // Xl = 2π·1kHz·1mH ≈ 6.2832 Ω.
+        assert!(
+            (calc::inductive_reactance(1000.0, 1e-3).unwrap() - std::f64::consts::TAU).abs() < 1e-9
+        );
+        // dB round trip: 10× is +20 dBV, and back.
+        assert!((calc::db_from_ratio(10.0).unwrap() - 20.0).abs() < 1e-12);
+        assert!((calc::ratio_from_db(20.0).unwrap() - 10.0).abs() < 1e-12);
+        // Johnson noise of 1 kΩ over 1 Hz at 300 K ≈ 4.07 nV/√Hz · 1.
+        let vn = calc::thermal_noise_voltage(1000.0, 300.0, 1.0).unwrap();
+        assert!((vn - 4.070e-9).abs() < 1e-11, "vn = {vn}");
+        // Dropout headroom 12 V in, 5 V out → 7 V.
+        assert!((calc::regulator_dropout_headroom(12.0, 5.0).unwrap() - 7.0).abs() < 1e-12);
+        // …and negative when the input is below the output.
+        assert!(calc::regulator_dropout_headroom(3.0, 5.0).unwrap() < 0.0);
+    }
+
+    #[test]
+    fn new_calculators_reject_degenerate_inputs() {
+        use calc::CalcError::*;
+        assert_eq!(
+            calc::ne555_astable_frequency(0.0, 1000.0, 1e-6),
+            Err(NonPositive("R1"))
+        );
+        assert_eq!(
+            calc::op_amp_inverting_gain(0.0, 1000.0),
+            Err(NonPositive("the input resistance"))
+        );
+        assert_eq!(
+            calc::lc_resonance_hz(-1.0, 1e-6),
+            Err(NonPositive("the inductance"))
+        );
+        assert_eq!(
+            calc::capacitive_reactance(0.0, 1e-6),
+            Err(NonPositive("the frequency"))
+        );
+        assert_eq!(calc::db_from_ratio(0.0), Err(NonPositive("the ratio")));
+        assert_eq!(
+            calc::thermal_noise_voltage(1000.0, 0.0, 1.0),
+            Err(NonPositive("the temperature"))
+        );
+        assert_eq!(
+            calc::regulator_dropout_headroom(f64::INFINITY, 5.0),
+            Err(NotFinite)
+        );
     }
 
     // ── Parts index ─────────────────────────────────────────────────────────────
