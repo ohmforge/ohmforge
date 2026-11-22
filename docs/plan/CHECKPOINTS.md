@@ -207,8 +207,8 @@ _(Maintenance, post-v0.8.0: **elite landing-page redesign** + `.gitattributes` (
 
 _From a six-track planning fan-out (`docs/plan/m10-proposals/*.md`). Executed in dependency waves: W1 sim-core/boards/ui-shell/ai-fmt · W2 web (after AF-M10.1) · W3 platform. Standing rules hold; determinism-moving work ships opt-in._
 
-- [~] **CP-SIM-M10.1** (sim-core) Reuse the ordered symbolic/numeric factorization on the complex AC/noise solver (re-factors every swept frequency today), size-gated. — *gate:* AC/noise bit-for-bit vs today, swept-AC benchmark markedly faster at scale, golden suite unchanged.
-- [~] **CP-SIM-M10.2** (sim-core) Opt-in trapezoidal/Gear-2 transient integration (Backward-Euler stays default). — *gate:* an LC tank rings with trap where BE over-damps; the BE path stays bit-for-bit; selectable via the analysis API.
+- [x] **CP-SIM-M10.1** (sim-core) Reuse the ordered symbolic/numeric factorization on the complex AC/noise solver (re-factors every swept frequency today), size-gated. — *gate (passing):* a `ComplexSystem` dense/sparse-backing + reusable ordered complex LU (`ComplexSymbolic`/`ComplexNumeric`/`ComplexReusableSolver`, `COMPLEX_SPARSE_THRESHOLD=64`/`COMPLEX_KLU_THRESHOLD=256`, sharing the real side's `min_degree_eliminate`), wired into `ac`/`noise`. `determinism::{ac_deterministic_and_golden, noise_deterministic_and_golden, full_golden_suite_runs_twice_identically}` stay bit-for-bit (fixtures below threshold); `tests::swept_ac_ordered_matches_dense` (300-rung ladder ≤1e-12), `mna_complex::tests::{complex_sparse_matches_dense_bit_for_bit, complex_ordered_and_refactor_match_dense, complex_ordered_reports_singular}`; bench `ac_scaling` ≈6×/9×/18× at 300/600/1000 rungs.
+- [x] **CP-SIM-M10.2** (sim-core) Opt-in trapezoidal/Gear-2 transient integration (Backward-Euler stays default). — *gate (passing):* additive `IntegrationMethod::{BackwardEuler(default),Trapezoidal}` + `Engine::run_transient(circuit, duration, step, method)` (no `Analysis`/`PartKind`/`Waveform` change). `tests::lc_tank_rings_under_trapezoidal_where_backward_euler_decays` (trap late amplitude >0.95× early; BE <0.5×), `tests::run_transient_backward_euler_matches_analysis_transient_bit_for_bit`, `tests::trapezoidal_needs_a_fixed_step`; `determinism::{transient_deterministic_and_golden, full_golden_suite_runs_twice_identically}` bit-for-bit.
 - [x] **CP-BRD-M10.1** (boards) Cortex-M Thumb-2 correctness (`CBZ/CBNZ`, `UDIV/SDIV`, load/store pre/post-index writeback + scaled register offset) + graceful `Unknown` opcode (halts via `CortexM::halted`, no `debug_assert!` panic). — *gate PASS:* `cortexm::core::tests::t2_cbz_udiv_writeback_gate_program` (array sum via post-index LDR in a CBZ loop, then UDIV → r0=60/r5=10); `t2_cbz_branches_when_zero`, `t2_cbnz_branches_when_nonzero`, `t2_udiv_and_sdiv`, `t2_ldr_post_index_writeback`, `t2_str_pre_index_writeback`, `t2_ldr_scaled_register_offset`; `t2_unknown_opcode_halts_gracefully` (no panic, core halts cleanly).
 - [x] **CP-BRD-M10.2** (boards) AVR Timer0/1 (OVF + COMPA/COMPB) and USART (RX/UDRE/TX) interrupt vectors sourced from `TIMSK`/`UCSR` into the existing priority sweep. — *gate PASS:* `avr::core::tests::timer0_overflow_isr_advances_a_counter_at_the_expected_rate` (ISR counter tracks the 256-cycle overflow rate) and `usart_rx_isr_runs_when_a_byte_arrives` (RX ISR reads the delivered byte); periph units `timer0_overflow_sources_its_vector_when_enabled`, `timer1_compare_a_sources_its_vector`, `usart_rx_sources_its_vector_when_enabled`, `interrupt_priority_prefers_the_lower_vector`, `*_without_enable_never_vectors`.
 - [x] **CP-UX-M10.1** (ui-shell) Wire the real `Oscilloscope` (trigger/cursors/measurements) into the live scope pane + sweep `run sparams` into an S11 locus on the Smith chart. — *gate (passing, no tty):* `ohmforge-tui` `app::tests::scope_cursors_read_dt_dv_and_frequency_on_a_known_capture` + `scope_keys_drive_the_trigger_and_cursors`; `scope_renders_within_an_80x24_pane_without_clipping_the_axis` still passes through the new `Oscilloscope` path; `ohmforge-shell` `run_sparams_sweeps_an_s11_locus_across_frequency`. Swept `run sparams <p1> <p2> [z0] <f0> <f1> [ppd]` loops `Engine::s_parameters` → `SmithChart::render(&locus)`.
@@ -227,13 +227,13 @@ _From a six-track planning fan-out (`docs/plan/m10-proposals/*.md`). Executed in
 
 | Track | Done | In progress | Total |
 |---|---|---|---|
-| sim-core | 28 | 2 | 30 |
+| sim-core | 30 | 0 | 30 |
 | boards | 20 | 0 | 20 |
 | ui-shell | 25 | 0 | 25 |
 | ai-fmt | 21 | 0 | 21 |
 | platform | 11 | 0 | 14 |
 | web | 7 | 0 | 9 |
-| **Total** | **112** | **2** | **119** |
+| **Total** | **114** | **0** | **119** |
 
 _**67/67 — M0 through M4 all complete** (M0–M3 tagged v0.1.0; M4 adds the rest). M4 delivered the **plugin device-model API** + an **instrument/block plugin trait**, a **KLU-class ordered/reusable sparse solver** and **multithreaded analyses**, a **Cortex-M3/M4 (Thumb-2)** core with an STM32 board, **SPICE `.model` import** + a vendor model library, and **shareable circuit links** in the browser. Deferred by design: real-time collaboration, the QEMU full-SBC bridge, and full vendor-SPICE `.model` fidelity — the standing M-next horizon._
 

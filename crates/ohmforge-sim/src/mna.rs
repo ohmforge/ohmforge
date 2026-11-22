@@ -831,7 +831,18 @@ fn min_degree_order(rows: &[BTreeMap<usize, f64>], n: usize) -> Vec<usize> {
             }
         }
     }
+    min_degree_eliminate(adj)
+}
 
+/// The greedy minimum-degree elimination over a prebuilt symmetric adjacency — the
+/// pattern-only heart of [`min_degree_order`], shared with the complex AC/noise
+/// solver (`CP-SIM-M10.1`), whose adjacency is built from [`ohmforge_core::Complex`]
+/// row maps. Taking the adjacency (not the valued rows) keeps the ordering purely
+/// structural, so the real and complex paths share one proven heuristic. `adj[i]`
+/// holds `i`'s neighbors (`j ≠ i` wherever the matrix couples them, symmetrized);
+/// the result is the fill-reducing elimination order `perm[new] = old`.
+pub(crate) fn min_degree_eliminate(mut adj: Vec<BTreeSet<usize>>) -> Vec<usize> {
+    let n = adj.len();
     let mut eliminated = vec![false; n];
     let mut order: Vec<usize> = Vec::with_capacity(n);
     let mut heap: BinaryHeap<Reverse<(usize, usize)>> = BinaryHeap::new();

@@ -24,13 +24,41 @@ use std::f64::consts::TAU;
 use std::fmt;
 
 use mna::{ReusableSolver, System};
-use mna_complex::ComplexSystem;
+use mna_complex::{ComplexReusableSolver, ComplexSymbolic, ComplexSystem, COMPLEX_KLU_THRESHOLD};
 use ohmforge_core::graph::{
     BjtModel, Circuit, DiodeModel, Line, LineKind, MosfetModel, NetId, Part, PartKind, Polarity,
     Switch, Waveform, NOMINAL_TEMP_C,
 };
 use ohmforge_core::value::Value;
 use ohmforge_core::{Complex, Domain, Signal, SignalData, Unit};
+
+/// The time-integration method for a transient analysis (`CP-SIM-M10.2`).
+///
+/// Backward Euler is the **default** everywhere — [`Analysis::Transient`] always uses
+/// it, so every existing transient result is byte-identical. The opt-in
+/// [`Trapezoidal`](IntegrationMethod::Trapezoidal) method is selected only through
+/// [`Engine::run_transient`], an additive surface that leaves the [`Analysis`] enum
+/// (and its many construction sites) untouched.
+///
+/// * **Backward Euler** — first order, unconditionally stable, but heavily and
+///   artificially damped: it smears LC ringing and under-predicts overshoot on
+///   resonant / lightly-damped circuits.
+/// * **Trapezoidal** — second order and (for an ideal reactance) energy-conserving,
+///   so it sustains oscillation where Backward Euler decays it, at the cost of the
+///   classic trapezoidal "ringing" on a hard-switched step. Applied to the
+///   two-terminal capacitor and (isolated) inductor companions; magnetically-coupled
+///   inductors, transmission lines, and controlled switches keep their Backward-Euler
+///   companions regardless, and the method needs a fixed timestep (the adaptive
+///   driver's step-doubling error control is first-order Backward Euler by design).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IntegrationMethod {
+    /// First-order Backward Euler — the default, matching every pre-`CP-SIM-M10.2`
+    /// transient bit-for-bit.
+    #[default]
+    BackwardEuler,
+    /// Second-order trapezoidal integration (opt-in via [`Engine::run_transient`]).
+    Trapezoidal,
+}
 
 /// The analyses the engine can run.
 #[derive(Debug, Clone)]
@@ -197,9 +225,14 @@ impl Engine {
                 let x = solve_dc(circuit, &layout, reg)?;
                 Ok(op_signals(&layout, &x))
             }
-            Analysis::Transient { duration, step } => {
-                transient(circuit, &layout, *duration, *step, reg)
-            }
+            Analysis::Transient { duration, step } => transient(
+                circuit,
+                &layout,
+                *duration,
+                *step,
+                reg,
+                IntegrationMethod::BackwardEuler,
+            ),
             Analysis::Ac {
                 f_start,
                 f_stop,
@@ -238,6 +271,41 @@ impl Engine {
                 inner,
             } => self.monte_carlo(circuit, *seed, *runs, *output, *sample, inner),
         }
+    }
+
+    /// Run a fixed-step transient with an explicit [`IntegrationMethod`] — the opt-in
+    /// surface for second-order (trapezoidal) integration (`CP-SIM-M10.2`).
+    ///
+    /// This is **purely additive**: [`Engine::run`] with [`Analysis::Transient`] is
+    /// unchanged and always Backward Euler, so every existing result stays
+    /// byte-identical; `run_transient` is the only way to select another integrator,
+    /// and does not touch the [`Analysis`] enum. It requires an explicit `step`
+    /// (`> 0`): a non-Backward-Euler method is incompatible with the adaptive driver's
+    /// first-order error control, and `method = BackwardEuler` here is exactly the
+    /// fixed-step `Analysis::Transient { step: Some(step) }` path. Returns one
+    /// [`Signal`] per node, as [`Engine::run`] does.
+    ///
+    /// Trapezoidal sustains the ringing of a lightly-damped resonator (an LC tank)
+    /// that Backward Euler artificially damps; it applies to the two-terminal
+    /// capacitor and isolated-inductor companions, while coupled inductors,
+    /// transmission lines, and controlled switches keep Backward Euler.
+    pub fn run_transient(
+        &self,
+        circuit: &Circuit,
+        duration: f64,
+        step: f64,
+        method: IntegrationMethod,
+    ) -> Result<Vec<Signal>, SimError> {
+        validate(circuit, &self.registry)?;
+        let layout = Layout::build(circuit);
+        transient(
+            circuit,
+            &layout,
+            duration,
+            Some(step),
+            &self.registry,
+            method,
+        )
     }
 }
 
@@ -1569,6 +1637,13 @@ struct StepOut {
     /// Refreshed lossy-line companion state `[series_i, cap_a_v, cap_b_v]`
     /// (lossy-line order); empty when the circuit has no lossy lines.
     lossy: Vec<[f64; 3]>,
+    /// Refreshed capacitor branch currents `i_C` — the extra history the trapezoidal
+    /// companion carries (`CP-SIM-M10.2`). **Empty under Backward Euler**, which needs
+    /// no current history, so the default path threads nothing and stays bit-for-bit.
+    cap_i: Vec<f64>,
+    /// Refreshed isolated-inductor branch voltages `v_L` — the trapezoidal companion's
+    /// extra history. Empty under Backward Euler.
+    ind_v: Vec<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1891,6 +1966,10 @@ struct TransientModel<'a> {
     n: usize,
     m: usize,
     cb: usize,
+    /// Time-integration method (`CP-SIM-M10.2`). [`IntegrationMethod::BackwardEuler`]
+    /// (the default) reproduces every pre-M10 transient bit-for-bit; the opt-in
+    /// trapezoidal method changes only the two-terminal reactive companions.
+    method: IntegrationMethod,
 }
 
 impl<'a> TransientModel<'a> {
@@ -1898,6 +1977,7 @@ impl<'a> TransientModel<'a> {
         circuit: &'a Circuit,
         layout: &'a Layout,
         registry: &DeviceRegistry,
+        method: IntegrationMethod,
     ) -> Result<Self, SimError> {
         let caps: Vec<(NetId, NetId, f64)> = circuit
             .parts()
@@ -1988,6 +2068,7 @@ impl<'a> TransientModel<'a> {
             n: layout.n_nodes(),
             m: layout.vsources.len(),
             cb: layout.n_controlled_branches(),
+            method,
         })
     }
 
@@ -2099,11 +2180,14 @@ impl<'a> TransientModel<'a> {
         h: f64,
         cap_prev: &[f64],
         ind_prev: &[f64],
+        cap_i_prev: &[f64],
+        ind_v_prev: &[f64],
         line_prev: &LineState,
         node_prev: &[f64],
         solver: &mut ReusableSolver,
     ) -> Result<StepOut, SimError> {
         let (circuit, layout) = (self.circuit, self.layout);
+        let trap = matches!(self.method, IntegrationMethod::Trapezoidal);
         // `alpha` ramps the independent sources only (source stepping); the
         // reactive companions carry state from the previous step and stay at full.
         let stamp_at = |sys: &mut System, alpha: f64| -> Result<(), SimError> {
@@ -2113,21 +2197,41 @@ impl<'a> TransientModel<'a> {
             stamp_current_sources(sys, circuit, layout, Some(t_end), alpha)?;
             stamp_controlled_sources(sys, circuit, layout)?;
             for (ci, (a, b, c)) in self.caps.iter().enumerate() {
-                let g_eq = c / h;
                 let (ia, ib) = (layout.node_of(circuit, *a), layout.node_of(circuit, *b));
-                sys.stamp_conductance(ia, ib, g_eq);
-                sys.stamp_current(ia, ib, g_eq * cap_prev[ci]);
+                if trap {
+                    // Trapezoidal (`CP-SIM-M10.2`): `i_C,n = (2C/h)(v_n − v_{n−1}) −
+                    // i_{n−1}`, a Norton of conductance `g_eq = 2C/h` and history
+                    // current `g_eq·v_prev + i_prev`.
+                    let g_eq = 2.0 * c / h;
+                    sys.stamp_conductance(ia, ib, g_eq);
+                    sys.stamp_current(ia, ib, g_eq * cap_prev[ci] + cap_i_prev[ci]);
+                } else {
+                    // Backward Euler — the original companion, bit-for-bit.
+                    let g_eq = c / h;
+                    sys.stamp_conductance(ia, ib, g_eq);
+                    sys.stamp_current(ia, ib, g_eq * cap_prev[ci]);
+                }
             }
-            // Isolated inductors: the original conductance companion, bit-for-bit.
+            // Isolated inductors.
             for (li, (a, b, l)) in self.inds.iter().enumerate() {
                 if self.coupling.branch_of[li].is_some() {
-                    continue; // coupled — stamped by the branch-row loop below
+                    continue; // coupled — stamped by the branch-row loop below (always BE)
                 }
-                let g_eq = h / l;
                 let (ia, ib) = (layout.node_of(circuit, *a), layout.node_of(circuit, *b));
-                sys.stamp_conductance(ia, ib, g_eq);
-                // History source `i_prev` oriented a → b: current flows a into b.
-                sys.stamp_current(ib, ia, ind_prev[li]);
+                if trap {
+                    // Trapezoidal: `i_n = (h/2L)(v_n + v_{n−1}) + i_{n−1}`, a Norton of
+                    // conductance `g_eq = h/2L` and history current `g_eq·v_prev +
+                    // i_prev` oriented a → b.
+                    let g_eq = h / (2.0 * l);
+                    sys.stamp_conductance(ia, ib, g_eq);
+                    sys.stamp_current(ib, ia, ind_prev[li] + g_eq * ind_v_prev[li]);
+                } else {
+                    // Backward Euler — the original conductance companion, bit-for-bit.
+                    let g_eq = h / l;
+                    sys.stamp_conductance(ia, ib, g_eq);
+                    // History source `i_prev` oriented a → b: current flows a into b.
+                    sys.stamp_current(ib, ia, ind_prev[li]);
+                }
             }
             // Coupled inductors: a branch-current row each. Branch `k`'s equation is
             // `(v_a − v_b) − Σⱼ (Lₖⱼ/h)·iⱼ = −Σⱼ (Lₖⱼ/h)·iⱼ_prev` (Backward Euler on
@@ -2198,26 +2302,54 @@ impl<'a> TransientModel<'a> {
             &stamp_at,
             solver,
         )?;
-        let new_caps = self
+        let new_caps: Vec<f64> = self
             .caps
             .iter()
             .map(|(a, b, _)| across(&x, layout.node_of(circuit, *a), layout.node_of(circuit, *b)))
             .collect();
-        let new_inds = self
+        let new_inds: Vec<f64> = self
             .inds
             .iter()
             .enumerate()
             .map(|(li, (a, b, l))| match self.coupling.branch_of[li] {
-                // A coupled inductor's current is a solved branch unknown.
+                // A coupled inductor's current is a solved branch unknown (always BE).
                 Some(off) => x[cbase + off],
-                // An isolated inductor updates from its companion: `i += (h/L)·v`.
                 None => {
-                    ind_prev[li]
-                        + (h / l)
-                            * across(&x, layout.node_of(circuit, *a), layout.node_of(circuit, *b))
+                    let v = across(&x, layout.node_of(circuit, *a), layout.node_of(circuit, *b));
+                    if trap {
+                        // Trapezoidal: `i_n = (h/2L)·v_n + i_prev + (h/2L)·v_prev`.
+                        let g_eq = h / (2.0 * l);
+                        ind_prev[li] + g_eq * (v + ind_v_prev[li])
+                    } else {
+                        // Backward Euler: `i += (h/L)·v`.
+                        ind_prev[li] + (h / l) * v
+                    }
                 }
             })
             .collect();
+        // Trapezoidal carries one extra history per two-terminal reactance — the
+        // capacitor current and the isolated-inductor voltage at this step — so the
+        // next step's companion can use the second-order update. Backward Euler needs
+        // neither, so both stay empty and the default path threads nothing.
+        let (new_cap_i, new_ind_v) = if trap {
+            let g_eq_c = |c: f64| 2.0 * c / h;
+            let cap_i = self
+                .caps
+                .iter()
+                .enumerate()
+                .map(|(ci, (_, _, c))| g_eq_c(*c) * (new_caps[ci] - cap_prev[ci]) - cap_i_prev[ci])
+                .collect();
+            let ind_v = self
+                .inds
+                .iter()
+                .map(|(a, b, _)| {
+                    across(&x, layout.node_of(circuit, *a), layout.node_of(circuit, *b))
+                })
+                .collect();
+            (cap_i, ind_v)
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
         // Refresh the transmission-line state from the solved step.
         let mut new_lossless = Vec::new();
@@ -2248,6 +2380,8 @@ impl<'a> TransientModel<'a> {
             inds: new_inds,
             lossless: new_lossless,
             lossy: new_lossy,
+            cap_i: new_cap_i,
+            ind_v: new_ind_v,
         })
     }
 
@@ -2268,21 +2402,32 @@ impl<'a> TransientModel<'a> {
     }
 }
 
-/// Transient dispatcher. `step = Some(h)` runs the fixed-step Backward-Euler
-/// exactly as M0 did (bit-for-bit — the existing tests do not move); `step = None`
-/// asks the engine to choose the timestep and runs the error-controlled adaptive
-/// driver ([`adaptive_transient`], `CP-SIM-M1.6`).
+/// Transient dispatcher. `step = Some(h)` runs the fixed-step integration exactly as
+/// M0 did (bit-for-bit under the default Backward Euler — the existing tests do not
+/// move); `step = None` asks the engine to choose the timestep and runs the
+/// error-controlled adaptive driver ([`adaptive_transient`], `CP-SIM-M1.6`). `method`
+/// selects the integrator (`CP-SIM-M10.2`); a non-default method requires a fixed
+/// timestep (the adaptive driver's error control is first-order Backward Euler).
 fn transient(
     circuit: &Circuit,
     layout: &Layout,
     duration: f64,
     step: Option<f64>,
     registry: &DeviceRegistry,
+    method: IntegrationMethod,
 ) -> Result<Vec<Signal>, SimError> {
     if duration <= 0.0 {
         return Err(SimError::BadValue("transient duration/step".into()));
     }
-    let model = TransientModel::build(circuit, layout, registry)?;
+    // A non-default integrator (trapezoidal) only runs at a fixed timestep: the
+    // adaptive driver's step-doubling LTE estimate is first-order Backward Euler by
+    // construction, so mixing it with a second-order method would mis-control the step.
+    if !matches!(method, IntegrationMethod::BackwardEuler) && !matches!(step, Some(h) if h > 0.0) {
+        return Err(SimError::Unsupported(
+            "trapezoidal integration needs a fixed transient timestep",
+        ));
+    }
+    let model = TransientModel::build(circuit, layout, registry, method)?;
     // Transmission lines need the uniform history grid the fixed step provides (the
     // delayed port state is interpolated from committed samples), so a circuit with
     // a line requires an explicit timestep; the adaptive driver rejects it cleanly.
@@ -2350,6 +2495,21 @@ fn fixed_transient(
     }
     let mut cap_prev = cap_v0;
     let mut ind_prev = vec![0.0; model.inds.len()];
+    // Trapezoidal carries one extra history per two-terminal reactance (capacitor
+    // current, isolated-inductor voltage), both zero at the relaxed t = 0 start;
+    // Backward Euler carries none, so these stay empty and are never read on the
+    // default path — keeping it bit-for-bit (`CP-SIM-M10.2`).
+    let trap = matches!(model.method, IntegrationMethod::Trapezoidal);
+    let mut cap_i_prev = if trap {
+        vec![0.0; model.caps.len()]
+    } else {
+        Vec::new()
+    };
+    let mut ind_v_prev = if trap {
+        vec![0.0; model.inds.len()]
+    } else {
+        Vec::new()
+    };
     // The previous step's full solution — a controlled switch reads its control-node
     // voltage from here (`CP-SIM-M9.1`). It starts at the t = 0 initial solution.
     let mut node_prev = x0;
@@ -2365,6 +2525,8 @@ fn fixed_transient(
             h,
             &cap_prev,
             &ind_prev,
+            &cap_i_prev,
+            &ind_v_prev,
             &line_state,
             &node_prev,
             &mut solver,
@@ -2375,6 +2537,8 @@ fn fixed_transient(
         }
         cap_prev = out.caps;
         ind_prev = out.inds;
+        cap_i_prev = out.cap_i;
+        ind_v_prev = out.ind_v;
         node_prev = out.x;
         // Commit this step's transmission-line state: append the lossless history
         // sample (so later steps can read it one delay back) and advance the lossy
@@ -2465,12 +2629,16 @@ fn adaptive_transient(
         let h_try = h.min(duration - t);
         let at_floor = h_try <= h_min * (1.0 + 1e-9);
 
-        // Coarse: one step of h_try. Fine: two steps of h_try/2.
+        // Coarse: one step of h_try. Fine: two steps of h_try/2. The adaptive driver
+        // is Backward Euler by construction (the dispatcher rejects any other method),
+        // so no trapezoidal current/voltage history is threaded — empty slices here.
         let coarse = model.step(
             t + h_try,
             h_try,
             &cap_prev,
             &ind_prev,
+            &[],
+            &[],
             &no_lines,
             &node_prev,
             &mut solver,
@@ -2481,6 +2649,8 @@ fn adaptive_transient(
             half,
             &cap_prev,
             &ind_prev,
+            &[],
+            &[],
             &no_lines,
             &node_prev,
             &mut solver,
@@ -2490,6 +2660,8 @@ fn adaptive_transient(
             half,
             &mid.caps,
             &mid.inds,
+            &[],
+            &[],
             &no_lines,
             &mid.x,
             &mut solver,
@@ -2734,6 +2906,24 @@ impl<'a> AcNetwork<'a> {
     /// as 0 V shorts, current sources open). The caller adds the excitation.
     fn assemble(&self, w: f64) -> Result<ComplexSystem, SimError> {
         let mut sys = ComplexSystem::new(self.size);
+        self.stamp_into(&mut sys, w)?;
+        Ok(sys)
+    }
+
+    /// Assemble forced to the dense backing — the exact per-frequency dense solve a
+    /// swept AC uses below the sparse/ordered thresholds, exposed so a bench or test
+    /// can race the ordered reusable path against it at any size (`CP-SIM-M10.1`).
+    fn assemble_dense(&self, w: f64) -> Result<ComplexSystem, SimError> {
+        let mut sys = ComplexSystem::dense(self.size);
+        self.stamp_into(&mut sys, w)?;
+        Ok(sys)
+    }
+
+    /// Stamp the whole frequency-independent network into `sys` at angular frequency
+    /// `w`, every independent source quiet. The backing (dense or sparse) is the
+    /// caller's; the stamps are identical either way, so the assembled matrix is
+    /// byte-for-byte the same regardless.
+    fn stamp_into(&self, sys: &mut ComplexSystem, w: f64) -> Result<(), SimError> {
         for &(a, b, g) in &self.conductances {
             sys.stamp_admittance(a, b, Complex::new(g, 0.0));
         }
@@ -2764,13 +2954,13 @@ impl<'a> AcNetwork<'a> {
             sys.stamp_matrix(a, b, Complex::new(g, 0.0));
         }
         for (li, ln) in self.lines.iter().enumerate() {
-            ln.stamp_ac(&mut sys, w, self.line_branch_of[li]);
+            ln.stamp_ac(sys, w, self.line_branch_of[li]);
         }
         for &(plus, minus, k) in &self.vsources {
             sys.stamp_vsource(plus, minus, k, Complex::ZERO);
         }
-        stamp_controlled_sources_complex(&mut sys, self.circuit, self.layout)?;
-        Ok(sys)
+        stamp_controlled_sources_complex(sys, self.circuit, self.layout)?;
+        Ok(())
     }
 }
 
@@ -2807,6 +2997,12 @@ fn ac(
     let freqs = log_frequencies(f_start, f_stop, points_per_decade);
     let mut per_node: Vec<Vec<Complex>> = vec![Vec::with_capacity(freqs.len()); net.n];
 
+    // One solver for the whole sweep: every frequency assembles the *same structure*
+    // (only the `jωC` / `1/jωL` numbers move), so a large network analyzes the
+    // fill-reducing ordering once and only refactors per frequency. Below the
+    // threshold it is a bit-for-bit pass-through to the dense/natural-order solve, so
+    // small AC fixtures are byte-identical to the pre-reuse per-frequency solve.
+    let mut solver = ComplexReusableSolver::new(net.size);
     for &f in &freqs {
         let w = TAU * f;
         let mut sys = net.assemble(w)?;
@@ -2821,7 +3017,7 @@ fn ac(
             sys.stamp_current(b, a, Complex::ONE);
         }
 
-        let x = sys.solve().ok_or(SimError::Singular)?;
+        let x = solver.solve(sys).ok_or(SimError::Singular)?;
         for (d, col) in per_node.iter_mut().enumerate() {
             col.push(x[d]);
         }
@@ -3626,17 +3822,60 @@ fn noise(
 
     let freqs = log_frequencies(f_start, f_stop, points_per_decade);
     let mut psd: Vec<f64> = Vec::with_capacity(freqs.len());
+    // A noise sweep is the ideal case for factorization reuse: the same structure at
+    // every frequency, and *several* right-hand sides per frequency (a 1 A probe per
+    // noise source). Above the ordered threshold we factor the quiet network once per
+    // frequency (reusing the symbolic ordering across frequencies) and back-solve each
+    // probe; below it we keep the exact pre-reuse path (a fresh solve per probe),
+    // byte-identical on the small golden/determinism fixtures.
+    let ordered = size >= COMPLEX_KLU_THRESHOLD;
+    let mut sym: Option<ComplexSymbolic> = None;
+    let mut num: Option<mna_complex::ComplexNumeric> = None;
+    // A 1 A probe's right-hand side (`+1` at `na`, `−1` at `nb`) — what `stamp_current`
+    // would add to a quiet system's RHS, built directly for the reuse path.
+    let probe_rhs = |na: Option<usize>, nb: Option<usize>| {
+        let mut rhs = vec![Complex::ZERO; size];
+        if let Some(i) = na {
+            rhs[i] = rhs[i] + Complex::ONE;
+        }
+        if let Some(j) = nb {
+            rhs[j] = rhs[j] - Complex::ONE;
+        }
+        rhs
+    };
     for &f in &freqs {
         let w = TAU * f;
         let mut total = 0.0;
-        // Each noise source: inject a 1 A probe across its nodes, solve, and read
-        // the transimpedance off the output; accumulate |Z|²·S incoherently.
-        for &(na, nb, s_k) in &noise_sources {
-            let mut sys = build_network(w)?;
-            sys.stamp_current(na, nb, Complex::ONE);
-            let x = sys.solve().ok_or(SimError::Singular)?;
-            let z = out_node.map_or(Complex::ZERO, |i| x[i]);
-            total += z.magnitude().powi(2) * s_k;
+        if ordered {
+            let (mat, _z) = build_network(w)?.into_ordered_parts();
+            // Reuse the cached ordering + pivot sequence when it still holds; else
+            // analyze + factor afresh (first frequency, or after a pivot collapse).
+            let mut reused = false;
+            if let (Some(s), Some(nm)) = (sym.as_ref(), num.as_mut()) {
+                reused = nm.refactor(s, &mat).is_some();
+            }
+            if !reused {
+                let s = ComplexSymbolic::analyze(&mat);
+                let nm = s.factor(&mat).ok_or(SimError::Singular)?;
+                sym = Some(s);
+                num = Some(nm);
+            }
+            let nm = num.as_ref().expect("factored above");
+            for &(na, nb, s_k) in &noise_sources {
+                let x = nm.solve(&probe_rhs(na, nb));
+                let z = out_node.map_or(Complex::ZERO, |i| x[i]);
+                total += z.magnitude().powi(2) * s_k;
+            }
+        } else {
+            // Each noise source: inject a 1 A probe across its nodes, solve, and read
+            // the transimpedance off the output; accumulate |Z|²·S incoherently.
+            for &(na, nb, s_k) in &noise_sources {
+                let mut sys = build_network(w)?;
+                sys.stamp_current(na, nb, Complex::ONE);
+                let x = sys.solve().ok_or(SimError::Singular)?;
+                let z = out_node.map_or(Complex::ZERO, |i| x[i]);
+                total += z.magnitude().powi(2) * s_k;
+            }
         }
         psd.push(total);
     }
@@ -4095,6 +4334,75 @@ pub mod bench_support {
     /// Solve `circuit`'s linear DC operating point with the forced sparse backing.
     pub fn dc_solve_sparse(circuit: &Circuit) -> Option<Vec<f64>> {
         linear_dc_system(circuit, System::sparse).solve()
+    }
+
+    // --- CP-SIM-M10.1: reusable ordered complex AC/noise solver ------------
+
+    pub use crate::mna_complex::{ComplexNumeric, ComplexSparseMatrix, ComplexSymbolic};
+
+    /// A swept-AC solve of `circuit` that **forces the per-frequency dense complex
+    /// solve** at every point (the exact pre-`CP-SIM-M10.1` behavior), returning the
+    /// node-voltage phasors as `per_node[node][freq_index]`. Used both as the
+    /// reference the ordered reusable path is checked against (`swept_ac_ordered_…`
+    /// test) and as the dense baseline in the `ac_scaling` bench.
+    pub fn ac_sweep_dense(
+        circuit: &Circuit,
+        f_start: f64,
+        f_stop: f64,
+        ppd: u32,
+    ) -> Option<Vec<Vec<Complex>>> {
+        ac_sweep(circuit, f_start, f_stop, ppd, false)
+    }
+
+    /// A swept-AC solve of `circuit` that routes through the **reusable ordered
+    /// complex LU** (`ComplexReusableSolver`): factor the structure once, then
+    /// refactor and back-solve per frequency. Returns the same `per_node[node][freq]`
+    /// phasors as [`ac_sweep_dense`], to a few ULP.
+    pub fn ac_sweep_ordered(
+        circuit: &Circuit,
+        f_start: f64,
+        f_stop: f64,
+        ppd: u32,
+    ) -> Option<Vec<Vec<Complex>>> {
+        ac_sweep(circuit, f_start, f_stop, ppd, true)
+    }
+
+    fn ac_sweep(
+        circuit: &Circuit,
+        f_start: f64,
+        f_stop: f64,
+        ppd: u32,
+        ordered: bool,
+    ) -> Option<Vec<Vec<Complex>>> {
+        let layout = Layout::build(circuit);
+        let reg = DeviceRegistry::default();
+        let net = AcNetwork::build(circuit, &layout, &reg).ok()?;
+        let freqs = log_frequencies(f_start, f_stop, ppd);
+        let mut per_node: Vec<Vec<Complex>> = vec![Vec::with_capacity(freqs.len()); net.n];
+        let mut solver = ComplexReusableSolver::new(if ordered { net.size } else { 0 });
+        for &f in &freqs {
+            let w = TAU * f;
+            let mut sys = if ordered {
+                net.assemble(w).ok()?
+            } else {
+                net.assemble_dense(w).ok()?
+            };
+            for &k in &net.ac_drive_branches {
+                sys.stamp_current(Some(k), None, Complex::ONE);
+            }
+            for &(a, b) in &net.ac_drive_csources {
+                sys.stamp_current(b, a, Complex::ONE);
+            }
+            let x = if ordered {
+                solver.solve(sys)?
+            } else {
+                sys.solve()?
+            };
+            for (d, col) in per_node.iter_mut().enumerate() {
+                col.push(x[d]);
+            }
+        }
+        Some(per_node)
     }
 
     /// Solve `circuit`'s linear DC operating point through the fill-reducing ordered
@@ -4623,6 +4931,158 @@ mod tests {
         );
     }
 
+    /// A lossless parallel LC tank, kicked by a brief current pulse, then left to
+    /// ring. Node `tank` has `C` and `L` both to ground; the current source injects a
+    /// short pulse to build energy. With no resistance the oscillation is ideal, so
+    /// its amplitude should persist — and that is exactly what a second-order,
+    /// energy-conserving integrator preserves and a first-order one does not.
+    fn lc_tank() -> (Circuit, NetId) {
+        let mut c = Circuit::new("lc_tank");
+        let tank = c.new_net();
+        c.add_part(
+            "L1",
+            PartKind::Inductor,
+            Some(Value::new(1e-3, Unit::Henry)),
+            vec![tank, NetId::GROUND],
+        );
+        c.add_part(
+            "C1",
+            PartKind::Capacitor,
+            Some(Value::new(1e-6, Unit::Farad)),
+            vec![tank, NetId::GROUND],
+        );
+        c.add_part(
+            "I1",
+            PartKind::CurrentSource,
+            Some(Value::new(0.0, Unit::Ampere)),
+            vec![NetId::GROUND, tank],
+        );
+        // A single 20 µs, 1 A kick (≈ T/10 of the 198.7 µs resonance), then quiet.
+        assert!(c.set_waveform(
+            "I1",
+            Waveform::Pulse {
+                v1: 0.0,
+                v2: 1.0,
+                delay: 0.0,
+                width: 20e-6,
+                period: 0.0,
+            },
+        ));
+        (c, tank)
+    }
+
+    /// The peak absolute tank voltage over a time window `[t0, t1]` of a transient
+    /// result — the ringing envelope the gate compares early vs late.
+    fn peak_in_window(sigs: &[Signal], name: &str, t0: f64, t1: f64) -> f64 {
+        let sig = sigs.iter().find(|s| s.name == name).expect("tank signal");
+        let ys = sig.real().unwrap();
+        sig.x
+            .iter()
+            .zip(ys)
+            .filter(|(&t, _)| t >= t0 && t <= t1)
+            .map(|(_, &y)| y.abs())
+            .fold(0.0, f64::max)
+    }
+
+    /// `CP-SIM-M10.2` accuracy gate: an LC tank that Backward Euler over-damps rings
+    /// on undiminished under the opt-in trapezoidal integrator. Both run the same
+    /// fixed step; the trapezoidal late-window amplitude stays within a few percent of
+    /// its early-window amplitude (energy conserved), while the Backward-Euler
+    /// amplitude has collapsed to a small fraction of it (artificial damping).
+    #[test]
+    fn lc_tank_rings_under_trapezoidal_where_backward_euler_decays() {
+        let (c, tank) = lc_tank();
+        let name = format!("v(n{})", c.resolve(tank).0);
+        let (h, duration) = (2e-6, 4e-3); // ~100 pts/period, ~20 periods
+        let (t_early0, t_early1) = (0.5e-3, 1.5e-3);
+        let (t_late0, t_late1) = (3.0e-3, 4.0e-3);
+
+        // Default Backward Euler (via run_transient, == Analysis::Transient).
+        let be = Engine::new()
+            .run_transient(&c, duration, h, IntegrationMethod::BackwardEuler)
+            .unwrap();
+        let be_early = peak_in_window(&be, &name, t_early0, t_early1);
+        let be_late = peak_in_window(&be, &name, t_late0, t_late1);
+        assert!(be_early > 1.0, "BE kick did not excite the tank");
+        assert!(
+            be_late < 0.5 * be_early,
+            "Backward Euler should over-damp: early {be_early} V, late {be_late} V"
+        );
+
+        // Opt-in trapezoidal: the oscillation persists.
+        let tr = Engine::new()
+            .run_transient(&c, duration, h, IntegrationMethod::Trapezoidal)
+            .unwrap();
+        let tr_early = peak_in_window(&tr, &name, t_early0, t_early1);
+        let tr_late = peak_in_window(&tr, &name, t_late0, t_late1);
+        assert!(
+            tr_late > 0.95 * tr_early,
+            "trapezoidal should sustain the ring: early {tr_early} V, late {tr_late} V"
+        );
+    }
+
+    /// `CP-SIM-M10.2` opt-in-default proof: selecting the default
+    /// [`IntegrationMethod::BackwardEuler`] through the new `run_transient` surface
+    /// yields a result **byte-for-byte identical** to the pre-M10 fixed-step
+    /// `Analysis::Transient` path — so the opt-in never perturbs the default, on a
+    /// representative RLC that exercises both a capacitor and an inductor companion.
+    #[test]
+    fn run_transient_backward_euler_matches_analysis_transient_bit_for_bit() {
+        let mut c = Circuit::new("rlc");
+        let vin = c.new_net();
+        let a = c.new_net();
+        let out = c.new_net();
+        c.add_part(
+            "V1",
+            PartKind::VoltageSource,
+            v("5", Unit::Volt),
+            vec![vin, NetId::GROUND],
+        );
+        c.add_part("R1", PartKind::Resistor, v("10", Unit::Ohm), vec![vin, a]);
+        c.add_part("L1", PartKind::Inductor, v("1m", Unit::Henry), vec![a, out]);
+        c.add_part(
+            "C1",
+            PartKind::Capacitor,
+            v("1u", Unit::Farad),
+            vec![out, NetId::GROUND],
+        );
+        let (duration, h) = (3e-4, 2e-7);
+        let viaanalysis = Engine::new()
+            .run(
+                &c,
+                &Analysis::Transient {
+                    duration,
+                    step: Some(h),
+                },
+            )
+            .unwrap();
+        let viamethod = Engine::new()
+            .run_transient(&c, duration, h, IntegrationMethod::BackwardEuler)
+            .unwrap();
+        assert_eq!(
+            viaanalysis, viamethod,
+            "run_transient(BackwardEuler) must equal Analysis::Transient bit-for-bit"
+        );
+    }
+
+    /// Trapezoidal integration requires a fixed timestep — an adaptive request (no
+    /// step) is rejected cleanly rather than silently mis-controlled.
+    #[test]
+    fn trapezoidal_needs_a_fixed_step() {
+        let (c, _tank) = lc_tank();
+        let layout = Layout::build(&c);
+        let err = transient(
+            &c,
+            &layout,
+            1e-3,
+            None,
+            &DeviceRegistry::default(),
+            IntegrationMethod::Trapezoidal,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SimError::Unsupported(_)));
+    }
+
     #[test]
     fn missing_ground_is_reported_clearly() {
         // A source and resistor with no ground reference → singular, not a panic.
@@ -5073,6 +5533,103 @@ mod tests {
         let in_name = format!("v(n{})", c.resolve(inp).0);
         let in_sig = sigs.iter().find(|s| s.name == in_name).unwrap();
         assert!(in_sig.complex().unwrap()[ic].magnitude_db().abs() < 1e-9);
+    }
+
+    /// A long RC ladder whose MNA system clears [`COMPLEX_KLU_THRESHOLD`] (so
+    /// `Engine::run(Ac)` takes the reusable ordered complex path): an AC-driven source
+    /// at node 0, then `rungs` sections of a series R into a rung node with a shunt C
+    /// to ground. `rungs + 1` nodes + one source branch — a representative swept-AC
+    /// network large enough to exercise the ordered path. Returns the circuit and its
+    /// output net (the last rung).
+    fn ac_rc_ladder(rungs: usize) -> (Circuit, NetId) {
+        let mut c = Circuit::new("ac_ladder");
+        let n0 = c.new_net();
+        c.add_part("V1", PartKind::VoltageSource, None, vec![n0, NetId::GROUND]);
+        assert!(c.set_waveform(
+            "V1",
+            Waveform::Sine {
+                amplitude: 1.0,
+                freq: 1_000.0,
+                offset: 0.0,
+                phase_deg: 0.0,
+            },
+        ));
+        let mut prev = n0;
+        let mut last = n0;
+        for i in 0..rungs {
+            let node = c.new_net();
+            c.add_part(
+                format!("R{i}"),
+                PartKind::Resistor,
+                v("1k", Unit::Ohm),
+                vec![prev, node],
+            );
+            c.add_part(
+                format!("C{i}"),
+                PartKind::Capacitor,
+                Some(Value::new(10e-9, Unit::Farad)),
+                vec![node, NetId::GROUND],
+            );
+            prev = node;
+            last = node;
+        }
+        (c, last)
+    }
+
+    /// `CP-SIM-M10.1` AC gate: a swept AC on a ladder past the ordered threshold,
+    /// solved through `Engine::run` (the reusable ordered complex factorization),
+    /// equals the per-frequency **dense** complex solve at every node and every swept
+    /// frequency to ≤1e-12 — the ordered LU is the same factorization merely
+    /// reordered. Proves the reuse path is correct where it engages.
+    #[test]
+    fn swept_ac_ordered_matches_dense() {
+        let (c, _out) = ac_rc_ladder(300); // MNA size 302 ≥ COMPLEX_KLU_THRESHOLD (256)
+        let (f_start, f_stop, ppd) = (10.0, 1e6, 10);
+
+        // The engine path (auto-selects the ordered reusable solver at this size).
+        let sigs = Engine::new()
+            .run(
+                &c,
+                &Analysis::Ac {
+                    f_start,
+                    f_stop,
+                    points_per_decade: ppd,
+                },
+            )
+            .unwrap();
+
+        // The forced per-frequency dense reference.
+        let dense = bench_support::ac_sweep_dense(&c, f_start, f_stop, ppd).unwrap();
+
+        let mut worst = 0.0_f64;
+        for (node, sig) in sigs.iter().enumerate() {
+            let engine = sig.complex().unwrap();
+            assert_eq!(engine.len(), dense[node].len(), "freq count mismatch");
+            for (a, b) in engine.iter().zip(&dense[node]) {
+                worst = worst.max((*a - *b).magnitude());
+            }
+        }
+        assert!(
+            worst <= 1e-12,
+            "ordered swept-AC diverged from the dense solve: max |Δ| = {worst}"
+        );
+    }
+
+    /// `CP-SIM-M10.1` bench_support sanity: the ordered swept-AC helper and the dense
+    /// helper agree to ≤1e-12 (the same assertion the bench relies on to race a
+    /// like-for-like result), and the ordered path is actually engaged at this size.
+    #[test]
+    fn ac_sweep_helpers_agree_ordered_vs_dense() {
+        let (c, _out) = ac_rc_ladder(260);
+        let dense = bench_support::ac_sweep_dense(&c, 100.0, 1e5, 8).unwrap();
+        let ordered = bench_support::ac_sweep_ordered(&c, 100.0, 1e5, 8).unwrap();
+        let mut worst = 0.0_f64;
+        for (dn, on) in dense.iter().zip(&ordered) {
+            for (a, b) in dn.iter().zip(on) {
+                worst = worst.max((*a - *b).magnitude());
+            }
+        }
+        assert!(worst <= 1e-12, "ac_sweep helpers diverged: {worst}");
     }
 
     #[test]

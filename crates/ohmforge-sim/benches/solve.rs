@@ -14,6 +14,9 @@
 //!   markedly ahead.
 //! - `sparse_scaling` — the sparse path alone over N = 1000…4000, to show it
 //!   keeps scaling where the dense cube is already impractical.
+//! - `ac_scaling` — the `CP-SIM-M10.1` gate: a swept AC on an RC ladder, the
+//!   per-frequency dense complex solve raced against the reusable ordered complex LU
+//!   (one fill-reducing analysis amortized over the whole sweep).
 //!
 //! The head-to-head uses [`ohmforge_sim::bench_support`], a hidden hook that forces
 //! each solver on one assembled matrix (the engine itself auto-picks sparse
@@ -25,7 +28,7 @@
 use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use ohmforge_core::graph::{Circuit, NetId, PartKind};
+use ohmforge_core::graph::{Circuit, NetId, PartKind, Waveform};
 use ohmforge_core::{Unit, Value};
 use ohmforge_sim::{bench_support, Analysis, Engine};
 
@@ -348,6 +351,66 @@ fn bench_engine_klu_routing(c: &mut Criterion) {
     group.finish();
 }
 
+/// An AC-driven RC ladder of `rungs` sections (an AC sine at node 0, then a series
+/// 1 kΩ into each rung node with a 10 nF shunt to ground) — a swept-AC network whose
+/// MNA size is `rungs + 2`, used to race the ordered reusable complex solver against
+/// the per-frequency dense solve (`CP-SIM-M10.1`).
+fn ac_rc_ladder(rungs: usize) -> Circuit {
+    let mut c = Circuit::new("ac_ladder");
+    let n0 = c.new_net();
+    c.add_part("V1", PartKind::VoltageSource, None, vec![n0, NetId::GROUND]);
+    c.set_waveform(
+        "V1",
+        Waveform::Sine {
+            amplitude: 1.0,
+            freq: 1_000.0,
+            offset: 0.0,
+            phase_deg: 0.0,
+        },
+    );
+    let mut prev = n0;
+    for i in 0..rungs {
+        let node = c.new_net();
+        c.add_part(
+            format!("R{i}"),
+            PartKind::Resistor,
+            val("1k", Unit::Ohm),
+            vec![prev, node],
+        );
+        c.add_part(
+            format!("C{i}"),
+            PartKind::Capacitor,
+            Some(Value::new(10e-9, Unit::Farad)),
+            vec![node, NetId::GROUND],
+        );
+        prev = node;
+    }
+    c
+}
+
+/// The `CP-SIM-M10.1` scaling gate: a swept AC on an RC ladder solved per-frequency
+/// by the **dense** complex solve (`O(points·N³)`) vs. the **reusable ordered**
+/// complex LU (`O(N³)` once + `O(points·nnz)`). As the ladder grows the ordered path
+/// pulls markedly ahead — one fill-reducing analysis amortized over the whole sweep.
+fn bench_ac_scaling(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ac_scaling");
+    let (f_start, f_stop, ppd) = (10.0, 1e6, 10);
+    for rungs in [300usize, 600, 1000] {
+        let circuit = ac_rc_ladder(rungs);
+        group.bench_with_input(BenchmarkId::new("dense", rungs), &circuit, |b, circuit| {
+            b.iter(|| bench_support::ac_sweep_dense(black_box(circuit), f_start, f_stop, ppd))
+        });
+        group.bench_with_input(
+            BenchmarkId::new("ordered", rungs),
+            &circuit,
+            |b, circuit| {
+                b.iter(|| bench_support::ac_sweep_ordered(black_box(circuit), f_start, f_stop, ppd))
+            },
+        );
+    }
+    group.finish();
+}
+
 /// The `CP-SIM-M4.3` speedup gate: a many-run Monte-Carlo, sequential vs the
 /// public (threaded under `--features parallel`) path. Each run is a nonlinear
 /// Newton solve, so with the feature on `parallel` pulls markedly ahead of
@@ -376,6 +439,7 @@ criterion_group!(
     bench_ordered_vs_natural,
     bench_refactor_reuse,
     bench_engine_klu_routing,
+    bench_ac_scaling,
     bench_monte_carlo
 );
 criterion_main!(benches);
