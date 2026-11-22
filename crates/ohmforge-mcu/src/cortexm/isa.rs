@@ -30,10 +30,23 @@ pub enum Size {
 /// How a load/store forms its effective address off the base register `rn`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddrMode {
-    /// `[rn, #imm]` — a (pre-scaled) immediate byte offset.
+    /// `[rn, #imm]` — a (pre-scaled) immediate byte offset, no writeback.
     Imm(u32),
-    /// `[rn, rm]` — a register offset.
+    /// `[rn, rm]` — a register offset (unscaled).
     Reg(u8),
+    /// `[rn, rm, LSL #shift]` — a register offset scaled by a left shift (the
+    /// Thumb-2 scaled-register form; `shift` is `0..=3`).
+    RegShift { rm: u8, shift: u8 },
+    /// An immediate offset with explicit index/writeback control (the Thumb-2
+    /// pre-/post-indexed forms). The accessed address is `rn ± imm` when
+    /// `index` (pre-index) and `rn` otherwise (post-index); when `wback` the
+    /// base register is updated to `rn ± imm`. `add` selects `+`/`-`.
+    ImmWb {
+        imm: u32,
+        add: bool,
+        index: bool,
+        wback: bool,
+    },
 }
 
 /// A load or store. `rn == 15` is a PC-relative literal access (the base is the
@@ -171,6 +184,11 @@ pub enum Instr {
     /// `LDMIA rn!, {reglist}`.
     Ldm { rn: u8, regs: u8 },
 
+    /// `CBZ`/`CBNZ rn, #imm` — compare the register against zero and branch
+    /// forward by `imm` bytes (always a positive offset). `nonzero` selects
+    /// `CBNZ` (branch when `rn != 0`); otherwise `CBZ` (branch when `rn == 0`).
+    Cb { nonzero: bool, rn: u8, imm: u32 },
+
     /// `B` — unconditional branch (signed byte offset).
     B { offset: i32 },
     /// `B<cond>` — conditional branch (`cond` is the 4-bit condition code).
@@ -250,6 +268,13 @@ pub enum Instr {
     /// `SMULL rdlo, rdhi, rn, rm` — signed 32×32→64 multiply.
     Smull { rdlo: u8, rdhi: u8, rn: u8, rm: u8 },
 
+    /// `UDIV rd, rn, rm` — unsigned divide (`rd = rn / rm`; a zero divisor
+    /// yields `0`, matching ARMv7-M without divide-by-zero trapping).
+    Udiv { rd: u8, rn: u8, rm: u8 },
+    /// `SDIV rd, rn, rm` — signed divide (`rd = rn / rm`, rounding toward zero;
+    /// a zero divisor yields `0`).
+    Sdiv { rd: u8, rn: u8, rm: u8 },
+
     /// `CLZ rd, rm` — count leading zeros.
     Clz { rd: u8, rm: u8 },
     /// `RBIT rd, rm` — reverse the bit order.
@@ -290,8 +315,10 @@ pub enum Instr {
     /// `IT{x{y{z}}} <firstcond>` — begin an If-Then block (`mask != 0`).
     It { firstcond: u8, mask: u8 },
 
-    /// An encoding outside the modelled subset; executes as a no-op under debug
-    /// assertion. See [`decode`](mod@super::decode) for the documented TODOs.
+    /// An encoding outside the modelled subset. Executing it halts the core
+    /// gracefully (see [`CortexM::halted`](super::core::CortexM::halted)) rather
+    /// than panicking. See [`decode`](mod@super::decode) for the documented
+    /// TODOs.
     Unknown(u16),
 }
 

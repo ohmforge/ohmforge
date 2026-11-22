@@ -53,14 +53,16 @@
 //! `MUL`/`MLA`/`MLS`/`UMULL`/`SMULL`; `CLZ`/`RBIT` and the wide byte-reversals;
 //! `LDR`/`STR` (+ byte/half, signed) with 12-bit and register offsets;
 //! `LDRD`/`STRD`; wide `LDM`/`STM` (IA/DB, i.e. `PUSH.W`/`POP.W`); the wide
-//! branches `B.W`/`B<cond>.W`/`BL`; and `MRS`/`MSR`.
+//! branches `B.W`/`B<cond>.W`/`BL`; `MRS`/`MSR`; the integer divides
+//! `SDIV`/`UDIV`; the 16-bit compare-and-branch `CBZ`/`CBNZ`; and `LDR`/`STR`
+//! with pre-/post-index writeback and a scaled register offset.
 //!
 //! Not yet implemented (decode to [`Instr::Unknown`], a documented TODO): the
-//! saturating `SSAT`/`USAT`, `SDIV`/`UDIV`, the DSP `SMLAL`/`SMLALxy` family,
-//! load/store with pre/post-index + writeback or a scaled register offset,
-//! `TBB`/`TBH`, `LDREX`/`STREX`, `CBZ`/`CBNZ`, all coprocessor / floating-point
-//! encodings, and (as on the M0+) the barriers `DSB`/`DMB`/`ISB`, `CPS`,
-//! `BKPT`, and `UDF`.
+//! saturating `SSAT`/`USAT`, the DSP `SMLAL`/`SMLALxy` family, `TBB`/`TBH`,
+//! `LDREX`/`STREX`, all coprocessor / floating-point encodings, and (as on the
+//! M0+) the barriers `DSB`/`DMB`/`ISB`, `CPS`, `BKPT`, and `UDF`. An
+//! unimplemented encoding is a *graceful* stop, not a panic — see
+//! [`CortexM::halted`](super::core::CortexM::halted).
 
 use super::isa::{AddrMode, Instr, Mem, Size};
 
@@ -357,6 +359,18 @@ fn decode_adr_add_sp(w: u16) -> Instr {
 fn decode_misc(w: u16) -> Instr {
     let rd = (w & 0x7) as u8;
     let rm = ((w >> 3) & 0x7) as u8;
+    // CBZ/CBNZ: `1011 op0 i 1 imm5 Rn` (bits [15:12]=1011, [10]=0, [8]=1). The
+    // branch offset is always forward: imm32 = ZeroExtend(i:imm5:'0').
+    if w & 0xF500 == 0xB100 {
+        let nonzero = w & (1 << 11) != 0;
+        let i = ((w >> 9) & 1) as u32;
+        let imm5 = ((w >> 3) & 0x1F) as u32;
+        return Instr::Cb {
+            nonzero,
+            rn: (w & 0x7) as u8,
+            imm: (i << 6) | (imm5 << 1),
+        };
+    }
     match (w >> 6) & 0x3F {
         // 0000 0xx: ADD SP, SP, #imm7 (scaled by 4).
         0b000000 | 0b000001 => Instr::AddSp {
@@ -777,22 +791,20 @@ fn decode_t32_load_store_single(w0: u16, w1: u16) -> Instr {
     let addr = if w0 & (1 << 7) != 0 {
         AddrMode::Imm((w1 & 0xFFF) as u32)
     } else if w1 & (1 << 11) != 0 {
-        // imm8 form with P/U/W: model only the common P=1,U=1,W=0 (positive,
-        // no writeback) case; otherwise leave it unmodelled.
-        let p = w1 & (1 << 10) != 0;
-        let u = w1 & (1 << 9) != 0;
-        let wb = w1 & (1 << 8) != 0;
-        if p && u && !wb {
-            AddrMode::Imm((w1 & 0xFF) as u32)
-        } else {
-            return Instr::Unknown(w0);
+        // imm8 form with P/U/W: the offset, pre-indexed and post-indexed forms,
+        // each with optional writeback. The common `[rn, #imm]` offset is
+        // P=1,U=1,W=0; `[rn, #imm]!` is P=1,W=1; `[rn], #imm` is P=0,W=1.
+        AddrMode::ImmWb {
+            imm: (w1 & 0xFF) as u32,
+            add: w1 & (1 << 9) != 0,    // U
+            index: w1 & (1 << 10) != 0, // P
+            wback: w1 & (1 << 8) != 0,  // W
         }
     } else if (w1 >> 6) & 0x3F == 0 {
-        // Register offset, LSL #imm2. Model the shift-by-0 case.
-        if (w1 >> 4) & 0x3 == 0 {
-            AddrMode::Reg((w1 & 0xF) as u8)
-        } else {
-            return Instr::Unknown(w0);
+        // Register offset `[rn, rm, LSL #imm2]`; the shift is in w1[5:4].
+        AddrMode::RegShift {
+            rm: (w1 & 0xF) as u8,
+            shift: ((w1 >> 4) & 0x3) as u8,
         }
     } else {
         return Instr::Unknown(w0);
@@ -848,13 +860,17 @@ fn decode_t32_dp_reg_mul(w0: u16, w1: u16) -> Instr {
                 Instr::Unknown(w0)
             }
         }
-        // 11111 0111 xxx: 64-bit multiply (UMULL/SMULL).
+        // 11111 0111 xxx: the long-multiply / divide group (UMULL/SMULL and
+        // UDIV/SDIV). The divides carry `op2 == 0b1111` in w1[7:4] and put Rd in
+        // w1[11:8] (the `rdhi` slot); the long multiplies carry `op2 == 0`.
         0b11000..=0b11111 => {
             let rdlo = ((w1 >> 12) & 0xF) as u8;
             let rdhi = ((w1 >> 8) & 0xF) as u8;
             match (w0 >> 4) & 0x7 {
                 0b000 if w1 & 0xF0 == 0 => Instr::Smull { rdlo, rdhi, rn, rm },
                 0b010 if w1 & 0xF0 == 0 => Instr::Umull { rdlo, rdhi, rn, rm },
+                0b001 if w1 & 0xF0 == 0xF0 => Instr::Sdiv { rd: rdhi, rn, rm },
+                0b011 if w1 & 0xF0 == 0xF0 => Instr::Udiv { rd: rdhi, rn, rm },
                 _ => Instr::Unknown(w0),
             }
         }
