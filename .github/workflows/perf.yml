@@ -1,0 +1,47 @@
+name: perf
+
+# CP-PLAT-M10.1 — performance-regression gate. Benches are slow and runner
+# timings are noisy, so this is a SEPARATE workflow off the PR matrix: it runs
+# only on pushes to `main` and on manual dispatch. It runs the hot-path Criterion
+# benches with the documented quick-pass settings and diffs their means against
+# the committed baseline (benches/baseline.json), failing on a regression beyond
+# the baseline's threshold.
+on:
+  push:
+    branches: [main]
+    # Only when something that could move the numbers (or the gate itself) changes.
+    paths:
+      - "crates/**"
+      - "benches/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/perf.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    name: bench vs baseline
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Quick-pass settings (the exact invocation the solve bench documents) keep
+      # this fast; the key-bench filter avoids the heavy scaling/Monte-Carlo runs.
+      - name: Run hot-path benches (quick pass)
+        run: |
+          cargo bench -p ohmforge-core --bench parse -- \
+            --warm-up-time 0.2 --measurement-time 1.0 --sample-size 20 \
+            'value_parse/mix'
+          cargo bench -p ohmforge-sim --bench solve -- \
+            --warm-up-time 0.2 --measurement-time 1.0 --sample-size 20 \
+            'op_point/ladder_16|transient/'
+      - name: Compare against committed baseline
+        run: python3 -I benches/ci/compare.py

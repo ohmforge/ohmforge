@@ -29,6 +29,9 @@ ohmforge-core = { workspace = true }
 # itself dependency-free and wasm/MSRV-clean. Default features off; we only need
 # `cargo_bench_support` to run a `harness = false` bench under `cargo bench`.
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+# Property tests only (CP-PLAT-M10.2); dev-dep, so the shipped crate stays
+# dependency-free and wasm/MSRV-clean.
+proptest = { workspace = true }
 
 [[bench]]
 name = "solve"

@@ -1,0 +1,60 @@
+# CP-PLAT-M10.2 — cargo-fuzz targets for the hot text parsers.
+#
+# This is a STANDALONE workspace (note the empty `[workspace]` table below) and
+# is `exclude`d from the main workspace, so the default `cargo build/test/clippy
+# --workspace` never pulls in libfuzzer-sys and nothing shipped depends on it.
+# The parser crates are referenced by path only (dev/fuzz tooling), never as a
+# normal dependency of any shipped crate.
+#
+# Build (nightly + the libFuzzer sanitizer runtime):
+#   cargo +nightly fuzz build
+# Run a bounded smoke of one target:
+#   cargo +nightly fuzz run value_parse -- -max_total_time=5
+[package]
+name = "ohmforge-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ohmforge-core = { path = "../crates/ohmforge-core" }
+ohmforge-fmt = { path = "../crates/ohmforge-fmt" }
+ohmforge-digital = { path = "../crates/ohmforge-digital" }
+
+# Detach from the main workspace: this crate is its own workspace root.
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "value_parse"
+path = "fuzz_targets/value_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "netlist_parse"
+path = "fuzz_targets/netlist_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "spice_import"
+path = "fuzz_targets/spice_import.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "digital_expr"
+path = "fuzz_targets/digital_expr.rs"
+test = false
+doc = false
+bench = false

@@ -20,3 +20,6 @@ ohmforge-core = { workspace = true }
 # Tests prove a parsed circuit actually simulates; the format layer itself
 # never depends on the solver.
 ohmforge-sim = { workspace = true }
+# Property tests only (CP-PLAT-M10.2); dev-dep, so the shipped crate stays
+# dependency-free.
+proptest = { workspace = true }
