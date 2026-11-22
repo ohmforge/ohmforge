@@ -232,8 +232,8 @@ _From a six-track planning fan-out (`docs/plan/m10-proposals/*.md`). Executed in
 | ui-shell | 25 | 0 | 25 |
 | ai-fmt | 21 | 0 | 21 |
 | platform | 11 | 0 | 14 |
-| web | 7 | 0 | 9 |
-| **Total** | **114** | **0** | **119** |
+| web | 9 | 0 | 9 |
+| **Total** | **116** | **0** | **119** |
 
 _**67/67 — M0 through M4 all complete** (M0–M3 tagged v0.1.0; M4 adds the rest). M4 delivered the **plugin device-model API** + an **instrument/block plugin trait**, a **KLU-class ordered/reusable sparse solver** and **multithreaded analyses**, a **Cortex-M3/M4 (Thumb-2)** core with an STM32 board, **SPICE `.model` import** + a vendor model library, and **shareable circuit links** in the browser. Deferred by design: real-time collaboration, the QEMU full-SBC bridge, and full vendor-SPICE `.model` fidelity — the standing M-next horizon._
 
